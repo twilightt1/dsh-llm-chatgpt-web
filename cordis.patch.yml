@@ -1,0 +1,12 @@
+# dsh-llm-chatgpt-web bundle layer.
+# One plugin row: registers the `chatgpt-web` provider route. All fields are
+# optional — schema defaults apply (headed turns, auto-detected browser).
+#
+# `name` must be the FULL package specifier as installed in the profile's
+# node_modules. Quote the value: a YAML scalar starting with `@` would parse
+# as a directive (unscoped names need no quotes, kept plain deliberately).
+- insert:
+    - id: llm-chatgpt-web
+      name: dsh-llm-chatgpt-web
+      config:
+        headed: true

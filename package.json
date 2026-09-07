@@ -1,0 +1,69 @@
+{
+  "name": "dsh-llm-chatgpt-web",
+  "description": "ChatGPT Web (owned Chromium driving Temporary Chat) adapter for the DeepSeek Harness LLM seam",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib",
+    "src",
+    "scripts",
+    "cordis.patch.yml",
+    "cordis.yml.example",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "chatgpt-web",
+    "llm",
+    "adapter",
+    "provider",
+    "plugin",
+    "bundle"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": "^0.1.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "dependencies": {
+    "playwright-core": "^1.62.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsdown": "^0.22.2",
+    "tsx": "^4.23.12",
+    "typescript": "5.9.3",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "postinstall": "node scripts/link-dsh-deps.mjs",
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

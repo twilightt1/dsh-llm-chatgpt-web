@@ -1,0 +1,22 @@
+# Minimal one-shot composition: ChatGPT Web LLM + the default agent spine.
+# No DeepSeek key, no credentials service, no persistence — one task, stdout.
+- id: llm-chatgpt-web
+  name: '/Users/twilight/Coding/Vibe/GWeb2dsh/dsh-llm-chatgpt-web/src/index.ts'
+  config:
+    headed: true
+    turnTimeoutMs: 300000
+    stallTimeoutMs: 120000
+
+- id: agent-spine
+  name: '/Users/twilight/deepseek-harness/packages/examples/agent-spine-demo/src/index.ts'
+  config:
+    agents:
+      - id: main
+        provider: chatgpt-web
+        model: chatgpt-web/high
+        cwd: /tmp/dsh-chatgpt-task
+    persona: |
+      You are a helpful assistant answering through ChatGPT Web.
+      Keep answers brief and factual.
+    workspaceContext:
+      maxBytes: 16384

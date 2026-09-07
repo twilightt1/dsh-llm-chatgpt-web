@@ -1,0 +1,29 @@
+# Example composition entry: mount ChatGPT Web as a DSH provider route.
+#
+# No bridge daemon, no Codex: the plugin owns its Chromium and drives
+# ChatGPT Temporary Chat directly. First run opens a headed window for
+# manual sign-in; later turns run headless on the saved session.
+
+- id: llm-chatgpt-web
+  name: '../../dsh-llm-chatgpt-web/src/index.ts'
+  config:
+    # profileDir: ~/.dsh-chatgpt-web      # login session lives here
+    # chromeExecutablePath: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+    # headed: false
+    # turnTimeoutMs: 300000
+    # stallTimeoutMs: 120000
+    models:
+      - id: chatgpt-web/luna
+        name: ChatGPT Web Luna
+        contextWindow: 1050000
+      - id: chatgpt-web/high
+        name: ChatGPT Web High
+        contextWindow: 90000
+
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  config:
+    agents:
+      - id: main
+        provider: chatgpt-web
+        model: chatgpt-web/high
