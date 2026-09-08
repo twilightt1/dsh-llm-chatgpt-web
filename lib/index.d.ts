@@ -94,10 +94,12 @@ declare class ChatGptWebAdapter extends LlmAdapter {
 //#endregion
 //#region src/chatgpt/prompt.d.ts
 /**
- * Compile one prompt for a fresh Temporary Chat page.
- * @param options - fully assembled harness request.
- * @param maxChars - composer budget; exceeding it fails with context overflow.
- * @param notice - optional one-shot system notice (e.g. tool-call retry).
+ * Compile one ChatGPT prompt: transport contract + JSON context envelope.
+ *
+ * The contract mirrors the upstream shared contract (role semantics, read
+ * before acting, no echo, no transport talk) adapted to DSH: the tool
+ * protocol rides as its own section and the reminder keeps last-token
+ * position.
  */
 declare function compilePrompt(options: GenerateOptions, maxChars: number, notice?: string): string;
 //#endregion

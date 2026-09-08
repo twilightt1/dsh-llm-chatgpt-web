@@ -85,9 +85,10 @@ export interface ChatGptWebAdapterOptions {
   options: () => ChatGptWebConnectionOptions
 }
 
-/** Default whole-turn budget. */
-export const DEFAULT_TURN_TIMEOUT_MS = 300_000/** Default no-growth stall budget. */
-export const DEFAULT_STALL_TIMEOUT_MS = 120_000
+/** Default whole-turn budget (15 minutes: reasoning models think long). */
+export const DEFAULT_TURN_TIMEOUT_MS = 900_000
+/** Default no-growth stall budget (5 minutes, matching upstream bridge). */
+export const DEFAULT_STALL_TIMEOUT_MS = 300_000
 /** Default manual login window. */
 export const DEFAULT_LOGIN_TIMEOUT_MS = 600_000
 /** Default daemon idle shutdown. */
@@ -327,6 +328,8 @@ export class ChatGptWebAdapter extends LlmAdapter {
     const prompt = compilePrompt(options, COMPOSER_CHAR_BUDGET, this.takeNotice(options))
     const browser = this.browserFor(connection)
     await browser.ensureReady(options.signal)
+    // Fresh page per turn (upstream pageForNewTurn): a reused SPA page
+    // retains the previous transcript and autocomplete DOM.
     const page = await browser.newTurnPage()
     let iterator: AsyncIterator<{ type: 'delta'; delta: string }, { text: string; promptChars: number }> | undefined
     try {
@@ -380,7 +383,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
       yield* this.emitTurnResult(options, prompt, fullText, blockIndex)
     } catch (error: unknown) {
       if (options.signal?.aborted) {
-        // Stop server-side generation; the shared page stays for next turns.
+        // Stop server-side generation; the turn page is closed below.
         await page.locator('[data-testid="stop-button"]').last().press('Enter').catch(() => {})
         try {
           await iterator?.return?.()
@@ -391,6 +394,11 @@ export class ChatGptWebAdapter extends LlmAdapter {
       }
       if (error instanceof LlmError) throw error
       throw new LlmError('ChatGPT Web turn failed.', 'TRANSPORT', { cause: error })
+    } finally {
+      // The turn page is always closed, and a COMPLETED turn persists the
+      // fresh session (ChatGPT rotates tokens; upstream does this per turn).
+      await page.close().catch(() => {})
+      await browser.persistSession().catch(() => {})
     }
   }
 }

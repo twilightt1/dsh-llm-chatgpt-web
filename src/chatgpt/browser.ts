@@ -1,16 +1,27 @@
 /**
  * Managed browser attachment for ChatGPT turns: connects to the shared
- * daemon browser, owns one context + one reused page per adapter lifetime.
+ * daemon browser, owns one context per adapter lifetime and one FRESH page
+ * per turn.
  *
  * Login model: the first run with no saved session opens a headed window at
- * chatgpt.com where the user signs in manually; the verified session is saved
- * and all later turns attach to the daemon. No launcher app, no copied
- * profiles. The daemon (not this process) owns hiding and minimization, so
- * turns never flash a window after the daemon's birth.
+ * chatgpt.com where the user signs in manually; the verified session is
+ * saved and all later turns attach to the daemon. No launcher app, no
+ * copied profiles. The daemon (not this process) owns hiding and
+ * minimization, so turns never flash a window after the daemon's birth.
+ *
+ * Session freshness (ported from upstream browser-worker): after EVERY
+ * successful turn the context storageState is atomically persisted back to
+ * the profile — ChatGPT rotates session tokens continuously, so a state
+ * captured only at login goes stale mid-flight.
+ *
+ * Page lifecycle (ported from upstream pageForNewTurn): each turn owns a
+ * fresh page; reusing one SPA page across turns retains the previous
+ * transcript and autocomplete DOM, which breaks assistant-turn indexing.
+ * The adapter closes the page after the turn.
  * @module dsh-llm-chatgpt-web/chatgpt-browser
  */
 
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright-core'
 import { LlmError } from '@deepseek-ai/dsh-llm'
@@ -34,10 +45,24 @@ function storageStatePath(profileDir: string): string {
   return join(profileDir, 'storage-state.json')
 }
 
+/** Atomic write: temp file + rename, so a crash never truncates the state. */
+function persistStorageState(profileDir: string, state: unknown): void {
+  const path = storageStatePath(profileDir)
+  const temp = `${path}.tmp`
+  try {
+    writeFileSync(temp, `${JSON.stringify(state)}\n`, { mode: 0o600 })
+    renameSync(temp, path)
+  } catch (error) {
+    console.log(
+      `[dsh-llm-chatgpt-web] storageState persist failed: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
 /**
  * One daemon attachment for the adapter's lifetime. Turns are serialized by
- * the caller and share ONE page: a fresh Temporary Chat navigation per turn
- * starts an empty chat (temp chats never persist).
+ * the caller; each turn gets a FRESH page in the shared context and closes
+ * it when done.
  *
  * Never closes the shared browser: `close()` releases only this attachment's
  * context. The daemon reaps itself after `daemonIdleMs` without turns.
@@ -45,7 +70,6 @@ function storageStatePath(profileDir: string): string {
 export class ChatGptBrowser {
   private browser: Browser | undefined
   private context: BrowserContext | undefined
-  private page: Page | undefined
   private capabilitiesProbed = false
   private loginPromise: Promise<void> | undefined
 
@@ -63,7 +87,6 @@ export class ChatGptBrowser {
         console.log('[dsh-llm-chatgpt-web] daemon connection dead; reattaching')
         this.context = undefined
         this.browser = undefined
-        this.page = undefined
         this.capabilitiesProbed = false
       }
     }
@@ -92,23 +115,21 @@ export class ChatGptBrowser {
   }
 
   /**
-   * Open (or reuse) the single turn page; heartbeats the daemon.
-   * Self-healing: if the daemon connection dropped between turns (idle exit
-   * raced a connect, machine sleep, crash), one reconnect attempt runs
-   * before surfacing the error.
+   * Open a FRESH page for one turn (upstream pageForNewTurn: a reused SPA
+   * page retains the previous transcript and autocomplete DOM). The caller
+   * closes it. Self-healing: if the daemon connection dropped between turns
+   * (idle exit raced a connect, machine sleep, crash), one reconnect
+   * attempt runs before surfacing the error.
    */
   async newTurnPage(): Promise<Page> {
     if (!this.context) {
       throw new LlmError('ChatGPT Web browser is not ready.', 'TRANSPORT')
     }
     touchEndpoint(this.options.profileDir)
-    if (this.page && !this.page.isClosed()) return this.page
     const attached = this.context
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        const page = await attached.newPage()
-        this.page = page
-        return page
+        return await attached.newPage()
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         const connectionDropped = /browser closed|connection closed|target closed|session closed/i.test(message)
@@ -124,7 +145,6 @@ export class ChatGptBrowser {
         console.log('[dsh-llm-chatgpt-web] daemon connection lost; reconnecting')
         this.context = undefined
         this.browser = undefined
-        this.page = undefined
         this.capabilitiesProbed = false
         await this.ensureReady()
       }
@@ -132,10 +152,29 @@ export class ChatGptBrowser {
     throw new LlmError('ChatGPT Web browser page could not be opened.', 'TRANSPORT')
   }
 
+  /**
+   * Persist the session after a completed turn (upstream does this after
+   * every managed-chrome turn): ChatGPT rotates session tokens, and the
+   * daemon keeps living cookies fresher than the login-time snapshot.
+   * Best-effort — a failed persist never fails the turn.
+   */
+  async persistSession(): Promise<void> {
+    if (!this.context) return
+    try {
+      const state = await this.context.storageState()
+      persistStorageState(this.options.profileDir, state)
+    } catch (error) {
+      console.log(
+        `[dsh-llm-chatgpt-web] storageState read failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
   async close(): Promise<void> {
+    // Best-effort final persist before releasing the context.
+    await this.persistSession().catch(() => {})
     await this.context?.close().catch(() => {})
     this.context = undefined
-    this.page = undefined
     this.capabilitiesProbed = false
     // Detach from the shared daemon WITHOUT closing it: browser.close()
     // would terminate the shared browser for everyone. The internal

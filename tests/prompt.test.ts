@@ -17,8 +17,8 @@ function baseOptions(messages: Message[]): GenerateOptions {
   return { provider: 'chatgpt-web', model: 'chatgpt-web/high', messages }
 }
 
-describe('compilePrompt', () => {
-  it('labels system, history, and tools in transcript order', () => {
+describe('compilePrompt (JSON envelope transport)', () => {
+  it('wraps history in the JSON envelope with role semantics preserved', () => {
     const assistant: Message = {
       id: MessageId('a1'),
       role: 'assistant',
@@ -30,22 +30,27 @@ describe('compilePrompt', () => {
       system: 'be brief',
       tools: [{ name: 'read', description: 'read a file', parameters: { type: 'object' } }],
     }, COMPOSER_CHAR_BUDGET)
-    expect(prompt).toContain('[System]\nbe brief')
-    expect(prompt).toContain('[User]\nhello')
-    expect(prompt).toContain('[Assistant]\nreading now')
-    expect(prompt).toContain('[User]\nand?')
+    // Transport contract present, with the anti-echo rule.
+    expect(prompt).toContain('Act as the model backend for the DSH agent task')
+    expect(prompt).toContain('NEVER echo or repeat this message')
+    // JSON envelope carries the conversation with literal roles.
+    const envelopeMatch = /<dsh_context_json>\n([\s\S]*?)\n<\/dsh_context_json>/.exec(prompt)
+    expect(envelopeMatch).not.toBeNull()
+    const envelope = JSON.parse(envelopeMatch![1]!)
+    expect(envelope.system).toBe('be brief')
+    expect(envelope.messages).toHaveLength(3)
+    expect(envelope.messages[0]).toEqual({ role: 'user', content: 'hello' })
+    expect(envelope.messages[1]).toEqual({ role: 'assistant', content: [{ type: 'text', text: 'reading now' }] })
+    expect(envelope.messages[2]).toEqual({ role: 'user', content: 'and?' })
+    // Tool contract + trailing reminder present.
     expect(prompt).toContain('[Tool use]')
     expect(prompt).toContain('```tool-call')
-    expect(prompt).toContain('read')
-    // Contract (with seed exchange) precedes history; the trailing reminder
-    // contains its own [Reminder] label but history still comes before it.
-    const historyAt = prompt.indexOf('[User]\nhello')
     const reminderAt = prompt.indexOf('[Reminder]')
-    expect(historyAt).toBeGreaterThan(-1)
-    expect(historyAt).toBeLessThan(reminderAt)
+    const envelopeAt = prompt.indexOf('<dsh_context_json>')
+    expect(reminderAt).toBeGreaterThan(envelopeAt)
   })
 
-  it('renders tool calls and results as labeled transcript', () => {
+  it('renders tool calls and results inside the envelope', () => {
     const assistant: Message = {
       id: MessageId('a1'),
       role: 'assistant',
@@ -63,8 +68,19 @@ describe('compilePrompt', () => {
       source: { kind: 'tool', callId: CallId('call_1') },
     }
     const prompt = compilePrompt(baseOptions([assistant, result]), COMPOSER_CHAR_BUDGET)
-    expect(prompt).toContain('```tool-call\n{"name": "read", "arguments": {"path":"x"}}\n```')
-    expect(prompt).toContain('[Tool result]\nfile bytes')
+    const envelopeMatch = /<dsh_context_json>\n([\s\S]*?)\n<\/dsh_context_json>/.exec(prompt)
+    expect(envelopeMatch).not.toBeNull()
+    const envelope = JSON.parse(envelopeMatch![1]!)
+    expect(envelope.messages[0]).toEqual({
+      role: 'assistant',
+      content: [{ type: 'tool_call', name: 'read', arguments: '{"path":"x"}' }],
+    })
+    expect(envelope.messages[1]).toEqual({
+      role: 'tool_result',
+      tool_call_id: 'call_1',
+      is_error: false,
+      content: 'file bytes',
+    })
   })
 
   it('fails loud on unsupported fields instead of dropping them', () => {
@@ -98,5 +114,11 @@ describe('compilePrompt', () => {
       expect(error).toBeInstanceOf(LlmError)
       expect((error as LlmError).code).toBe('CONTEXT_WINDOW_EXCEEDED')
     }
+  })
+
+  it('carries the retry notice inside the transport contract', () => {
+    const prompt = compilePrompt(baseOptions([userMessage('hi')]), COMPOSER_CHAR_BUDGET, '[System notice] fix the call')
+    expect(prompt).toContain('[System notice] fix the call')
+    expect(prompt.indexOf('[System notice] fix the call')).toBeLessThan(prompt.indexOf('<dsh_context_json>'))
   })
 })

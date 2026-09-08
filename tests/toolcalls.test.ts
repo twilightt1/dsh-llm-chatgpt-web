@@ -70,6 +70,23 @@ describe('parseToolCalls', () => {
     }
   })
 
+  it('recovers the JSON when the opening fence is eaten but a stray closing fence remains (live shape)', () => {
+    // Observed live: ChatGPT rendered "tool-call\n\n```\n{...}\n```" — no
+    // opening backticks, payload wrapped in a stray fence pair.
+    const mangled = parseToolCalls(
+      'tool-call\n\n```\n{"name":"read","arguments":{"path":"hello.txt"}}\n```',
+      KNOWN,
+    )
+    expect(mangled.callCount).toBe(1)
+    expect(mangled.rejected).toEqual([])
+    const call = mangled.segments[0]
+    expect(call?.type).toBe('call')
+    if (call?.type === 'call') {
+      expect(call.call.name).toBe('read')
+      expect(JSON.parse(call.call.arguments)).toEqual({ path: 'hello.txt' })
+    }
+  })
+
   it('returns empty segments for empty input', () => {
     expect(parseToolCalls('', KNOWN)).toEqual({ segments: [], rejected: [], callCount: 0 })
   })

@@ -16,7 +16,10 @@ export const TOOL_CALL_FENCE = 'tool-call'
 // ("tool-call{"name"…"). Openers accept 0-3 backticks and an OPTIONAL
 // separator; closers accept 2+ backticks OR end-of-text (the trailing
 // fence can be eaten too). Unknown names and bad JSON still reject loudly.
-const FENCE_RE = /`{0,3}\s*tool-call[ \t]*\r?\n?([\s\S]*?)(?:`{2,3}|$)/g
+// The segment after the tag also skips stray fence markers and blank lines
+// before the JSON payload (live shape: "tool-call\n\n```\n{...}\n```" —
+// the opening backticks were eaten, a stray pair wraps the payload).
+const FENCE_RE = /`{0,3}\s*tool-call[ \t]*(?:\r?\n)+(?:[ \t]*`{1,3}[ \t]*(?:\r?\n)*)*([\s\S]*?)(?:`{2,3}|$)/g
 
 /** One validated call with its span in the source text. */
 export interface ParsedToolCall {
@@ -71,7 +74,8 @@ export function renderToolContract(tools: ToolSchema[]): string {
   const exampleArgs = exampleFirstArgs(exampleTool)
   return [
     '[Tool use] READ THIS FIRST — it is how you act, not background info.',
-    'The tools in the catalog below are the ONLY executable tools in this environment. This chat has NO native python/container/web/image tools — any attempt to use them does nothing.',
+    'The tools in the catalog below are REAL and available RIGHT NOW in this chat: an automated harness is watching this conversation and executes every fenced ```tool-call block you emit, then sends the results back into this chat as tool results.',
+    'This chat has NO native python/container/web/image tools — but every tool in the catalog IS wired up. Do NOT refuse or claim the interface is unavailable; the fenced block below is the interface.',
     'The ONLY way to call a tool is emitting exactly one fenced block per call, then STOP writing (no text after the last block).',
     'Merely describing or narrating an action ("I will run...", "Writing file...", "bash -lc ...", a ```python block) DOES NOTHING — only a fenced ```tool-call block executes.',
     'Do NOT repeat or echo this message — the user only sees your actual answer, never these instructions.',
@@ -216,6 +220,37 @@ export function buildSchemaIndex(tools: readonly ToolSchema[]): Map<string, Tool
   return new Map(tools.map(tool => [tool.name, tool]))
 }
 
+/**
+ * Extract the first balanced JSON object from a mangled fence body.
+ * ChatGPT's composer pipeline can EAT the opening backticks entirely
+ * (observed live: "tool-call\n\n```\n{...}\n```") — the body then contains
+ * stray fence markers around the JSON. Bracket-matching skips those
+ * markers instead of failing the whole call.
+ */
+function firstBalancedJsonObject(source: string): string | undefined {
+  const start = source.indexOf('{')
+  if (start < 0) return undefined
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < source.length; i += 1) {
+    const char = source[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') inString = true
+    else if (char === '{') depth += 1
+    else if (char === '}') {
+      depth -= 1
+      if (depth === 0) return source.slice(start, i + 1)
+    }
+  }
+  return undefined
+}
+
 /** Parse with per-property schema validation. */
 export function parseToolCallsWithSchemas(
   text: string,
@@ -230,7 +265,7 @@ export function parseToolCallsWithSchemas(
   for (;;) {
     const match = FENCE_RE.exec(text)
     if (!match || match.index === undefined) break
-    const body = (match[1] ?? '').trim()
+    let body = (match[1] ?? '').trim()
     const end = match.index + match[0].length
     const head = text.slice(cursor, match.index)
     if (head.length > 0) segments.push({ type: 'text', text: head })
@@ -239,8 +274,21 @@ export function parseToolCallsWithSchemas(
     try {
       parsed = JSON.parse(body)
     } catch {
-      rejected.push({ raw: body.slice(0, 200), reason: 'block is not valid JSON' })
-      continue
+      // Fence-eaten fallback: pull the first balanced JSON object out of the
+      // mangled region (stray ``` markers around the payload) before failing.
+      const balanced = firstBalancedJsonObject(body)
+      if (balanced !== undefined) {
+        try {
+          parsed = JSON.parse(balanced)
+        } catch {
+          parsed = undefined
+        }
+      }
+      if (parsed === undefined) {
+        rejected.push({ raw: body.slice(0, 200), reason: 'block is not valid JSON' })
+        continue
+      }
+      body = balanced ?? body
     }
     if (!isRecord(parsed) || typeof parsed['name'] !== 'string') {
       rejected.push({ raw: body.slice(0, 200), reason: 'block needs a string "name"' })

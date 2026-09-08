@@ -18,14 +18,27 @@ dsh web
 
 ```
 DSH agent-loop → GenerateOptions → ChatGptWebAdapter.stream()
-  → compilePrompt(history) → fresh Temporary Chat page (owned Chromium)
+  → compilePrompt(history) → JSON envelope + transport contract
+  → fresh Temporary Chat page (owned Chromium daemon)
   → select effort → attach prompt → send
-  → poll answer DOM → text-delta StreamChunks → usage + finish
+  → poll answer DOM (block segments → Markdown buffer) → text-delta StreamChunks
+  → usage + finish
 ```
 
 Each turn owns a fresh Temporary Chat page and carries the full visible
 history in its prompt (stateless turns, no cross-turn browser state). Turns
 are serialized: at most one page is ever active.
+
+The prompt transport follows codex-chatgpt-web's proven design: the DSH
+conversation is wrapped in a `<dsh_context_json>` envelope with an explicit
+transport contract (role semantics, read-before-acting, never echo), which
+replaced the old plaintext transcript that made ChatGPT echo instructions
+back. Answer extraction converts ChatGPT's answer-root HTML into Markdown
+(turndown) streamed through an append-only buffer with source ranges, so
+code fences (including ```tool-call blocks), tables, and headings survive and
+ChatGPT re-renders can never retract streamed text. The session is persisted
+back to the profile after every completed turn because ChatGPT rotates
+session tokens.
 
 ## Prerequisites
 
@@ -122,8 +135,13 @@ owned browser (the dev `scripts/live-turn.ts` shows the pattern).
   throw `UNSUPPORTED*` instead of being silently dropped.
 - No selectable reasoning efforts: an explicit `reasoningEffort` throws —
   pick the effort via the model id.
-- No tool calls from the page: tool schemas are rendered into the prompt as
-  a labeled transcript the model can read, but the loop receives text only.
+- Tool calls run through a TEXT protocol: tool schemas are advertised in the
+  prompt and the model emits fenced ```tool-call blocks the adapter parses
+  into harness tool-call chunks; results ride back as tool_result messages
+  inside the next prompt's JSON envelope. Live-verified through the real
+  agent loop (session writes execute, answers return). ChatGPT-Web models
+  sometimes refuse the fenced protocol on the lowest effort (Instant);
+  nudging recovers most cases, and medium+ efforts comply reliably.
   (Driving page-side tool use back into DSH tools is V2 work.)
 - Usage is a client-side char-based estimate; the page exposes no measured
   counts.
@@ -151,18 +169,26 @@ auth asserts (SPA hydration lags `domcontentloaded`).
 
 ## Live verification
 
-Proven against a real Plus-class account (`scripts/live-turn.ts`):
-manual headed login → saved session → capability probe (Sol detected,
-Luna correctly refused with failover to Instant) → effort slider → attach →
-send → streamed deltas → copy-action completion → usage + `stop` finish,
-clean process exit via `dispose()`.
+Proven against a real Plus-class account (Sep 2026, after the JSON-envelope
++ Markdown-extraction rework):
 
-Proven through the real agent loop (`scripts/run-task.ts` +
-`chatgpt-web.cordis.yml`, DSH Loader `boot` + `runFixtureTurn` over
-`agent-spine-demo`): two consecutive tasks returned exact outputs
-(`LOOP READY`, `LOOP TWO`) with session + usage records, and fiber unload
-closes the owned browser (effect disposer, same pattern as the
-persistent-bash providers).
+- `scripts/live-lib.mjs` / `scripts/live-turn.ts`: fresh Temporary Chat →
+  effort slider → attach JSON-envelope prompt → submit → streamed Markdown
+  deltas (headings, lists, bold all survive) → usage + `stop` finish, on
+  both the src (tsx) and built `lib/` paths.
+- `scripts/run-task.ts` + `chatgpt-web.cordis.yml` through the real DSH
+  agent spine: a tool task ("create hello.txt with TOOL-LOOP-OK") — the
+  model emits the fenced ```tool-call block, the harness executes `write`,
+  the file appears on disk with the exact content, and the final answer is
+  a clean "FILE WRITTEN" (with an in-chat nudge recovering a first-round
+  refusal). Two-task continuity ("remember codeword" → "recall it") replays
+  the JSON envelope history correctly.
+- The storage state persists after every completed turn (ChatGPT rotates
+  session tokens); `storage-state.json` mtime advances per turn.
+- Heavier reasoning efforts (think/medium/high) need the raised budgets
+  (15-minute turn, 5-minute stall) and single-evaluate polling: per-poll
+  locator round-trips previously throttled ChatGPT's streaming DOM so hard
+  that short answers never finished rendering.
 
 ## Layout
 
@@ -170,11 +196,12 @@ persistent-bash providers).
 |---|---|
 | `src/chatgpt/session.ts` | Vendored selectors / effort menu / auth / capability probe |
 | `src/chatgpt/model.ts` | Vendored backend+effort resolution |
-| `src/chatgpt/browser.ts` | Chromium launch, login, profile, page pool |
+| `src/chatgpt/browser.ts` | Daemon attach, login, per-turn fresh page, session persist |
+| `src/chatgpt/markdown.ts` | Vendored HTML→Markdown + append-only streaming buffer |
 | `src/chatgpt/guards.ts` | Rate-limit / session / onboarding / terminal guards |
 | `src/chatgpt/effort.ts` | Effort slider + Think toggle per turn |
-| `src/chatgpt/prompt.ts` | DSH history → plain-text prompt |
-| `src/chatgpt/turn.ts` | Attach → send → stream loop |
+| `src/chatgpt/prompt.ts` | DSH history → JSON envelope + transport contract |
+| `src/chatgpt/turn.ts` | Attach → send → block-segment stream loop |
 | `src/chatgpt/usage.ts` | Char-based usage estimates |
 | `src/adapter.ts` | `ChatGptWebAdapter` (seam, queue, chunk protocol) |
 | `src/index.ts` | Cordis plugin (`registerAdapter(['chatgpt-web'])`) |

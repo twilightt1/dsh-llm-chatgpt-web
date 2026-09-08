@@ -2,8 +2,15 @@
  * One text turn on a fresh Temporary Chat page: prepare → attach → send →
  * stream answer deltas until the completion predicate holds.
  *
- * The completion predicate mirrors the upstream rule (response present, not
- * running, non-empty text, copy action visible) scoped to the response turn.
+ * Extraction is the upstream technique (codex-chatgpt-web browser-worker
+ * responseDomSnapshot): classify `.markdown` roots into commentary vs
+ * answer, flatten the ANSWER roots into semantic block segments carrying
+ * `data-start/data-end` source ranges, and stream them through the
+ * append-only ChatGptMarkdownBuffer (turndown HTML→Markdown) so fences,
+ * tables, and formatting survive and ChatGPT re-renders never retract
+ * streamed text. The completion predicate mirrors upstream: response
+ * present, not running, non-empty text, copy action visible, signature
+ * stable for CHATGPT_COMPLETION_SETTLE_MS.
  * @module dsh-llm-chatgpt-web/chatgpt-turn
  */
 
@@ -11,7 +18,6 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { Locator, Page } from 'playwright-core'
 import {
   CHATGPT_ASSISTANT_TURN_SELECTOR,
-  CHATGPT_COMPLETION_ACTION_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_STOP_BUTTON_SELECTOR,
   CHATGPT_TEMPORARY_CHAT_URL,
@@ -25,10 +31,16 @@ import {
   throwIfTerminalError,
 } from './guards.ts'
 import type { ChatGptWebAccountCapabilities } from './session.ts'
+import { ChatGptMarkdownBuffer, chatGptHtmlToMarkdown } from './markdown.ts'
 import { selectModelEffort } from './effort.ts'
 
 /** Composer budget in chars (measured upstream envelope, fail-closed). */
 export const COMPOSER_CHAR_BUDGET = 200_000
+
+/** Completion must hold this long before the turn is accepted (upstream settle). */
+export const CHATGPT_COMPLETION_SETTLE_MS = 2_000
+/** Grace for the copy action to appear after generation stops (upstream). */
+export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000
 
 export interface TextTurnOptions {
   model: string
@@ -39,9 +51,10 @@ export interface TextTurnOptions {
   signal?: AbortSignal
   /**
    * In-chat self-correction: when set, an answer with NO tool-call block
-   * while the prompt advertised tools gets one follow-up nudge in the SAME
-   * Temporary Chat ("emit the block, do not narrate"), then its new answer
-   * is captured. Detects both ```tool-call fences and eaten-backtick forms.
+   * while the prompt advertised tools gets up to two follow-up nudges in
+   * the SAME Temporary Chat ("emit the block, do not narrate"), then its
+   * new answer is captured. Detects both ```tool-call fences and
+   * eaten-backtick forms.
    */
   requiresToolCall?: boolean
 }
@@ -105,44 +118,180 @@ async function stopVisible(page: Page): Promise<boolean> {
 }
 
 /**
- * Answer-only extraction (upstream technique, browser-worker.ts:3675–3922):
- * classify `.markdown` roots so commentary/status containers (chain-of-thought,
- * streaming status) are structurally excluded, then join the ANSWER roots'
- * text. UI chrome (edit/branch buttons, "Answer now"/"Thinking" rows) is
- * dropped by construction — it never sits in an answer root's text.
+ * One full DOM snapshot of the response turn: answer-root classification
+ * (commentary/chain-of-thought/status containers are structurally excluded)
+ * plus semantic block segments with source ranges — ported from upstream
+ * responseDomSnapshot. Runs entirely in the page; returns JSON-serializable
+ * segments the ChatGptMarkdownBuffer consumes.
  */
-const ANSWER_EXTRACTION_JS = `(() => {
-  const roots = [...document.querySelectorAll('.markdown')]
-    .filter((el) => {
-      const parent = el.parentElement
-      if (parent && parent.querySelector('.markdown') !== null && parent.closest('.markdown') !== null) return false
-      return true
-    })
-    .filter((el) => el.offsetParent !== null || el.getClientRects().length > 0)
-  if (roots.length === 0) return ''
-  // The LAST answer root is the response to the newest prompt; earlier roots
-  // belong to previous rounds of this Temporary Chat.
-  const root = roots[roots.length - 1]
-  const clone = root.cloneNode(true)
-  for (const el of clone.querySelectorAll('button, script, style, [role="status"], [aria-busy="true"]')) {
-    el.remove()
-  }
-  return (clone.textContent ?? '').replace(/\\u00a0/g, ' ')
-})()`
+interface ResponseSnapshotSegment {
+  key: string
+  tag: string
+  html: string
+  text: string
+  group?: string
+  sourceStart?: number
+  sourceEnd?: number
+  streamable: boolean
+}
+
+interface ResponseSnapshot {
+  responsePresent: boolean
+  segments: ResponseSnapshotSegment[]
+  completionActionVisible: boolean
+  visibleText: string
+  /** Stop button visible = generation still running (observed in-page). */
+  running: boolean
+  /** Rate-limit dialog text present (upstream guard, in-page). */
+  rateLimited: boolean
+  /** Session-expiry alert present (upstream guard, in-page). */
+  sessionExpired: boolean
+}
 
 /**
- * Read the answer text via page-level answer-root classification (chrome is
- * structurally excluded — see ANSWER_EXTRACTION_JS). Scoped to the response
- * turn first; falls back to the last markdown node in it, then the turn.
+ * Build the page-level response snapshot expression (a self-invoking IIFE
+ * string). Playwright treats a string as an *expression* (isFunction is
+ * false for strings), so it must be invoked inline; arguments cannot be
+ * passed to a non-function expression, hence `baseCount` is embedded via
+ * JSON. A real module function would break under dev transpilers (tsx/esbuild
+ * inject `__name(...)` helpers into the serialized source, which do not
+ * exist in the page) — the IIFE string is the only form that survives every
+ * pipeline (tsx dev, tsdown lib build) unchanged.
+ *
+ * The snapshot selects the response turn INSIDE the page: the (baseCount)-th
+ * conversation-turn section that contains an assistant-authored message,
+ * classifies answer roots vs commentary (streaming-status / cot containers),
+ * flattens answer roots into semantic block segments with `data-start/
+ * data-end` source ranges, and reports completion evidence.
  */
-async function responseText(responseTurn: Locator, fallback: string): Promise<string> {
-  const scoped = await responseTurn.evaluate<string, undefined>(ANSWER_EXTRACTION_JS, undefined).catch(() => '')
-  if (scoped.length > 0) return scoped
-  const markdown = responseTurn.locator('.markdown')
-  if (await markdown.count().then(count => count > 0).catch(() => false)) {
-    return await markdown.last().innerText().catch(() => fallback)
+function buildResponseSnapshotExpression(baseCount: number): string {
+  return `(() => {
+  const BASE = ${JSON.stringify(baseCount)};
+  const renderedInDom = (candidate) => {
+    const style = getComputedStyle(candidate);
+    return candidate.isConnected
+      && style.display !== 'none'
+      && style.visibility !== 'hidden'
+      && style.opacity !== '0';
+  };
+  const sections = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
+  const responseSections = sections.filter(section => (
+    section.querySelector('[data-message-author-role="assistant"]') !== null
+    || section.querySelector('[data-turn="assistant"]') !== null
+  ));
+  const responseSection = responseSections[BASE] ?? responseSections[responseSections.length - 1];
+  const target = responseSection ?? document.body;
+  const allMarkdownRoots = [...target.querySelectorAll('.markdown')]
+    .filter(candidate => !candidate.parentElement || candidate.parentElement.closest('.markdown') === null)
+    .filter(renderedInDom);
+  const streamingStatusContainers = [...target.querySelectorAll('[data-streaming-response-status]')]
+    .filter(renderedInDom);
+  const selectAnswerRoots = (markdownRoots, statusContainers) => {
+    const firstStatus = statusContainers[0];
+    const commentary = markdownRoots.filter(candidate => (
+      candidate.closest('[data-streaming-response-status]') !== null
+      || candidate.closest('[data-testid^="cot-v5"]') !== null
+      || (firstStatus !== undefined && Boolean(
+        candidate.compareDocumentPosition(firstStatus) & 4
+      ))
+    ));
+    return { commentary, answer: markdownRoots.filter(c => !commentary.includes(c)) };
+  };
+  const classified = selectAnswerRoots(allMarkdownRoots, streamingStatusContainers);
+  const answerRoots = classified.answer;
+  const segments = [];
+  const blockTags = new Set([
+    'address','article','aside','blockquote','div','dl','fieldset','figcaption',
+    'figure','footer','form','h1','h2','h3','h4','h5','h6','header','hr',
+    'li','main','nav','ol','p','pre','section','table','ul',
+  ]);
+  let listGroupIndex = 0;
+  const sourceRange = (candidate) => {
+    const s = candidate.getAttribute('data-start');
+    const e = candidate.getAttribute('data-end');
+    if (s === null || e === null || !s.trim() || !e.trim()) return undefined;
+    const start = Number(s), end = Number(e);
+    return Number.isFinite(start) && Number.isFinite(end) && end >= start
+      ? { start, end } : undefined;
+  };
+  const appendSegment = (element, html, text, groupHint) => {
+    const range = sourceRange(element);
+    const tag = element.tagName.toLowerCase();
+    let group;
+    if (groupHint !== undefined) group = groupHint;
+    else if (range !== undefined) group = 'block:' + range.start;
+    segments.push({
+      key: (range !== undefined ? 'r:' + range.start + ':' + tag : 'g:' + (group ?? segments.length) + ':' + tag + ':' + segments.length),
+      tag,
+      html,
+      text,
+      ...(group !== undefined ? { group } : {}),
+      ...(range !== undefined ? { sourceStart: range.start, sourceEnd: range.end } : {}),
+      streamable: false,
+    });
+  };
+  for (const answerRoot of answerRoots) {
+    const children = [...answerRoot.children].filter(renderedInDom);
+    const visibleChildren = children.length > 0 ? children : [answerRoot];
+    for (const child of visibleChildren) {
+      const tag = child.tagName.toLowerCase();
+      if (!blockTags.has(tag)) {
+        appendSegment(child, child.outerHTML, child.textContent ?? '', undefined);
+        continue;
+      }
+      if (tag === 'ol' || tag === 'ul') {
+        const range = sourceRange(child);
+        const group = range !== undefined
+          ? 'list:' + range.start + ':' + tag
+          : 'list:' + (listGroupIndex++) + ':' + tag;
+        const items = [...child.children].filter(li => li.tagName === 'LI');
+        for (const item of items) {
+          appendSegment(item, item.outerHTML, item.textContent ?? '', group);
+        }
+        continue;
+      }
+      appendSegment(child, child.outerHTML, child.textContent ?? '', undefined);
+    }
   }
-  return await responseTurn.innerText().catch(() => fallback)
+  for (let i = 0; i < segments.length; i++) {
+    segments[i].streamable = i < segments.length - 1;
+  }
+  const completionActionVisible = [...target.querySelectorAll('button[data-testid="copy-turn-action-button"]')]
+    .some(renderedInDom);
+  const stopButtons = [...document.querySelectorAll('[data-testid="stop-button"]')]
+    .filter(renderedInDom);
+  const rateDialog = [...document.querySelectorAll('[role="dialog"]')]
+    .some(d => d.textContent && /Too many requests/i.test(d.textContent) && /making requests too quickly/i.test(d.textContent));
+  const sessionAlert = [...document.querySelectorAll('[role="alert"], [role="dialog"]')]
+    .some(d => d.textContent && /Your session has expired/i.test(d.textContent));
+  const visibleText = segments.map(s => s.text).join('\\n\\n');
+  return {
+    responsePresent: segments.length > 0,
+    segments,
+    completionActionVisible,
+    visibleText,
+    running: stopButtons.length > 0,
+    rateLimited: rateDialog,
+    sessionExpired: sessionAlert,
+  };
+})()`
+}
+
+/**
+ * Snapshot the response turn (assistant turn #`baseCount` on the page) into
+ * segments + completion evidence. Page-level IIFE expression: no locator
+ * handles, no transpiler-sensitive function serialization.
+ */
+async function responseSnapshot(page: Page, baseCount: number): Promise<ResponseSnapshot> {
+  const fallback = (): ResponseSnapshot => ({ responsePresent: false, segments: [], completionActionVisible: false, visibleText: '', running: false, rateLimited: false, sessionExpired: false })
+  try {
+    return await page.evaluate(buildResponseSnapshotExpression(baseCount))
+  } catch (error) {
+    console.log(
+      `[dsh-llm-chatgpt-web] snapshot evaluate failed: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    return fallback()
+  }
 }
 
 /**
@@ -156,9 +305,8 @@ export async function prepareTemporaryChatSurface(
   diagDir?: string,
   settleTimeoutMs = 45_000,
 ): Promise<void> {
-  // Always navigate: the shared turn page is reused across turns, and only a
-  // fresh Temporary Chat load guarantees an empty conversation (temp chats
-  // never persist, so no history leaks between turns).
+  // Always navigate: a fresh Temporary Chat load guarantees an empty
+  // conversation (temp chats never persist, so no history leaks between turns).
   await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 })
   // Hydration grace: the SPA shell (bot-gate interstitial, React hydration)
   // can take many seconds after domcontentloaded. Wait for a visible
@@ -223,14 +371,12 @@ export async function* streamTextTurn(
   const assistantTurns = page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR)
   const initialAssistantTurns = await assistantTurns.count().catch(() => 0)
 
-  const squash = (value: string): string => value.replace(/\s+/g, '')
-  void squash
-
   /**
-   * Code-unit readback (upstream browser-worker.ts:2023–2067, 2825–2862):
-   * poll the composer text and require exact equality after the one DOM-only
-   * relaxation upstream verified — multi-space runs may surface as \u00a0.
-   * Failure reports where insertion diverged (expected/actual/common prefix).
+   * Code-unit readback (upstream browser-worker): poll the composer text and
+   * require exact equality after the one DOM-only relaxation upstream
+   * verified — multi-space runs may surface as NBSP, and ProseMirror block
+   * edges can drop newlines. Compare with whitespace squashed; every other
+   * code unit must match.
    */
   const READBACK_JS = `(() => {
     const el = document.querySelector('#prompt-textarea')
@@ -290,9 +436,8 @@ export async function* streamTextTurn(
       readback = (await attachedPromptText()).trim()
       // ProseMirror block-boundary relaxation (probed Sep 2026): when an
       // inserted newline lands at a block edge, innerText can DROP the
-      // separator entirely ("info.\nThe tools" reads as "info.The tools").
-      // Every other code unit must match, so compare with all whitespace
-      // squashed — order and content are still verified exactly.
+      // separator entirely. Every other code unit must match, so compare
+      // with all whitespace squashed — order and content are verified exactly.
       const want = text.replace(/\s+/g, '')
       const got = readback.replace(/\s+/g, '')
       if (want === got) return
@@ -343,91 +488,155 @@ export async function* streamTextTurn(
 
   /** Poll one round's assistant turn (created at `baseCount`) to completion. */
   async function* captureRound(baseCount: number): AsyncGenerator<TextTurnEvent, string> {
-    let previousText = ''
+    const markdownBuffer = new ChatGptMarkdownBuffer()
+    let previousVisible = ''
     let lastGrowth = Date.now()
-    let settledObservations = 0
-    let lastPollText = ''
-    const REQUIRED_SETTLED_OBSERVATIONS = 2
+    let lastSignature = ''
+    let stableSince: number | undefined
+    let copyMissingSince: number | undefined
+    const REQUIRED_STABLE_MS = CHATGPT_COMPLETION_SETTLE_MS
     for (;;) {
       checkDeadline()
-      await throwIfSessionFailureAlert(page)
-      await throwIfRateLimitDialog(page)
-      const count = await assistantTurns.count().catch(() => 0)
-      let responseTurn: Locator | undefined
-      if (count > baseCount) {
-        responseTurn = assistantTurns.nth(baseCount)
-      } else if (count > 0) {
-        responseTurn = assistantTurns.last()
+      // ONE evaluate per poll (upstream discipline): the snapshot IIFE
+      // carries answer segments, stop-button (running), and the rate-limit /
+      // session guards. Per-poll locator round-trips (guard isVisible x4,
+      // count, stopVisible) previously throttled ChatGPT's streaming DOM so
+      // hard that short answers never finished rendering.
+      const snapshot = await responseSnapshot(page, baseCount)
+      if (snapshot.rateLimited) {
+        throw new LlmError('ChatGPT rate limit: too many requests. Try again in a few minutes.', 'RATE_LIMIT')
       }
-    let currentText = ''
-    if (responseTurn) {
-      currentText = await responseText(responseTurn, previousText)
-      // Upstream chrome filters (browser-worker.ts:1634–1644): a bare
-      // "Thinking" header or an "Answer now" suffix must never be output.
-      currentText = currentText.replace(/^Thinking\s*\n+/, '').replace(/(?:^|\s)Answer now\s*$/, '')
-      await throwIfTerminalError(page)
-    }
-      if (currentText.length > previousText.length && currentText.startsWith(previousText)) {
-        const delta = currentText.slice(previousText.length)
-        previousText = currentText
-        lastGrowth = Date.now()
+      if (snapshot.sessionExpired) {
+        throw new LlmError(
+          'The ChatGPT session has expired. Delete the plugin profile directory and run again to sign in.',
+          'AUTH',
+        )
+      }
+      if (page.isClosed()) throw new LlmError('ChatGPT Web page was closed mid-turn.', 'TRANSPORT')
+      const running = snapshot.running
+      if (process.env['DSH_CHATGPT_DEBUG'] === '1') {
+        console.log(
+          `[dsh-llm-chatgpt-web] poll base=${baseCount} segs=${snapshot.segments.length}`
+          + ` visible=${snapshot.visibleText.length} copy=${snapshot.completionActionVisible}`
+          + ` running=${running}`,
+        )
+      }
+
+      // Segment texts are raw DOM text; commit Markdown via the buffer.
+      const segments = snapshot.segments.map(segment => ({
+        ...segment,
+        text: chatGptHtmlToMarkdown(segment.html) || segment.text,
+      }))
+      let delta = ''
+      try {
+        delta = markdownBuffer.observe(segments)
+      } catch {
+        // Consistency errors are surfaced as PROVIDER_ERROR below.
+        throw new LlmError(
+          'ChatGPT rewrote text that was already streamed; the turn cannot be completed safely.',
+          'PROVIDER_ERROR',
+        )
+      }
+      if (delta.length > 0) {
         yield { type: 'delta', delta }
-      } else if (currentText !== previousText && currentText.length >= previousText.length) {
-        // Re-render without prefix continuity (formatting pass): resync silently
-        // once the turn settles; never emit a duplicated prefix as a delta.
-        previousText = currentText
+      }
+
+      // Upstream chrome filters: a bare "Thinking" header or an "Answer now"
+      // suffix must never be output.
+      const visible = snapshot.visibleText.replace(/^Thinking\s*\n+/, '').replace(/(?:^|\s)Answer now\s*$/, '')
+      const responsePresent = snapshot.responsePresent
+
+      // Completion (upstream predicate + signature stability): response
+      // present, not running, non-empty text, copy action visible, and the
+      // signature unchanged for REQUIRED_STABLE_MS.
+      const signature = `${visible}\0${snapshot.segments.map(s => s.key).join(',')}`
+      const complete = responsePresent && !running && visible.length > 0 && snapshot.completionActionVisible
+      if (complete && signature === lastSignature) {
+        stableSince ??= Date.now()
+        if (Date.now() - stableSince >= REQUIRED_STABLE_MS) {
+          const final = markdownBuffer.finish()
+          if (final.delta.length > 0) yield { type: 'delta', delta: final.delta }
+          return final.markdown.length > 0 ? final.markdown : visible
+        }
+      } else {
+        stableSince = undefined
+      }
+      lastSignature = signature
+      if (visible.length > previousVisible.length) {
         lastGrowth = Date.now()
       }
-      const running = await stopVisible(page)
-      let copyVisible = false
-      if (responseTurn && count > 0) {
-        copyVisible = await responseTurn.locator(CHATGPT_COMPLETION_ACTION_SELECTOR)
-          .last().isVisible().catch(() => false)
-        if (!copyVisible) {
-          copyVisible = await page.locator(CHATGPT_COMPLETION_ACTION_SELECTOR)
-            .last().isVisible().catch(() => false)
+      previousVisible = visible
+
+      // Settled without a copy action: upstream grants a grace window, then
+      // accepts a quiet finish (some surfaces render no copy button).
+      if (responsePresent && !running && visible.length > 0 && !snapshot.completionActionVisible) {
+        copyMissingSince ??= Date.now()
+        if (Date.now() - copyMissingSince >= CHATGPT_COMPLETION_ACTION_GRACE_MS) {
+          const final = markdownBuffer.finish()
+          if (final.delta.length > 0) yield { type: 'delta', delta: final.delta }
+          return final.markdown.length > 0 ? final.markdown : visible
         }
+      } else {
+        copyMissingSince = undefined
       }
-      const responsePresent = count > baseCount || (count > 0 && previousText.length > 0)
-      const settled = responsePresent && !running && previousText.length > 0 && copyVisible
-        && currentText === lastPollText
-      lastPollText = currentText
-      settledObservations = settled ? settledObservations + 1 : 0
-      if (settledObservations >= REQUIRED_SETTLED_OBSERVATIONS) {
-        return previousText
-      }
-      if (!running && previousText.length > 0 && Date.now() - lastGrowth >= options.stallTimeoutMs) {
-        // Settled without an explicit completion action: accept a quiet finish
-        // rather than hanging (some surfaces render no copy button on retry turns).
-        return previousText
-      }
-      if (Date.now() - lastGrowth >= options.stallTimeoutMs) {
+
+      // Stall verdict: only when generation is NOT running and nothing has
+      // grown. A visible stop button proves ChatGPT is still generating
+      // (reasoning models can think for many minutes before first text), so
+      // the whole-turn deadline above — not the stall clock — governs it.
+      if (!running && Date.now() - lastGrowth >= options.stallTimeoutMs) {
+        if (responsePresent && visible.length > 0) {
+          // Quiet finish: settled, no copy action, grace already elapsed.
+          const final = markdownBuffer.finish()
+          if (final.delta.length > 0) yield { type: 'delta', delta: final.delta }
+          return final.markdown.length > 0 ? final.markdown : visible
+        }
+        console.log(
+          `[dsh-llm-chatgpt-web] stall diagnosis: baseCount=${baseCount}`
+          + ` segments=${snapshot.segments.length} visible=${visible.length} running=${running}`
+          + ` copyAction=${snapshot.completionActionVisible} url=${page.url()}`,
+        )
+        if (process.env['DSH_CHATGPT_DEBUG'] === '1') {
+          const stamp = Date.now()
+          await page.screenshot({ path: `/tmp/dsh-stall-${stamp}.png` }).catch(() => {})
+          console.log(`[dsh-llm-chatgpt-web] stall screenshot: /tmp/dsh-stall-${stamp}.png`)
+        }
         throw new LlmError(
           `ChatGPT Web turn stalled with no output growth for ${options.stallTimeoutMs}ms.`,
           'TIMEOUT',
         )
       }
-      await waitForDomMutation(page, 1_000)
+      // Upstream cadence: a plain 250ms sleep between polls; no dense
+      // MutationObserver evaluate inside the streaming loop.
+      await new Promise(resolveSleep => setTimeout(resolveSleep, 250))
     }
   }
 
   // Rounds: the prompt, then up to two in-chat nudges when the task needs a
   // tool call but the model narrated instead of emitting a fenced block.
-  const NUDGE = ('[System reminder] That was narration, not a tool call — nothing executed, the task is NOT done. '
-    + 'Reply AGAIN with your ENTIRE message being ONLY this shape (one line, real JSON, no prose before or after):\n'
+  const NUDGE = ('[System reminder] Your last reply was narration or a refusal — nothing executed, the task is NOT done. '
+    + 'The tool interface IS available in this chat (the harness executes fenced blocks and returns results here); claiming otherwise is incorrect. '
+    + 'Reply AGAIN with your ENTIRE message being ONLY this shape (real JSON, no prose before or after, use a real tool name and real argument values from the task):\n'
     + '```tool-call\n{"name": "<one of the advertised tools>", "arguments": {…}}\n```')
-  const fenceSeen = (text: string): boolean => /`{0,3}\s*tool-call/.test(text)
+  // A usable fence needs the tag AND a JSON body start inside the block —
+  // a bare "tool-call" word (backticks eaten) with the payload after a
+  // stray fence marker still counts; prose mentioning tool-call does not.
+  const fenceSeen = (text: string): boolean => /`{0,3}\s*tool-call[ \t]*\r?\n?[^{]*\{/.test(text)
   const maxRounds = options.requiresToolCall ? 3 : 1
   let captured = ''
+  const round0Base = await assistantTurns.count().catch(() => initialAssistantTurns)
   for (let round = 0; round < maxRounds; round += 1) {
     const isNudge = round > 0
     const baseCount = isNudge
-      ? await assistantTurns.count().catch(() => initialAssistantTurns)
-      : initialAssistantTurns
+      ? await assistantTurns.count().catch(() => round0Base)
+      : round0Base
     await attach(isNudge ? NUDGE : options.prompt)
     await submit(baseCount)
     const roundText = yield* captureRound(baseCount)
-    captured += (captured.length > 0 ? '\n\n' : '') + roundText
+    // Only the FINAL round's text is the answer: nudged rounds are failed
+    // attempts (refusals/narration), and including them would duplicate
+    // stale text (observed live: "FILE WRITTEN" x3 from 3 rounds).
+    captured = roundText
     if (!options.requiresToolCall || fenceSeen(captured)) break
     if (round === 0) {
       console.log('[dsh-llm-chatgpt-web] no tool-call block; nudging in-chat')
