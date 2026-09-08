@@ -10,7 +10,7 @@
  * @module dsh-llm-chatgpt-web/daemon-main
  */
 
-import { chmodSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { chromium } from 'playwright-core'
 import { endpointPath, type DaemonEndpoint } from './daemon.ts'
 import {
@@ -68,6 +68,11 @@ async function main(): Promise<void> {
     ignoreDefaultArgs: STEALTH_IGNORE_DEFAULT_ARGS,
   })
   const shutdown = async (): Promise<never> => {
+    // Delete the endpoint BEFORE closing the server: a client that reads the
+    // file after this moment goes down the respawn path instead of racing a
+    // dying daemon (connect succeeded once mid-close; newPage then failed
+    // with "Browser closed").
+    rmSync(endpointPath(args.profileDir), { force: true })
     await server.close().catch(() => {})
     process.exit(0)
   }

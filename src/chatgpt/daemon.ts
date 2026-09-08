@@ -161,7 +161,10 @@ export async function ensureDaemonBrowser(
       console.log('[dsh-llm-chatgpt-web] attaching to live daemon')
       touchEndpoint(profileDir)
       return browser
-    } catch {
+    } catch (error) {
+      // Endpoint exists but connect failed: daemon died mid-flight (idle
+      // exit, reboot, kill). Reap the marked browser, then respawn below.
+      console.log('[dsh-llm-chatgpt-web] endpoint stale, respawning daemon')
       await reapStaleBrowser(existing)
     }
   }
