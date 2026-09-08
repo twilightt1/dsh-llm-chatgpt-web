@@ -56,6 +56,7 @@
   },
   "scripts": {
     "build": "tsdown",
+    "prepare": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -64,5 +65,13 @@
   },
   "publishConfig": {
     "access": "public"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/twilightt1/dsh-llm-chatgpt-web.git"
+  },
+  "bugs": {
+    "url": "https://github.com/twilightt1/dsh-llm-chatgpt-web/issues"
+  },
+  "homepage": "https://github.com/twilightt1/dsh-llm-chatgpt-web#readme"
 }

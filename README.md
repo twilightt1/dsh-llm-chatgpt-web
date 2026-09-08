@@ -4,6 +4,16 @@ ChatGPT Web as a DeepSeek Harness (`dsh`) provider — standalone. The plugin
 owns its Chromium, signs in once, and drives ChatGPT Temporary Chat directly.
 No API key, no bridge daemon, no Codex.
 
+```sh
+dsh plugin --profile web add github:twilightt1/dsh-llm-chatgpt-web
+dsh web
+# Model picker → provider "chatgpt-web"
+```
+
+> pnpm ≥10 blocks dependency build scripts by default; this package ships
+> prebuilt `lib/` and needs **no** `allowBuilds` entry. If your client still
+> prompts, decline it — nothing here needs to run at install time.
+
 ## How it works
 
 ```
@@ -42,10 +52,10 @@ pnpm pack   # → dsh-llm-chatgpt-web-0.x.y.tgz
 dsh plugin --profile web add ./dsh-llm-chatgpt-web-0.x.y.tgz
 ```
 
-**C. GitHub (after publishing; commit `lib/`):**
+**C. GitHub (prebuilt `lib/` committed — no build permission needed):**
 
 ```sh
-dsh plugin --profile web add github:you/dsh-llm-chatgpt-web#<commit-or-tag>
+dsh plugin --profile web add github:twilightt1/dsh-llm-chatgpt-web
 ```
 
 Then select provider `chatgpt-web` (model `chatgpt-web/high` or per your
