@@ -25,7 +25,7 @@ import { CHATGPT_COMPOSER_SELECTOR, detectChatGptAccountCapabilities } from './c
 import type { ChatGptWebAccountCapabilities } from './chatgpt/session.ts'
 import { COMPOSER_CHAR_BUDGET, prepareTemporaryChatSurface, streamTextTurn } from './chatgpt/turn.ts'
 import { estimateUsage } from './chatgpt/usage.ts'
-import { parseToolCalls, renderRejectionNotice } from './chatgpt/toolcalls.ts'
+import { buildSchemaIndex, parseToolCallsWithSchemas, renderRejectionNotice } from './chatgpt/toolcalls.ts'
 
 /** Monotonic suffix for provider-issued call ids (unique per process). */
 let toolCallSequence = 0
@@ -239,7 +239,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
     yield { type: 'block-end', index: textIndex, block: textBlock }
     let callCount = 0
     if (known.size > 0) {
-      const parsed = parseToolCalls(fullText, known)
+      const parsed = parseToolCallsWithSchemas(fullText, buildSchemaIndex(options.tools ?? []))
       let nextIndex = textIndex + 1
       for (const segment of parsed.segments) {
         if (segment.type !== 'call') continue

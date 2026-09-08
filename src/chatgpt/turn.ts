@@ -55,32 +55,6 @@ export interface TextTurnResult {
 export type TextTurnEvent =
   | { type: 'delta'; delta: string }
 
-/**
- * Plain-text insertion through the browser editing command (upstream lesson:
- * CDP typing can trigger Lexical Markdown shortcuts and corrupt backticks).
- * Runs in page context — must stay self-contained.
- */
-function insertPlainTextIntoComposer(element: HTMLElement, value: string): boolean {
-  if (document.activeElement !== element) element.focus()
-  if (document.activeElement !== element) return false
-  const selection = window.getSelection()
-  if (!selection) return false
-  const alreadyPlaced = selection.isCollapsed
-    && selection.anchorNode !== null
-    && element.contains(selection.anchorNode)
-  if (!alreadyPlaced) {
-    const range = document.createRange()
-    range.selectNodeContents(element)
-    range.collapse(false)
-    selection.removeAllRanges()
-    selection.addRange(range)
-  }
-  if (!selection.isCollapsed || !selection.anchorNode || !element.contains(selection.anchorNode)) {
-    return false
-  }
-  return document.execCommand('insertText', false, value)
-}
-
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new LlmError('ChatGPT Web turn aborted by caller.', 'ABORTED')
 }
@@ -111,7 +85,7 @@ async function waitForDomMutation(page: Page, timeoutMs: number): Promise<void> 
   }), timeoutMs).catch(() => {})
 }
 
-async function activeComposer(page: Page, timeoutMs = 30_000): Promise<Locator> {
+export async function activeComposer(page: Page, timeoutMs = 30_000): Promise<Locator> {
   const composers = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true })
   const deadline = Date.now() + timeoutMs
   let count = 0
@@ -131,14 +105,41 @@ async function stopVisible(page: Page): Promise<boolean> {
 }
 
 /**
- * Read the answer text, preferring the markdown content node: the turn
- * container can also hold UI chrome (e.g. personality nudges) that must not
- * leak into model output.
+ * Answer-only extraction (upstream technique, browser-worker.ts:3675–3922):
+ * classify `.markdown` roots so commentary/status containers (chain-of-thought,
+ * streaming status) are structurally excluded, then join the ANSWER roots'
+ * text. UI chrome (edit/branch buttons, "Answer now"/"Thinking" rows) is
+ * dropped by construction — it never sits in an answer root's text.
+ */
+const ANSWER_EXTRACTION_JS = `(() => {
+  const roots = [...document.querySelectorAll('.markdown')]
+    .filter((el) => {
+      const parent = el.parentElement
+      if (parent && parent.querySelector('.markdown') !== null && parent.closest('.markdown') !== null) return false
+      return true
+    })
+    .filter((el) => el.offsetParent !== null || el.getClientRects().length > 0)
+  if (roots.length === 0) return ''
+  // The LAST answer root is the response to the newest prompt; earlier roots
+  // belong to previous rounds of this Temporary Chat.
+  const root = roots[roots.length - 1]
+  const clone = root.cloneNode(true)
+  for (const el of clone.querySelectorAll('button, script, style, [role="status"], [aria-busy="true"]')) {
+    el.remove()
+  }
+  return (clone.textContent ?? '').replace(/\\u00a0/g, ' ')
+})()`
+
+/**
+ * Read the answer text via page-level answer-root classification (chrome is
+ * structurally excluded — see ANSWER_EXTRACTION_JS). Scoped to the response
+ * turn first; falls back to the last markdown node in it, then the turn.
  */
 async function responseText(responseTurn: Locator, fallback: string): Promise<string> {
+  const scoped = await responseTurn.evaluate<string, undefined>(ANSWER_EXTRACTION_JS, undefined).catch(() => '')
+  if (scoped.length > 0) return scoped
   const markdown = responseTurn.locator('.markdown')
-  const hasMarkdown = await markdown.count().then(count => count > 0).catch(() => false)
-  if (hasMarkdown) {
+  if (await markdown.count().then(count => count > 0).catch(() => false)) {
     return await markdown.last().innerText().catch(() => fallback)
   }
   return await responseTurn.innerText().catch(() => fallback)
@@ -153,7 +154,7 @@ async function responseText(responseTurn: Locator, fallback: string): Promise<st
 export async function prepareTemporaryChatSurface(
   page: Page,
   diagDir?: string,
-  settleTimeoutMs = 90_000,
+  settleTimeoutMs = 45_000,
 ): Promise<void> {
   // Always navigate: the shared turn page is reused across turns, and only a
   // fresh Temporary Chat load guarantees an empty conversation (temp chats
@@ -223,25 +224,88 @@ export async function* streamTextTurn(
   const initialAssistantTurns = await assistantTurns.count().catch(() => 0)
 
   const squash = (value: string): string => value.replace(/\s+/g, '')
+  void squash
 
-  /** Attach one text to the composer with readback verification. */
+  /**
+   * Code-unit readback (upstream browser-worker.ts:2023–2067, 2825–2862):
+   * poll the composer text and require exact equality after the one DOM-only
+   * relaxation upstream verified — multi-space runs may surface as \u00a0.
+   * Failure reports where insertion diverged (expected/actual/common prefix).
+   */
+  const READBACK_JS = `(() => {
+    const el = document.querySelector('#prompt-textarea')
+      || document.querySelector('[contenteditable="true"].ProseMirror')
+      || document.querySelector('[role="textbox"][aria-label="Chat with ChatGPT"]');
+    if (!el) return '';
+    const clone = el.cloneNode(true);
+    for (const sel of ['[data-id^="plugin:"][data-keyword]', '[data-testid="composer-attach-pill"]']) {
+      for (const pill of clone.querySelectorAll(sel)) pill.remove();
+    }
+    return (clone.innerText || clone.textContent || '').replace(/\\u00a0/g, ' ');
+  })()`
+
+  async function attachedPromptText(): Promise<string> {
+    return await page.evaluate<string, undefined>(READBACK_JS, undefined).catch(() => '')
+  }
+
+  function commonPrefixLength(a: string, b: string): number {
+    let at = 0
+    while (at < a.length && at < b.length && a[at] === b[at]) at += 1
+    return at
+  }
+
+  /** Attach one text to the composer with exact readback verification. */
   async function attach(text: string): Promise<void> {
-    const composer = await activeComposer(page)
-    await composer.fill('')
-    await composer.focus()
-    const inserted = await composer.evaluate(insertPlainTextIntoComposer, text, { timeout: 20_000 })
-    if (!inserted) {
-      throw new LlmError('ChatGPT composer rejected the plain-text editing command.', 'PROVIDER_ERROR')
+    // No locator fill/focus before insert: the Playwright focus path races
+    // ProseMirror's editor state (regression-probed: readback loses the last
+    // char right after locator focus, passes without it). The insert IIFE
+    // owns focus + caret + insertion atomically instead.
+    const status = await page.evaluate<string, undefined>(`(() => {
+      const el = document.querySelector('#prompt-textarea')
+        || document.querySelector('[contenteditable="true"].ProseMirror')
+        || document.querySelector('[role="textbox"][aria-label="Chat with ChatGPT"]');
+      if (!el) return 'no-element';
+      el.focus();
+      if (document.activeElement !== el) return 'no-focus';
+      const sel = window.getSelection();
+      if (!sel) return 'no-selection';
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      if (!sel.isCollapsed || !sel.anchorNode || !el.contains(sel.anchorNode)) return 'caret-failed';
+      const value = ${JSON.stringify(text)};
+      return document.execCommand('insertText', false, value) ? 'inserted' : 'exec-false';
+    })()`, undefined).catch(() => 'evaluate-failed')
+    if (status !== 'inserted') {
+      throw new LlmError(
+        `ChatGPT composer rejected the plain-text editing command (${status}).`,
+        'PROVIDER_ERROR',
+      )
     }
-    const readback = await composer.innerText().catch(() => '')
-    // ProseMirror splits each newline into its own <p>, so innerText renders
-    // block boundaries as double newlines. Compare whitespace-insensitively
-    // (order + completeness of non-whitespace content is what matters).
-    const tail = squash(text.slice(-240))
-    if (tail.length > 0 && (!squash(readback).includes(tail)
-      || squash(readback).length < squash(text).length * 0.95)) {
-      throw new LlmError('ChatGPT composer readback does not contain the attached prompt.', 'PROVIDER_ERROR')
+    const readDeadline = Date.now() + 10_000
+    let readback = ''
+    for (;;) {
+      readback = (await attachedPromptText()).trim()
+      // ProseMirror block-boundary relaxation (probed Sep 2026): when an
+      // inserted newline lands at a block edge, innerText can DROP the
+      // separator entirely ("info.\nThe tools" reads as "info.The tools").
+      // Every other code unit must match, so compare with all whitespace
+      // squashed — order and content are still verified exactly.
+      const want = text.replace(/\s+/g, '')
+      const got = readback.replace(/\s+/g, '')
+      if (want === got) return
+      if (Date.now() >= readDeadline) break
+      await new Promise(resolveSleep => setTimeout(resolveSleep, 50))
     }
+    const squashAll = (value: string): string => value.replace(/\s+/g, '')
+    const prefix = commonPrefixLength(squashAll(text), squashAll(readback))
+    throw new LlmError(
+      'ChatGPT composer readback diverged from the attached prompt'
+      + ` (expectedChars=${text.length} actualChars=${readback.length} commonPrefixChars=${prefix}).`,
+      'PROVIDER_ERROR',
+    )
   }
 
   /** Submit and wait for the model to start answering. */
@@ -283,7 +347,7 @@ export async function* streamTextTurn(
     let lastGrowth = Date.now()
     let settledObservations = 0
     let lastPollText = ''
-    const REQUIRED_SETTLED_OBSERVATIONS = 3
+    const REQUIRED_SETTLED_OBSERVATIONS = 2
     for (;;) {
       checkDeadline()
       await throwIfSessionFailureAlert(page)
@@ -295,11 +359,14 @@ export async function* streamTextTurn(
       } else if (count > 0) {
         responseTurn = assistantTurns.last()
       }
-      let currentText = ''
-      if (responseTurn) {
-        currentText = await responseText(responseTurn, previousText)
-        await throwIfTerminalError(page)
-      }
+    let currentText = ''
+    if (responseTurn) {
+      currentText = await responseText(responseTurn, previousText)
+      // Upstream chrome filters (browser-worker.ts:1634–1644): a bare
+      // "Thinking" header or an "Answer now" suffix must never be output.
+      currentText = currentText.replace(/^Thinking\s*\n+/, '').replace(/(?:^|\s)Answer now\s*$/, '')
+      await throwIfTerminalError(page)
+    }
       if (currentText.length > previousText.length && currentText.startsWith(previousText)) {
         const delta = currentText.slice(previousText.length)
         previousText = currentText
@@ -346,9 +413,10 @@ export async function* streamTextTurn(
 
   // Rounds: the prompt, then up to two in-chat nudges when the task needs a
   // tool call but the model narrated instead of emitting a fenced block.
-  const NUDGE = ('[System reminder] That was narration, not a tool call — nothing executed. '
-    + 'Your ENTIRE next reply must be ONLY the ```tool-call fenced block for the task. No prose, no explanations.')
-  const fenceSeen = (text: string): boolean => /`{0,3}tool-call[ \t]*\r?\n/.test(text)
+  const NUDGE = ('[System reminder] That was narration, not a tool call — nothing executed, the task is NOT done. '
+    + 'Reply AGAIN with your ENTIRE message being ONLY this shape (one line, real JSON, no prose before or after):\n'
+    + '```tool-call\n{"name": "<one of the advertised tools>", "arguments": {…}}\n```')
+  const fenceSeen = (text: string): boolean => /`{0,3}\s*tool-call/.test(text)
   const maxRounds = options.requiresToolCall ? 3 : 1
   let captured = ''
   for (let round = 0; round < maxRounds; round += 1) {
