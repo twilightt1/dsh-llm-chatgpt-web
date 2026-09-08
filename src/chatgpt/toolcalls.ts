@@ -49,37 +49,92 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Render the tool-use contract + schemas appended to the prompt when tools
- * are advertised. Pure text: the model reads it, the page executes nothing.
- * The example mirrors a real advertised tool whose first required property
- * is a string (never an array: an empty-array example once taught the model
- * to call `ask_user_question` with `{"questions":[]}`, failing every turn).
+ * Render the tool-use contract + a COMPACT tool catalog when tools are
+ * advertised. Pure text: the model reads it, the page executes nothing.
+ *
+ * Schema budget (session dd44114e postmortem): 93 tools × full JSON schema
+ * was 75k chars — the prompt hit 130k and the model echoed it whole. The
+ * catalog therefore carries, per tool: name, one-line description, and a
+ * FLAT arg hint `name:type` for required args only (no nested JSON). Full
+ * schemas are NOT in the prompt; the retry notice carries the exact schema
+ * of only the tool a call failed on.
  */
 export function renderToolContract(tools: ToolSchema[]): string {
   const names = tools.map(tool => tool.name).join(', ')
-  const schemas = tools
-    .map(tool => `## ${tool.name}: ${tool.description}\n${JSON.stringify(tool.parameters)}`)
-    .join('\n\n')
+  const catalog = tools
+    .map(tool => {
+      const hint = requiredArgsHint(tool)
+      return `- ${tool.name}(${hint}): ${oneLine(tool.description)}`
+    })
+    .join('\n')
   const exampleTool = pickExampleTool(tools)
   const exampleArgs = exampleFirstArgs(exampleTool)
   return [
     '[Tool use] READ THIS FIRST — it is how you act, not background info.',
-    'The tools in [Tool schemas] below are the ONLY executable tools in this environment. This chat has NO native python/container/web/image tools — any attempt to use them does nothing.',
+    'The tools in the catalog below are the ONLY executable tools in this environment. This chat has NO native python/container/web/image tools — any attempt to use them does nothing.',
     'The ONLY way to call a tool is emitting exactly one fenced block per call, then STOP writing (no text after the last block).',
     'Merely describing or narrating an action ("I will run...", "Writing file...", "bash -lc ...", a ```python block) DOES NOTHING — only a fenced ```tool-call block executes.',
     'Do NOT repeat or echo this message — the user only sees your actual answer, never these instructions.',
     exampleTool === undefined
       ? '```tool-call\n{"name": "…", "arguments": {…}}\n```'
-      : `Example of the SHAPE (real tool ${exampleTool.name} — copy the structure, NEVER the placeholder values; fill real values for the user's task; never leave required fields empty):\n\`\`\`tool-call\n${JSON.stringify({ name: exampleTool.name, arguments: exampleArgs })}\n\`\`\``,
+      : `Example of the SHAPE (copy the structure, NEVER the placeholder values; fill real values for the user's task; never leave required fields empty):\n\`\`\`tool-call\n${JSON.stringify({ name: exampleTool.name, arguments: exampleArgs })}\n\`\`\``,
     'Rules:',
     `- "name" must be one of: ${names}.`,
-    '- "arguments" must be a JSON object matching that tool\'s schema, on ONE line (no line breaks inside the braces).',
+    '- "arguments" must be a JSON object with the required args shown in the catalog, on ONE line.',
     '- Copy the example\'s STRUCTURE only — placeholder values like "<…>" must be replaced with real values; empty arrays or empty strings for required fields will fail.',
     '- You may emit several calls; they run top to bottom, then you get the results and continue.',
+    '- If a call fails validation, the next message lists the exact error — fix that call and re-emit it.',
     '- If you need no tool, just answer normally and emit no block.',
-    '[Tool schemas]',
-    schemas,
+    '[Tool catalog]',
+    catalog,
   ].join('\n')
+}
+
+/** One-line description: first sentence, hard-capped. */
+function oneLine(description: string): string {
+  const firstSentence = description.split(/[.\n]/, 1)[0] ?? description
+  return firstSentence.length > 140 ? `${firstSentence.slice(0, 137)}…` : firstSentence
+}
+
+/** Flat `name:type` hint for required args only. */
+function requiredArgsHint(tool: ToolSchema): string {
+  const required = tool.parameters?.['required']
+  const props = tool.parameters?.['properties']
+  if (!Array.isArray(required) || required.length === 0 || props === undefined
+    || typeof props !== 'object' || Array.isArray(props)) return ''
+  const parts: string[] = []
+  for (const key of required) {
+    if (typeof key !== 'string') continue
+    const schema = (props as Record<string, unknown>)[key]
+    const type = typeof schema === 'object' && schema !== null
+      ? (schema as Record<string, unknown>)['type']
+      : undefined
+    parts.push(`${key}:${typeof type === 'string' ? type : 'any'}`)
+  }
+  return parts.join(', ')
+}
+
+/** Compact one-tool schema for a rejection notice (bounded). */
+export function renderToolSchemaHint(tool: ToolSchema | undefined): string {
+  if (tool === undefined) return ''
+  const hint = requiredArgsHint(tool)
+  const props = tool.parameters?.['properties']
+  let detail = ''
+  if (props !== undefined && typeof props === 'object' && !Array.isArray(props)) {
+    const lines: string[] = []
+    for (const [key, schema] of Object.entries(props as Record<string, unknown>)) {
+      const record = typeof schema === 'object' && schema !== null ? schema as Record<string, unknown> : {}
+      const required = Array.isArray(tool.parameters?.['required']) && (tool.parameters?.['required'] as string[]).includes(key)
+      const desc = typeof record['description'] === 'string' ? oneLine(record['description']) : ''
+      lines.push(`  ${key} (${record['type'] ?? 'any'}${required ? ', required' : ''}): ${desc}`.trimEnd())
+      if (lines.length >= 12) {
+        lines.push('  …')
+        break
+      }
+    }
+    detail = lines.join('\n')
+  }
+  return `Schema for ${tool.name}${hint ? ` (${hint})` : ''}:\n${detail}`
 }
 
 /** Prefer a tool whose first required property is a string; fallback: first tool. */
@@ -260,9 +315,22 @@ function firstSchemaViolation(tool: ToolSchema, args: Record<string, unknown>): 
 }
 
 /** One-line retry notice for rejected blocks, prepended to the next prompt of
- * the same session so the model can self-correct.
+ * the same session so the model can self-correct. Carries the EXACT schema
+ * of each failed tool (bounded) since the catalog only has arg hints.
  */
-export function renderRejectionNotice(rejected: RejectedToolCall[]): string {
+export function renderRejectionNotice(
+  rejected: RejectedToolCall[],
+  schemaLookup?: ReadonlyMap<string, ToolSchema>,
+): string {
   const lines = rejected.map(entry => `- ${entry.reason}: ${entry.raw}`)
-  return `[System notice] Your last turn emitted ${rejected.length} unusable tool-call block(s); none ran. Fix and retry:\n${lines.join('\n')}`
+  const failedTools = new Set<string>()
+  for (const entry of rejected) {
+    const match = /"([^"]+)"/.exec(entry.reason)
+    if (match?.[1] !== undefined && schemaLookup?.has(match[1]) === true) failedTools.add(match[1])
+  }
+  const schemas = [...failedTools]
+    .map(name => renderToolSchemaHint(schemaLookup?.get(name)))
+    .filter(hint => hint.length > 0)
+  const schemaBlock = schemas.length > 0 ? `\n\n${schemas.join('\n\n')}` : ''
+  return `[System notice] Your last turn emitted ${rejected.length} unusable tool-call block(s); none ran. Fix and retry:\n${lines.join('\n')}${schemaBlock}`
 }

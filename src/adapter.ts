@@ -297,7 +297,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         for (const entry of parsed.rejected) {
           console.log(`[dsh-llm-chatgpt-web] rejected tool-call: ${entry.reason} :: ${JSON.stringify(entry.raw)}`)
         }
-        this.stashNotice(options, renderRejectionNotice(parsed.rejected))
+        this.stashNotice(options, renderRejectionNotice(parsed.rejected, buildSchemaIndex(options.tools ?? [])))
       }
     }
     yield { type: 'usage', usage: estimateUsage(prompt.length, fullText.length) }

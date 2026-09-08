@@ -76,14 +76,23 @@ describe('parseToolCalls', () => {
 })
 
 describe('renderToolContract', () => {
-  it('names tools and embeds schemas', () => {
+  it('names tools with flat arg hints, no full schemas', () => {
     const contract = renderToolContract([
-      { name: 'bash', description: 'run shell', parameters: { type: 'object' } },
+      { name: 'bash', description: 'Run shell. Extra detail.', parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'The command' },
+          description: { type: 'string', description: 'What it does' },
+          timeoutMs: { type: 'number' },
+        },
+        required: ['command', 'description'],
+      } },
     ])
     expect(contract).toContain('```tool-call')
-    expect(contract).toContain('bash')
-    expect(contract).toContain('{"type":"object"}')
-    expect(contract).toContain('then STOP')
+    expect(contract).toContain('bash(command:string, description:string)')
+    expect(contract).toContain('Run shell')
+    // Full nested schema must NOT appear (75k-char echo prevention)
+    expect(contract).not.toContain('"properties"')
   })
 })
 
