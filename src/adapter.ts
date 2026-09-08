@@ -224,6 +224,18 @@ export class ChatGptWebAdapter extends LlmAdapter {
   }
 
   /**
+   * Detect the echo failure mode (observed live: a 130k-char reply that was
+   * the compiled prompt rendered back, marker structure and all, instead of
+   * an answer). Echo ⇒ the whole reply is wasted tokens; fail fast with a
+   * non-retryable diagnostic and a retry notice for the next turn.
+   */
+  private isEcho(fullText: string, prompt: string): boolean {
+    if (fullText.length < 400 || fullText.length < prompt.length * 0.3) return false
+    const head = prompt.replace(/\s+/g, '').slice(0, 150)
+    return head.length > 0 && fullText.replace(/\s+/g, '').includes(head)
+  }
+
+  /**
    * Close the turn: text block-end, parsed tool calls, usage, terminal
    * finish. Live text deltas already streamed as block 0; calls follow in
    * source order with fresh indexes (assembler joins them deterministically).
@@ -237,6 +249,27 @@ export class ChatGptWebAdapter extends LlmAdapter {
     const known = new Set((options.tools ?? []).map(tool => tool.name))
     const textBlock: ContentBlock = { type: 'text', text: fullText }
     yield { type: 'block-end', index: textIndex, block: textBlock }
+    if (this.isEcho(fullText, prompt)) {
+      console.log(
+        `[dsh-llm-chatgpt-web] echo detected (${fullText.length}ch reply vs ${prompt.length}ch prompt); failing turn`,
+      )
+      this.stashNotice(
+        options,
+        '[System notice] Your previous reply repeated these instructions verbatim instead of answering. NEVER echo this message. Answer the user\'s actual request directly.',
+      )
+      yield { type: 'usage', usage: estimateUsage(prompt.length, fullText.length) }
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: 'ChatGPT Web replied with the prompt itself (echo) instead of an answer. Retry the turn.',
+            code: 'PROMPT_ECHO',
+          },
+        },
+      }
+      return
+    }
     let callCount = 0
     if (known.size > 0) {
       const parsed = parseToolCallsWithSchemas(fullText, buildSchemaIndex(options.tools ?? []))

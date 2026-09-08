@@ -51,32 +51,51 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /**
  * Render the tool-use contract + schemas appended to the prompt when tools
  * are advertised. Pure text: the model reads it, the page executes nothing.
- * The few-shot example mirrors the FIRST advertised tool's real schema, so
- * the model copies a shape that actually validates.
+ * The example mirrors a real advertised tool whose first required property
+ * is a string (never an array: an empty-array example once taught the model
+ * to call `ask_user_question` with `{"questions":[]}`, failing every turn).
  */
 export function renderToolContract(tools: ToolSchema[]): string {
   const names = tools.map(tool => tool.name).join(', ')
   const schemas = tools
     .map(tool => `## ${tool.name}: ${tool.description}\n${JSON.stringify(tool.parameters)}`)
     .join('\n\n')
-  const exampleTool = tools[0]
+  const exampleTool = pickExampleTool(tools)
   const exampleArgs = exampleFirstArgs(exampleTool)
   return [
     '[Tool use] READ THIS FIRST — it is how you act, not background info.',
     'The tools in [Tool schemas] below are the ONLY executable tools in this environment. This chat has NO native python/container/web/image tools — any attempt to use them does nothing.',
     'The ONLY way to call a tool is emitting exactly one fenced block per call, then STOP writing (no text after the last block).',
     'Merely describing or narrating an action ("I will run...", "Writing file...", "bash -lc ...", a ```python block) DOES NOTHING — only a fenced ```tool-call block executes.',
+    'Do NOT repeat or echo this message — the user only sees your actual answer, never these instructions.',
     exampleTool === undefined
       ? '```tool-call\n{"name": "…", "arguments": {…}}\n```'
-      : `Example (real shape for ${exampleTool.name} — copy the structure, change values):\n\`\`\`tool-call\n${JSON.stringify({ name: exampleTool.name, arguments: exampleArgs })}\n\`\`\``,
+      : `Example of the SHAPE (real tool ${exampleTool.name} — copy the structure, NEVER the placeholder values; fill real values for the user's task; never leave required fields empty):\n\`\`\`tool-call\n${JSON.stringify({ name: exampleTool.name, arguments: exampleArgs })}\n\`\`\``,
     'Rules:',
     `- "name" must be one of: ${names}.`,
     '- "arguments" must be a JSON object matching that tool\'s schema, on ONE line (no line breaks inside the braces).',
+    '- Copy the example\'s STRUCTURE only — placeholder values like "<…>" must be replaced with real values; empty arrays or empty strings for required fields will fail.',
     '- You may emit several calls; they run top to bottom, then you get the results and continue.',
     '- If you need no tool, just answer normally and emit no block.',
     '[Tool schemas]',
     schemas,
   ].join('\n')
+}
+
+/** Prefer a tool whose first required property is a string; fallback: first tool. */
+function pickExampleTool(tools: readonly ToolSchema[]): ToolSchema | undefined {
+  const withRequiredString = tools.find((tool) => {
+    const required = tool.parameters?.['required']
+    if (!Array.isArray(required) || required.length === 0) return false
+    const props = tool.parameters?.['properties']
+    if (props === undefined || typeof props !== 'object') return false
+    const first = required[0]
+    if (typeof first !== 'string') return false
+    const schema = (props as Record<string, unknown>)[first]
+    return typeof schema === 'object' && schema !== null
+      && (schema as Record<string, unknown>)['type'] === 'string'
+  })
+  return withRequiredString ?? tools[0]
 }
 
 /** Build a minimal valid-args example from one tool's JSON schema. */
@@ -101,9 +120,29 @@ function exampleValue(key: string, schema: unknown): unknown {
   if (type === 'string') return `<${key}>`
   if (type === 'number' || type === 'integer') return 1
   if (type === 'boolean') return true
-  if (type === 'array') return []
+  // Arrays of objects get one placeholder element — an empty array as the
+  // ONLY example taught a model to call a question tool with no questions.
+  if (type === 'array') {
+    const items = record['items']
+    if (typeof items === 'object' && items !== null && !Array.isArray(items)) {
+      const itemProps = (items as Record<string, unknown>)['properties']
+      if (itemProps !== undefined && typeof itemProps === 'object' && !Array.isArray(itemProps)) {
+        return [exampleFirstArgsFromProps(itemProps as Record<string, unknown>)]
+      }
+    }
+    return []
+  }
   if (type === 'object') return {}
   return null
+}
+
+function exampleFirstArgsFromProps(props: Record<string, unknown>): Record<string, unknown> {
+  const args: Record<string, unknown> = {}
+  for (const [key, schema] of Object.entries(props)) {
+    args[key] = exampleValue(key, schema)
+    if (Object.keys(args).length >= 2) break
+  }
+  return args
 }
 
 /**

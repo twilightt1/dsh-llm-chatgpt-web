@@ -77,6 +77,13 @@ declare class ChatGptWebAdapter extends LlmAdapter {
   /** Remember a retry notice for the session's next turn. */
   private stashNotice;
   /**
+   * Detect the echo failure mode (observed live: a 130k-char reply that was
+   * the compiled prompt rendered back, marker structure and all, instead of
+   * an answer). Echo ⇒ the whole reply is wasted tokens; fail fast with a
+   * non-retryable diagnostic and a retry notice for the next turn.
+   */
+  private isEcho;
+  /**
    * Close the turn: text block-end, parsed tool calls, usage, terminal
    * finish. Live text deltas already streamed as block 0; calls follow in
    * source order with fresh indexes (assembler joins them deterministically).
