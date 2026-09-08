@@ -11,6 +11,7 @@
 
 import { contentHasImage, LlmError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+import { renderToolContract } from './toolcalls.ts'
 
 function textOf(blocks: ContentBlock[]): string {
   return blocks
@@ -43,7 +44,13 @@ function renderMessage(message: Message): string {
     if (text.length > 0) parts.push(text)
     for (const block of calls) {
       if (block.type !== 'tool-call') continue
-      parts.push(`[Tool call: ${block.name} ${block.arguments}]`)
+      // Render PAST calls in the exact format the contract teaches — the
+      // model imitates its own history more faithfully than instructions.
+      let args = block.arguments
+      try {
+        args = JSON.stringify(JSON.parse(block.arguments))
+      } catch { /* keep raw */ }
+      parts.push(`\`\`\`tool-call\n{"name": ${JSON.stringify(block.name)}, "arguments": ${args}}\n\`\`\``)
     }
     return `[Assistant]\n${parts.join('\n')}`
   }
@@ -54,8 +61,9 @@ function renderMessage(message: Message): string {
  * Compile one prompt for a fresh Temporary Chat page.
  * @param options - fully assembled harness request.
  * @param maxChars - composer budget; exceeding it fails with context overflow.
+ * @param notice - optional one-shot system notice (e.g. tool-call retry).
  */
-export function compilePrompt(options: GenerateOptions, maxChars: number): string {
+export function compilePrompt(options: GenerateOptions, maxChars: number, notice?: string): string {
   if (options.reasoningEffort !== undefined) {
     throw new LlmError(
       `ChatGPT Web does not support reasoning effort "${options.reasoningEffort}"; pick the effort via the model (chatgpt-web/light|medium|high|extra-high|pro|luna).`,
@@ -72,14 +80,35 @@ export function compilePrompt(options: GenerateOptions, maxChars: number): strin
   if (options.system !== undefined && options.system.length > 0) {
     sections.push(`[System]\n${options.system}`)
   }
+  // Tool contract FIRST (before history): buried instructions get narrated
+  // instead of followed. The model must see the protocol before any content.
+  if (options.tools !== undefined && options.tools.length > 0) {
+    sections.push(renderToolContract(options.tools))
+    // Seed a REAL demonstration exchange (not prose) when the session has
+    // no tool call yet: the model imitates adjacent history far more
+    // reliably than instructions. Once real calls exist, history teaches.
+    const hasRealCalls = options.messages.some(message =>
+      message.content.some(block => block.type === 'tool-call'),
+    )
+    if (!hasRealCalls) {
+      sections.push('[User]\nReady. Demonstrate the tool protocol once: call bash with {"command": "echo priming-echo"}.')
+      sections.push('[Assistant]\n```tool-call\n{"name": "bash", "arguments": {"command": "echo priming-echo"}}\n```')
+      sections.push('[Tool result]\npriming-echo')
+      sections.push('[Assistant]\nDone — the protocol works as demonstrated.')
+    }
+  }
+  if (notice !== undefined && notice.length > 0) {
+    sections.push(notice)
+  }
   for (const message of options.messages) {
     sections.push(renderMessage(message))
   }
   if (options.tools !== undefined && options.tools.length > 0) {
-    const catalog = options.tools
-      .map(tool => `- ${tool.name}: ${tool.description}`)
-      .join('\n')
-    sections.push(`[Available tools (transcript only; reply in plain text)]\n${catalog}`)
+    // Trailing reminder: last-token-position instructions survive the
+    // platform system prompt far better than buried ones.
+    sections.push(
+      '[Reminder] If the task needs an action, your ENTIRE reply must be tool-call fenced block(s) — never narration like "bash -lc ..." or a ```python block. If it needs no action, answer in plain text.',
+    )
   }
   const prompt = sections.join('\n\n')
   if (prompt.length > maxChars) {

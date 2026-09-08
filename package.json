@@ -55,7 +55,6 @@
     "vitest": "^3.0.0"
   },
   "scripts": {
-    "postinstall": "node scripts/link-dsh-deps.mjs",
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

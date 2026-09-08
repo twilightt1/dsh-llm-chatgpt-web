@@ -15,7 +15,6 @@ import {
   CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_STOP_BUTTON_SELECTOR,
   CHATGPT_TEMPORARY_CHAT_URL,
-  CHATGPT_USER_TURN_SELECTOR,
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
 } from './session.ts'
@@ -38,6 +37,13 @@ export interface TextTurnOptions {
   turnTimeoutMs: number
   stallTimeoutMs: number
   signal?: AbortSignal
+  /**
+   * In-chat self-correction: when set, an answer with NO tool-call block
+   * while the prompt advertised tools gets one follow-up nudge in the SAME
+   * Temporary Chat ("emit the block, do not narrate"), then its new answer
+   * is captured. Detects both ```tool-call fences and eaten-backtick forms.
+   */
+  requiresToolCall?: boolean
 }
 
 export interface TextTurnResult {
@@ -213,128 +219,151 @@ export async function* streamTextTurn(
 
   await selectModelEffort(page, options.model, options.capabilities)
 
-  const userTurns = page.locator(CHATGPT_USER_TURN_SELECTOR)
   const assistantTurns = page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR)
-  const initialUserTurns = await userTurns.count().catch(() => 0)
   const initialAssistantTurns = await assistantTurns.count().catch(() => 0)
 
-  // Attach: clear, then transport the whole prompt through one editing command.
-  const composer = await activeComposer(page)
-  await composer.fill('')
-  await composer.focus()
-  const inserted = await composer.evaluate(insertPlainTextIntoComposer, options.prompt, { timeout: 20_000 })
-  if (!inserted) {
-    throw new LlmError('ChatGPT composer rejected the plain-text editing command.', 'PROVIDER_ERROR')
-  }
-  const readback = await composer.innerText().catch(() => '')
-  // ProseMirror splits each newline into its own <p>, so innerText renders
-  // block boundaries as double newlines. Compare whitespace-insensitively
-  // (order + completeness of non-whitespace content is what matters).
   const squash = (value: string): string => value.replace(/\s+/g, '')
-  const tail = squash(options.prompt.slice(-240))
-  if (tail.length > 0 && (!squash(readback).includes(tail)
-    || squash(readback).length < squash(options.prompt).length * 0.95)) {
-    throw new LlmError('ChatGPT composer readback does not contain the attached prompt.', 'PROVIDER_ERROR')
+
+  /** Attach one text to the composer with readback verification. */
+  async function attach(text: string): Promise<void> {
+    const composer = await activeComposer(page)
+    await composer.fill('')
+    await composer.focus()
+    const inserted = await composer.evaluate(insertPlainTextIntoComposer, text, { timeout: 20_000 })
+    if (!inserted) {
+      throw new LlmError('ChatGPT composer rejected the plain-text editing command.', 'PROVIDER_ERROR')
+    }
+    const readback = await composer.innerText().catch(() => '')
+    // ProseMirror splits each newline into its own <p>, so innerText renders
+    // block boundaries as double newlines. Compare whitespace-insensitively
+    // (order + completeness of non-whitespace content is what matters).
+    const tail = squash(text.slice(-240))
+    if (tail.length > 0 && (!squash(readback).includes(tail)
+      || squash(readback).length < squash(text).length * 0.95)) {
+      throw new LlmError('ChatGPT composer readback does not contain the attached prompt.', 'PROVIDER_ERROR')
+    }
   }
 
-  // Send: the enabled send button is the authority, then Enter.
-  const sendButton = composer.locator('xpath=ancestor::form[1]').getByTestId('send-button')
-  await sendButton.waitFor({ state: 'visible', timeout: 30_000 })
-  const sendDeadline = Date.now() + 20_000
-  for (;;) {
-    checkDeadline()
-    await throwIfSessionFailureAlert(page)
-    await throwIfRateLimitDialog(page)
-    if (await sendButton.isEnabled().catch(() => false)) break
-    if (Date.now() >= sendDeadline) {
-      throw new LlmError('ChatGPT send button remained disabled after the complete prompt was attached.', 'PROVIDER_ERROR')
-    }
-    await new Promise(resolveSleep => setTimeout(resolveSleep, 200))
-  }
-  await sendButton.press('Enter')
-  checkDeadline()
-
-  // Wait for submission evidence: new user turn, new assistant turn, or running.
-  const submitDeadline = Date.now() + 60_000
-  for (;;) {
-    checkDeadline()
-    await throwIfSessionFailureAlert(page)
-    await throwIfRateLimitDialog(page)
-    const users = await userTurns.count().catch(() => initialUserTurns)
-    const assistants = await assistantTurns.count().catch(() => initialAssistantTurns)
-    if (users > initialUserTurns || assistants > initialAssistantTurns || await stopVisible(page)) break
-    if (Date.now() >= submitDeadline) {
-      await throwIfTerminalError(page)
-      throw new LlmError('ChatGPT did not accept the submitted prompt (no turn appeared).', 'PROVIDER_ERROR')
-    }
-    await waitForDomMutation(page, 500)
-  }
-
-  // Stream: poll the response turn's text, emit deltas, stop on completion.
-  let previousText = ''
-  let lastGrowth = Date.now()
-  // Completion must HOLD across polls: the stop button can flicker and the
-  // copy action can render a beat before the final tokens land. Accept only
-  // after consecutive settled observations with zero text growth.
-  let settledObservations = 0
-  let lastPollText = ''
-  const REQUIRED_SETTLED_OBSERVATIONS = 3
-  for (;;) {
-    checkDeadline()
-    await throwIfSessionFailureAlert(page)
-    await throwIfRateLimitDialog(page)
-    const count = await assistantTurns.count().catch(() => 0)
-    let responseTurn: Locator | undefined
-    if (count > initialAssistantTurns) {
-      responseTurn = assistantTurns.nth(initialAssistantTurns)
-    } else if (count > 0) {
-      responseTurn = assistantTurns.last()
-    }
-    let currentText = ''
-    if (responseTurn) {
-      currentText = await responseText(responseTurn, previousText)
-      await throwIfTerminalError(page)
-    }
-    if (currentText.length > previousText.length && currentText.startsWith(previousText)) {
-      const delta = currentText.slice(previousText.length)
-      previousText = currentText
-      lastGrowth = Date.now()
-      yield { type: 'delta', delta }
-    } else if (currentText !== previousText && currentText.length >= previousText.length) {
-      // Re-render without prefix continuity (formatting pass): resync silently
-      // once the turn settles; never emit a duplicated prefix as a delta.
-      previousText = currentText
-      lastGrowth = Date.now()
-    }
-    const running = await stopVisible(page)
-    let copyVisible = false
-    if (responseTurn && count > 0) {
-      copyVisible = await responseTurn.locator(CHATGPT_COMPLETION_ACTION_SELECTOR)
-        .last().isVisible().catch(() => false)
-      if (!copyVisible) {
-        copyVisible = await page.locator(CHATGPT_COMPLETION_ACTION_SELECTOR)
-          .last().isVisible().catch(() => false)
+  /** Submit and wait for the model to start answering. */
+  async function submit(baseCount: number): Promise<void> {
+    const composer = await activeComposer(page)
+    const sendButton = composer.locator('xpath=ancestor::form[1]').getByTestId('send-button')
+    await sendButton.waitFor({ state: 'visible', timeout: 30_000 })
+    const sendDeadline = Date.now() + 20_000
+    for (;;) {
+      checkDeadline()
+      await throwIfSessionFailureAlert(page)
+      await throwIfRateLimitDialog(page)
+      if (await sendButton.isEnabled().catch(() => false)) break
+      if (Date.now() >= sendDeadline) {
+        throw new LlmError('ChatGPT send button remained disabled after the complete prompt was attached.', 'PROVIDER_ERROR')
       }
+      await new Promise(resolveSleep => setTimeout(resolveSleep, 200))
     }
-    const responsePresent = count > initialAssistantTurns || (count > 0 && previousText.length > 0)
-    const settled = responsePresent && !running && previousText.length > 0 && copyVisible
-      && currentText === lastPollText
-    lastPollText = currentText
-    settledObservations = settled ? settledObservations + 1 : 0
-    if (settledObservations >= REQUIRED_SETTLED_OBSERVATIONS) {
-      return { text: previousText, promptChars: options.prompt.length }
+    await sendButton.press('Enter')
+    checkDeadline()
+    const submitDeadline = Date.now() + 60_000
+    for (;;) {
+      checkDeadline()
+      await throwIfSessionFailureAlert(page)
+      await throwIfRateLimitDialog(page)
+      const assistants = await assistantTurns.count().catch(() => 0)
+      if (assistants > baseCount || await stopVisible(page)) break
+      if (Date.now() >= submitDeadline) {
+        await throwIfTerminalError(page)
+        throw new LlmError('ChatGPT did not accept the submitted prompt (no turn appeared).', 'PROVIDER_ERROR')
+      }
+      await waitForDomMutation(page, 500)
     }
-    if (!running && previousText.length > 0 && Date.now() - lastGrowth >= options.stallTimeoutMs) {
-      // Settled without an explicit completion action: accept a quiet finish
-      // rather than hanging (some surfaces render no copy button on retry turns).
-      return { text: previousText, promptChars: options.prompt.length }
-    }
-    if (Date.now() - lastGrowth >= options.stallTimeoutMs) {
-      throw new LlmError(
-        `ChatGPT Web turn stalled with no output growth for ${options.stallTimeoutMs}ms.`,
-        'TIMEOUT',
-      )
-    }
-    await waitForDomMutation(page, 1_000)
   }
+
+  /** Poll one round's assistant turn (created at `baseCount`) to completion. */
+  async function* captureRound(baseCount: number): AsyncGenerator<TextTurnEvent, string> {
+    let previousText = ''
+    let lastGrowth = Date.now()
+    let settledObservations = 0
+    let lastPollText = ''
+    const REQUIRED_SETTLED_OBSERVATIONS = 3
+    for (;;) {
+      checkDeadline()
+      await throwIfSessionFailureAlert(page)
+      await throwIfRateLimitDialog(page)
+      const count = await assistantTurns.count().catch(() => 0)
+      let responseTurn: Locator | undefined
+      if (count > baseCount) {
+        responseTurn = assistantTurns.nth(baseCount)
+      } else if (count > 0) {
+        responseTurn = assistantTurns.last()
+      }
+      let currentText = ''
+      if (responseTurn) {
+        currentText = await responseText(responseTurn, previousText)
+        await throwIfTerminalError(page)
+      }
+      if (currentText.length > previousText.length && currentText.startsWith(previousText)) {
+        const delta = currentText.slice(previousText.length)
+        previousText = currentText
+        lastGrowth = Date.now()
+        yield { type: 'delta', delta }
+      } else if (currentText !== previousText && currentText.length >= previousText.length) {
+        // Re-render without prefix continuity (formatting pass): resync silently
+        // once the turn settles; never emit a duplicated prefix as a delta.
+        previousText = currentText
+        lastGrowth = Date.now()
+      }
+      const running = await stopVisible(page)
+      let copyVisible = false
+      if (responseTurn && count > 0) {
+        copyVisible = await responseTurn.locator(CHATGPT_COMPLETION_ACTION_SELECTOR)
+          .last().isVisible().catch(() => false)
+        if (!copyVisible) {
+          copyVisible = await page.locator(CHATGPT_COMPLETION_ACTION_SELECTOR)
+            .last().isVisible().catch(() => false)
+        }
+      }
+      const responsePresent = count > baseCount || (count > 0 && previousText.length > 0)
+      const settled = responsePresent && !running && previousText.length > 0 && copyVisible
+        && currentText === lastPollText
+      lastPollText = currentText
+      settledObservations = settled ? settledObservations + 1 : 0
+      if (settledObservations >= REQUIRED_SETTLED_OBSERVATIONS) {
+        return previousText
+      }
+      if (!running && previousText.length > 0 && Date.now() - lastGrowth >= options.stallTimeoutMs) {
+        // Settled without an explicit completion action: accept a quiet finish
+        // rather than hanging (some surfaces render no copy button on retry turns).
+        return previousText
+      }
+      if (Date.now() - lastGrowth >= options.stallTimeoutMs) {
+        throw new LlmError(
+          `ChatGPT Web turn stalled with no output growth for ${options.stallTimeoutMs}ms.`,
+          'TIMEOUT',
+        )
+      }
+      await waitForDomMutation(page, 1_000)
+    }
+  }
+
+  // Rounds: the prompt, then up to two in-chat nudges when the task needs a
+  // tool call but the model narrated instead of emitting a fenced block.
+  const NUDGE = ('[System reminder] That was narration, not a tool call — nothing executed. '
+    + 'Your ENTIRE next reply must be ONLY the ```tool-call fenced block for the task. No prose, no explanations.')
+  const fenceSeen = (text: string): boolean => /`{0,3}tool-call[ \t]*\r?\n/.test(text)
+  const maxRounds = options.requiresToolCall ? 3 : 1
+  let captured = ''
+  for (let round = 0; round < maxRounds; round += 1) {
+    const isNudge = round > 0
+    const baseCount = isNudge
+      ? await assistantTurns.count().catch(() => initialAssistantTurns)
+      : initialAssistantTurns
+    await attach(isNudge ? NUDGE : options.prompt)
+    await submit(baseCount)
+    const roundText = yield* captureRound(baseCount)
+    captured += (captured.length > 0 ? '\n\n' : '') + roundText
+    if (!options.requiresToolCall || fenceSeen(captured)) break
+    if (round === 0) {
+      console.log('[dsh-llm-chatgpt-web] no tool-call block; nudging in-chat')
+    }
+  }
+  return { text: captured, promptChars: options.prompt.length }
 }

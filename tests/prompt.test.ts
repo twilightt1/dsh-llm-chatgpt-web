@@ -34,8 +34,15 @@ describe('compilePrompt', () => {
     expect(prompt).toContain('[User]\nhello')
     expect(prompt).toContain('[Assistant]\nreading now')
     expect(prompt).toContain('[User]\nand?')
-    expect(prompt).toContain('- read: read a file')
-    expect(prompt.indexOf('[User]\nhello')).toBeLessThan(prompt.indexOf('[Assistant]'))
+    expect(prompt).toContain('[Tool use]')
+    expect(prompt).toContain('```tool-call')
+    expect(prompt).toContain('read')
+    // Contract (with seed exchange) precedes history; the trailing reminder
+    // contains its own [Reminder] label but history still comes before it.
+    const historyAt = prompt.indexOf('[User]\nhello')
+    const reminderAt = prompt.indexOf('[Reminder]')
+    expect(historyAt).toBeGreaterThan(-1)
+    expect(historyAt).toBeLessThan(reminderAt)
   })
 
   it('renders tool calls and results as labeled transcript', () => {
@@ -56,7 +63,7 @@ describe('compilePrompt', () => {
       source: { kind: 'tool', callId: CallId('call_1') },
     }
     const prompt = compilePrompt(baseOptions([assistant, result]), COMPOSER_CHAR_BUDGET)
-    expect(prompt).toContain('[Tool call: read {"path":"x"}]')
+    expect(prompt).toContain('```tool-call\n{"name": "read", "arguments": {"path":"x"}}\n```')
     expect(prompt).toContain('[Tool result]\nfile bytes')
   })
 

@@ -8,7 +8,7 @@
  * @module dsh-llm-chatgpt-web/adapter
  */
 
-import { contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { CallId, contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   GenerateOptions,
@@ -25,6 +25,15 @@ import { CHATGPT_COMPOSER_SELECTOR, detectChatGptAccountCapabilities } from './c
 import type { ChatGptWebAccountCapabilities } from './chatgpt/session.ts'
 import { COMPOSER_CHAR_BUDGET, prepareTemporaryChatSurface, streamTextTurn } from './chatgpt/turn.ts'
 import { estimateUsage } from './chatgpt/usage.ts'
+import { parseToolCalls, renderRejectionNotice } from './chatgpt/toolcalls.ts'
+
+/** Monotonic suffix for provider-issued call ids (unique per process). */
+let toolCallSequence = 0
+
+function mintCallId(): CallId {
+  toolCallSequence += 1
+  return CallId(`call-${toolCallSequence}`)
+}
 
 /** One advisory model entry (the id is the DSH-facing slug). */
 export interface ChatGptWebCatalogModel {
@@ -114,6 +123,8 @@ export class ChatGptWebAdapter extends LlmAdapter {
   private browserKey: string | undefined
   private capabilities: ChatGptWebAccountCapabilities | undefined
   private queue: Promise<void> = Promise.resolve()
+  /** One-shot retry notices keyed by session (consumed on next turn). */
+  private pendingNotices = new Map<string, string>()
 
   constructor(private readonly config: ChatGptWebAdapterOptions) {
     super()
@@ -198,6 +209,78 @@ export class ChatGptWebAdapter extends LlmAdapter {
     return this.browser
   }
 
+  /** Consume (get + delete) the pending retry notice for this session, if any. */
+  private takeNotice(options: GenerateOptions): string | undefined {
+    const key = options.sessionId !== undefined ? String(options.sessionId) : 'standalone'
+    const notice = this.pendingNotices.get(key)
+    if (notice !== undefined) this.pendingNotices.delete(key)
+    return notice
+  }
+
+  /** Remember a retry notice for the session's next turn. */
+  private stashNotice(options: GenerateOptions, notice: string): void {
+    const key = options.sessionId !== undefined ? String(options.sessionId) : 'standalone'
+    this.pendingNotices.set(key, notice)
+  }
+
+  /**
+   * Close the turn: text block-end, parsed tool calls, usage, terminal
+   * finish. Live text deltas already streamed as block 0; calls follow in
+   * source order with fresh indexes (assembler joins them deterministically).
+   */
+  private async * emitTurnResult(
+    options: GenerateOptions,
+    prompt: string,
+    fullText: string,
+    textIndex: number,
+  ): AsyncIterable<StreamChunk> {
+    const known = new Set((options.tools ?? []).map(tool => tool.name))
+    const textBlock: ContentBlock = { type: 'text', text: fullText }
+    yield { type: 'block-end', index: textIndex, block: textBlock }
+    let callCount = 0
+    if (known.size > 0) {
+      const parsed = parseToolCalls(fullText, known)
+      let nextIndex = textIndex + 1
+      for (const segment of parsed.segments) {
+        if (segment.type !== 'call') continue
+        const id = mintCallId()
+        yield { type: 'block-start', index: nextIndex, blockType: 'tool-call' }
+        yield {
+          type: 'tool-call-delta',
+          index: nextIndex,
+          id,
+          name: segment.call.name,
+          argumentsDelta: segment.call.arguments,
+        }
+        yield {
+          type: 'block-end',
+          index: nextIndex,
+          block: { type: 'tool-call', id, name: segment.call.name, arguments: segment.call.arguments },
+        }
+        nextIndex += 1
+      }
+      callCount = parsed.callCount
+      if (parsed.rejected.length > 0) {
+        for (const entry of parsed.rejected) {
+          console.log(`[dsh-llm-chatgpt-web] rejected tool-call: ${entry.reason} :: ${JSON.stringify(entry.raw)}`)
+        }
+        this.stashNotice(options, renderRejectionNotice(parsed.rejected))
+      }
+    }
+    yield { type: 'usage', usage: estimateUsage(prompt.length, fullText.length) }
+    if (fullText.length === 0 && callCount === 0) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
+        },
+      }
+      return
+    }
+    yield { type: 'finish', reason: callCount > 0 ? { kind: 'tool-calls' } : { kind: 'stop' } }
+  }
+
   private async * runTurn(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const connection = this.config.options()
     for (const message of options.messages) {
@@ -208,7 +291,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         )
       }
     }
-    const prompt = compilePrompt(options, COMPOSER_CHAR_BUDGET)
+    const prompt = compilePrompt(options, COMPOSER_CHAR_BUDGET, this.takeNotice(options))
     const browser = this.browserFor(connection)
     await browser.ensureReady(options.signal)
     const page = await browser.newTurnPage()
@@ -229,6 +312,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         browser.markProbed()
       }
       const capabilities = this.capabilities
+      const hasTools = (options.tools?.length ?? 0) > 0
       const turn = streamTextTurn(page, {
         model: options.model,
         prompt,
@@ -236,6 +320,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         turnTimeoutMs: connection.turnTimeoutMs,
         stallTimeoutMs: connection.stallTimeoutMs,
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        ...(hasTools ? { requiresToolCall: true } : {}),
       })
       iterator = turn[Symbol.asyncIterator]()
       let blockIndex = -1
@@ -259,20 +344,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         blockIndex = 0
         yield { type: 'block-start', index: blockIndex, blockType: 'text' }
       }
-      const block: ContentBlock = { type: 'text', text: fullText }
-      yield { type: 'block-end', index: blockIndex, block }
-      yield { type: 'usage', usage: estimateUsage(prompt.length, fullText.length) }
-      if (fullText.length === 0) {
-        yield {
-          type: 'finish',
-          reason: {
-            kind: 'error',
-            failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
-          },
-        }
-        return
-      }
-      yield { type: 'finish', reason: { kind: 'stop' } }
+      yield* this.emitTurnResult(options, prompt, fullText, blockIndex)
     } catch (error: unknown) {
       if (options.signal?.aborted) {
         // Stop server-side generation; the shared page stays for next turns.

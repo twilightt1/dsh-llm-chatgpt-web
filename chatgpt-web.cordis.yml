@@ -7,16 +7,40 @@
     turnTimeoutMs: 300000
     stallTimeoutMs: 120000
 
+# Managed child-process groups for the bash executor.
+- id: subprocess
+  name: '/Users/twilight/deepseek-harness/packages/subprocess/subprocess-local/src/index.ts'
+
+- id: bash
+  name: '/Users/twilight/deepseek-harness/packages/shell/bash-local/src/index.ts'
+  config:
+    timeoutMs: 60000
+
+# Local filesystem backend + model-facing file tools.
+- id: fs-local
+  name: '/Users/twilight/deepseek-harness/packages/fs/fs-local/src/index.ts'
+  config:
+    cwd: /tmp/dsh-chatgpt-task
+
+- id: fs-observation-policy
+  name: '/Users/twilight/deepseek-harness/packages/fs/fs-observation-policy/src/index.ts'
+
+- id: tool-fs
+  name: '/Users/twilight/deepseek-harness/packages/fs/tool-fs/src/index.ts'
+
 - id: agent-spine
   name: '/Users/twilight/deepseek-harness/packages/examples/agent-spine-demo/src/index.ts'
   config:
     agents:
       - id: main
         provider: chatgpt-web
-        model: chatgpt-web/high
+        model: chatgpt-web/light
         cwd: /tmp/dsh-chatgpt-task
+    skills:
+      enabled: false
+    toolJobs: false
     persona: |
       You are a helpful assistant answering through ChatGPT Web.
-      Keep answers brief and factual.
+      To execute anything, use the provided tools. Keep answers brief and factual.
     workspaceContext:
       maxBytes: 16384

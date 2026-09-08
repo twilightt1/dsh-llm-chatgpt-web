@@ -22,14 +22,35 @@ are serialized: at most one page is ever active.
 - Google Chrome installed (or set `chromeExecutablePath`).
 - A `deepseek-harness` checkout for the Cordis peers (see below).
 
-## Install (local dev)
+## Install (pick one)
+
+**A. Local checkout (dev, no build step needed — `lib/` ships in the repo):**
 
 ```sh
-cd dsh-llm-chatgpt-web
-pnpm install        # postinstall symlinks the harness peers from $DSH_HOME
-pnpm run typecheck
-pnpm run test
+dsh plugin --profile web add /absolute/path/to/dsh-llm-chatgpt-web
+dsh web
 ```
+
+The CLI registers `dsh.bundle.patch`, links the checkout, and appends the
+bundle to the profile automatically (`--dump-config` shows the
+`llm-chatgpt-web` row). Keep the checkout in place — the profile links it.
+
+**B. Prebuilt tarball (no build permission asked):**
+
+```sh
+pnpm pack   # → dsh-llm-chatgpt-web-0.x.y.tgz
+dsh plugin --profile web add ./dsh-llm-chatgpt-web-0.x.y.tgz
+```
+
+**C. GitHub (after publishing; commit `lib/`):**
+
+```sh
+dsh plugin --profile web add github:you/dsh-llm-chatgpt-web#<commit-or-tag>
+```
+
+Then select provider `chatgpt-web` (model `chatgpt-web/high` or per your
+account) in the Web UI model picker, or set it in an agent config. Requires
+Google Chrome/Brave installed and one manual ChatGPT sign-in on first use.
 
 Minimum harness peers are declared in `peerDependencies`
 (`cordis ^4.0.1`, `dsh-llm ^0.1.1-rc.2`, `schemastery ^3.18.1`).
