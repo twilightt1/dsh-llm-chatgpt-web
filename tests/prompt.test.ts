@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { CallId, LlmError, MessageId } from '@deepseek-ai/dsh-llm'
+import { LlmError, MessageId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
 import { compilePrompt } from '../src/chatgpt/prompt.ts'
 import { COMPOSER_CHAR_BUDGET } from '../src/chatgpt/turn.ts'
@@ -54,7 +54,7 @@ describe('compilePrompt (JSON envelope transport)', () => {
     const assistant: Message = {
       id: MessageId('a1'),
       role: 'assistant',
-      content: [{ type: 'tool-call', id: CallId('call_1'), name: 'read', arguments: '{"path":"x"}' }],
+      content: [{ type: 'tool-call', id: ToolCallId('call_1'), name: 'read', arguments: '{"path":"x"}' }],
       source: { kind: 'model', provider: 'chatgpt-web', model: 'chatgpt-web/high' },
     }
     const result: Message = {
@@ -62,10 +62,10 @@ describe('compilePrompt (JSON envelope transport)', () => {
       role: 'user',
       content: [{
         type: 'tool-result',
-        toolCallId: CallId('call_1'),
+        toolCallId: ToolCallId('call_1'),
         content: [{ type: 'text', text: 'file bytes' }],
       }],
-      source: { kind: 'tool', callId: CallId('call_1') },
+      source: { kind: 'tool', callId: ToolCallId('call_1') },
     }
     const prompt = compilePrompt(baseOptions([assistant, result]), COMPOSER_CHAR_BUDGET)
     const envelopeMatch = /<dsh_context_json>\n([\s\S]*?)\n<\/dsh_context_json>/.exec(prompt)

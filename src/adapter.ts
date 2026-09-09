@@ -8,7 +8,7 @@
  * @module dsh-llm-chatgpt-web/adapter
  */
 
-import { CallId, contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   GenerateOptions,
@@ -30,9 +30,9 @@ import { buildSchemaIndex, parseToolCallsWithSchemas, renderRejectionNotice } fr
 /** Monotonic suffix for provider-issued call ids (unique per process). */
 let toolCallSequence = 0
 
-function mintCallId(): CallId {
+function mintCallId(): ToolCallId {
   toolCallSequence += 1
-  return CallId(`call-${toolCallSequence}`)
+  return ToolCallId(`call-${toolCallSequence}`)
 }
 
 /** One advisory model entry (the id is the DSH-facing slug). */

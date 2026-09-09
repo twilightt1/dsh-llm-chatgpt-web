@@ -1,7 +1,7 @@
 {
   "name": "dsh-llm-chatgpt-web",
   "description": "ChatGPT Web (owned Chromium driving Temporary Chat) adapter for the DeepSeek Harness LLM seam",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
