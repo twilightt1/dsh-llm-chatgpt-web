@@ -92,9 +92,15 @@ async function rowTitles(rows: Locator): Promise<string[]> {
   return await rows.evaluateAll(elements => elements.map(element => element.textContent ?? ''))
 }
 
-async function waitForExactConnectorRow(page: Page, connectorName: string, deadline: number): Promise<Locator> {
+async function waitForExactConnectorRow(
+  page: Page,
+  connectorName: string,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<Locator> {
   let lastError: unknown
   for (;;) {
+    throwIfAborted(signal)
     const rows = await visibleConnectorRows(page)
     try {
       const index = exactConnectorRowIndex(await rowTitles(rows), connectorName)
@@ -114,8 +120,14 @@ async function waitForExactConnectorRow(page: Page, connectorName: string, deadl
   }
 }
 
-async function assertConnectorPill(page: Page, connectorName: string, deadline: number): Promise<void> {
+async function assertConnectorPill(
+  page: Page,
+  connectorName: string,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<void> {
   for (;;) {
+    throwIfAborted(signal)
     const pills = page.locator(CHATGPT_CONNECTOR_PILL_SELECTOR).filter({ visible: true })
     const count = await pills.count().catch(() => 0)
     if (count === 1 && await pills.first().getAttribute('data-keyword').catch(() => null) === connectorName) return
@@ -133,8 +145,12 @@ async function assertConnectorPill(page: Page, connectorName: string, deadline: 
 async function clearFailedConnectorSelection(page: Page): Promise<void> {
   try {
     await clearComposer(page)
-  } catch {
-    return
+  } catch (error) {
+    throw new LlmError(
+      'ChatGPT connector selection could not clear the composer after a failed attempt.',
+      'PROVIDER_ERROR',
+      { cause: error },
+    )
   }
   const pills = page.locator(CHATGPT_CONNECTOR_PILL_SELECTOR).filter({ visible: true })
   const deadline = Date.now() + 2_000
@@ -162,18 +178,26 @@ export async function selectChatGptConnector(
       await clearComposer(page)
       const composer = await visibleComposer(page)
       await composer.pressSequentially(`@${connectorName}`)
-      const row = await waitForExactConnectorRow(page, connectorName, Date.now() + 10_000)
+      const row = await waitForExactConnectorRow(page, connectorName, Date.now() + 10_000, signal)
       throwIfAborted(signal)
       await row.press('Enter')
       // Enter replaces the React composer subtree; never retain the stale
       // locator while verifying the attached connector.
       await visibleComposer(page)
-      await assertConnectorPill(page, connectorName, Date.now() + 10_000)
+      await assertConnectorPill(page, connectorName, Date.now() + 10_000, signal)
       return
     } catch (error) {
       if (signal?.aborted) throw error
       lastError = error
-      await clearFailedConnectorSelection(page).catch(() => {})
+      try {
+        await clearFailedConnectorSelection(page)
+      } catch (cleanupError) {
+        throw new LlmError(
+          `ChatGPT connector selection could not reset the composer after attempt ${attempt + 1}.`,
+          'PROVIDER_ERROR',
+          { cause: cleanupError },
+        )
+      }
     }
   }
   throw new LlmError(

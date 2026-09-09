@@ -186,9 +186,8 @@ export function createDshNativeMcpServer(client: BrokerRpcClient): McpServer {
       return await withActivity(client, request_id, extra.signal, async (snapshot, id, signal) => {
         const tool = snapshot.tools.find(candidate => candidate.name === wire_name)
         if (tool === undefined) throw new Error(`native MCP tool is not advertised: ${wire_name}`)
-        let result: BrokerToolResult
         try {
-          result = await client.invoke(
+          const result = await client.invoke(
             request_id,
             id,
             tool.name,
@@ -196,12 +195,12 @@ export function createDshNativeMcpServer(client: BrokerRpcClient): McpServer {
             snapshot.invocationTimeoutMs,
             signal,
           )
+          return mcpContent(result)
         } catch (error) {
           await client.release(request_id).catch(() => {})
           startedRequests.delete(request_id)
           throw error
         }
-        return mcpContent(result)
       })
     },
   )

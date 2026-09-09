@@ -412,8 +412,14 @@ export class ChatGptWebAdapter extends LlmAdapter {
     let ownershipTransferred = false
     let nativeReleased = false
     let cleanupPromise: Promise<void> | undefined
+    let cleanupRequested: 'stop' | 'close' | undefined
     const cleanup: NativeRoundCleanup = (mode): Promise<void> => {
+      if (cleanupRequested === undefined || mode === 'stop') cleanupRequested = mode
       if (cleanupPromise !== undefined) return cleanupPromise
+      // A turn-boundary event can arrive before the page is allocated. Keep
+      // the request latched; the setup checkpoints below will close anything
+      // allocated after this callback returns.
+      if (page === undefined && iterator === undefined) return Promise.resolve()
       cleanupPromise = (async () => {
         if (mode === 'stop' && page !== undefined && !page.isClosed()) {
           const stopButton = page.locator('[data-testid="stop-button"]').last()
@@ -446,6 +452,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
           invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
           ...(options.signal !== undefined ? { signal: options.signal } : {}),
         })
+        lease.bindCleanup(cleanup)
       }
       const prompt = compilePrompt(
         options,
@@ -460,6 +467,10 @@ export class ChatGptWebAdapter extends LlmAdapter {
       // Fresh page per turn (upstream pageForNewTurn): a reused SPA page
       // retains the previous transcript and autocomplete DOM.
       page = await browser.newTurnPage()
+      if (cleanupRequested !== undefined) {
+        await cleanup(cleanupRequested)
+        throw new LlmError('ChatGPT Web turn stopped at a turn boundary.', 'ABORTED')
+      }
       await prepareTemporaryChatSurface(page, connection.profileDir)
       if (!this.capabilities || !browser.probed) {
         try {
@@ -493,6 +504,10 @@ export class ChatGptWebAdapter extends LlmAdapter {
         }),
       })
       iterator = turn[Symbol.asyncIterator]()
+      if (cleanupRequested !== undefined) {
+        await cleanup(cleanupRequested)
+        throw new LlmError('ChatGPT Web turn stopped at a turn boundary.', 'ABORTED')
+      }
       let blockIndex = -1
       let fullText = ''
       let turnResult: TextTurnResult | undefined

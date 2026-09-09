@@ -150,6 +150,17 @@ describe('NativeRoundCoordinator', () => {
     expect(calls).toEqual(['stop', 'close'])
   })
 
+  it('runs bound cleanup when a turn stops before page allocation', async () => {
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const modes: Array<'stop' | 'close'> = []
+    const lease = await coordinator.beginStep(stepInput('s1'))
+    lease.bindCleanup(async mode => { modes.push(mode) })
+    await coordinator.stopAtTurnBoundary('s1')
+    expect(modes).toEqual(['stop'])
+    await coordinator.dispose()
+  })
+
   it('revokes a parked round at the turn boundary and releases another session', async () => {
     const broker = new NativeToolBroker()
     const coordinator = new NativeRoundCoordinator(broker)

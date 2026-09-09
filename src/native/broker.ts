@@ -7,6 +7,7 @@ import type {
 } from './types.ts'
 
 const BATCH_WINDOW_MS = 15
+const MAX_TIMER_MS = 2_147_483_647
 const MAX_RETIRED_REQUESTS = 64
 
 /** A deferred value with its settlement functions kept private to the broker. */
@@ -104,11 +105,11 @@ export class NativeToolBroker {
 
   register(input: BrokerRoundSnapshot & { readonly ttlMs: number }): string {
     if (this.closed) throw new Error('native tool broker is closed')
-    if (!Number.isFinite(input.ttlMs) || input.ttlMs <= 0) {
-      throw new Error('native broker TTL must be a positive finite number')
+    if (!Number.isSafeInteger(input.ttlMs) || input.ttlMs <= 0 || input.ttlMs > MAX_TIMER_MS) {
+      throw new Error(`native broker TTL must be a positive safe integer no greater than ${MAX_TIMER_MS}`)
     }
-    if (!Number.isSafeInteger(input.invocationTimeoutMs) || input.invocationTimeoutMs <= 0) {
-      throw new Error('native broker invocation timeout must be a positive safe integer')
+    if (!Number.isSafeInteger(input.invocationTimeoutMs) || input.invocationTimeoutMs <= 0 || input.invocationTimeoutMs > MAX_TIMER_MS) {
+      throw new Error(`native broker invocation timeout must be a positive safe integer no greater than ${MAX_TIMER_MS}`)
     }
     if (typeof input.sessionId !== 'string' || input.sessionId.length === 0) {
       throw new Error('native broker sessionId must be non-empty')

@@ -200,7 +200,7 @@ describe('DSH native MCP façade', () => {
       await vi.waitFor(() => expect(fake.invocations).toHaveLength(1))
       fake.pending.resolve({ content: [{ type: 'reasoning', text: 'hidden' }], isError: false })
       await expect(pending).resolves.toMatchObject({ isError: true })
-      expect(fake.released).toHaveLength(0)
+      expect(fake.released).toEqual([requestId])
     } finally {
       await client.close()
       await server.close()

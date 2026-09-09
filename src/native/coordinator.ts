@@ -9,6 +9,7 @@ export type NativeRoundCleanup = (mode: 'stop' | 'close') => Promise<void>
 /** The adapter-facing lease for one registered provider round. */
 export interface NativeStepLease {
   readonly requestId: string
+  bindCleanup(cleanup: NativeRoundCleanup): void
   takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined
   beginCompletionFence(): number | undefined
   commitCompletionFence(revision: number): boolean
@@ -128,6 +129,11 @@ class NativeLease implements NativeStepLease {
     this.requestId = requestId
   }
 
+  bindCleanup(cleanup: NativeRoundCleanup): void {
+    this.assertOpen()
+    this.setCleanup(cleanup)
+  }
+
   takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined {
     this.assertOpen()
     return this.owner.broker.takeToolBatch(this.requestId, now)
@@ -146,7 +152,7 @@ class NativeLease implements NativeStepLease {
   async park(cleanup: NativeRoundCleanup): Promise<void> {
     this.assertOpen()
     if (this.record.state !== 'open') throw new Error('native step lease is already parked or terminal')
-    this.record.cleanup = cleanup
+    this.setCleanup(cleanup)
     this.record.state = 'parked'
     this.owner.watchParkedRound(this.record)
   }
@@ -154,15 +160,21 @@ class NativeLease implements NativeStepLease {
   async complete(cleanup: NativeRoundCleanup): Promise<void> {
     this.assertOpen()
     if (this.record.state !== 'open') throw new Error('native step lease cannot complete after park or termination')
+    this.setCleanup(cleanup)
     await this.owner.finish(this.record, 'close', cleanup)
   }
 
   async fail(cleanup: NativeRoundCleanup, cause: Error): Promise<void> {
     this.assertOpen()
-    if (this.record.state === 'parked' && this.record.cleanup !== cleanup) {
-      throw new Error('native parked step lease already owns a cleanup callback')
-    }
+    this.setCleanup(cleanup)
     await this.owner.finish(this.record, 'stop', cleanup, cause)
+  }
+
+  private setCleanup(cleanup: NativeRoundCleanup): void {
+    if (this.record.cleanup !== undefined && this.record.cleanup !== cleanup) {
+      throw new Error('native step lease already owns a different cleanup callback')
+    }
+    this.record.cleanup = cleanup
   }
 
   private assertOpen(): void {

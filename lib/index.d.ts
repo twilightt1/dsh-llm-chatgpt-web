@@ -75,6 +75,7 @@ type NativeRoundCleanup = (mode: 'stop' | 'close') => Promise<void>;
 /** The adapter-facing lease for one registered provider round. */
 interface NativeStepLease {
   readonly requestId: string;
+  bindCleanup(cleanup: NativeRoundCleanup): void;
   takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined;
   beginCompletionFence(): number | undefined;
   commitCompletionFence(revision: number): boolean;
@@ -127,12 +128,14 @@ declare class NativeLease implements NativeStepLease {
   private readonly record;
   readonly requestId: string;
   constructor(owner: NativeRoundCoordinator, record: RoundRecord, requestId: string);
+  bindCleanup(cleanup: NativeRoundCleanup): void;
   takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined;
   beginCompletionFence(): number | undefined;
   commitCompletionFence(revision: number): boolean;
   park(cleanup: NativeRoundCleanup): Promise<void>;
   complete(cleanup: NativeRoundCleanup): Promise<void>;
   fail(cleanup: NativeRoundCleanup, cause: Error): Promise<void>;
+  private setCleanup;
   private assertOpen;
 }
 /** Serialize one browser reservation while giving its parked owner priority. */

@@ -12,6 +12,7 @@ import { NativeToolBroker } from './broker.ts'
 
 const MAX_UNIX_SOCKET_PATH_BYTES = 103
 const MAX_LINE_BYTES = 64 * 1024 * 1024
+const MAX_TIMER_MS = 2_147_483_647
 const DEFAULT_RPC_TIMEOUT_MS = 30_000
 
 type BrokerRpcMethod = 'start' | 'claim' | 'activity_complete' | 'invoke' | 'release'
@@ -316,7 +317,9 @@ export function createBrokerRpcClient(socketPath: string): BrokerRpcClient {
     signal?: AbortSignal,
     timeoutMs = DEFAULT_RPC_TIMEOUT_MS,
   ): Promise<T> => {
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('native broker RPC timeout must be positive')
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMER_MS) {
+      throw new Error(`native broker RPC timeout must be a positive safe integer no greater than ${MAX_TIMER_MS}`)
+    }
     if (signal?.aborted) throw abortError('native broker RPC aborted')
     const id = rpcId()
     return await new Promise<T>((resolve, reject) => {
