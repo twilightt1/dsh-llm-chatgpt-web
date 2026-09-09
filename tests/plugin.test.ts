@@ -67,6 +67,29 @@ describe('plugin', () => {
     })).toThrowError(/connectorName/i)
   })
 
+  it('keeps external runtime compatible and resolves managed config explicitly', () => {
+    const defaults = resolveAdapterOptions({})
+    expect(defaults.connectorTransport).toBe('text')
+    expect(defaults.connectorRuntime).toBe('external')
+
+    const managed = resolveAdapterOptions({
+      profileDir: '/tmp/dsh-managed-profile',
+      connectorTransport: 'mcp',
+      connectorRuntime: 'managed',
+    })
+    expect(managed.connectorRuntime).toBe('managed')
+    expect(managed.nativeRuntimeConfigPath).toBe('/tmp/dsh-managed-profile/native-runtime.json')
+  })
+
+  it('rejects managed runtime outside MCP and on Windows', () => {
+    expect(() => resolveAdapterOptions({ connectorRuntime: 'managed' }))
+      .toThrow(/requires connectorTransport "mcp"/)
+    expect(() => resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'managed',
+    }, 'win32')).toThrow(/unsupported on win32/)
+  })
+
   it('installs native lifecycle listeners and tears down the broker stack', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-plugin-native-'))
     const ctx = stubCtx()

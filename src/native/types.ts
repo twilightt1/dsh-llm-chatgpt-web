@@ -25,6 +25,9 @@ export interface BrokerRoundSnapshot {
 /** The two supported adapter-level connector transports. */
 export type ConnectorTransport = 'text' | 'mcp'
 
+/** Owner of the native MCP tunnel process. */
+export type ConnectorRuntime = 'external' | 'managed'
+
 /** JSON-RPC request/response values used by the private broker socket. */
 export interface BrokerRpcError {
   readonly message: string

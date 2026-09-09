@@ -24,16 +24,19 @@ import type { Page } from 'playwright-core'
 import { ChatGptBrowser } from './chatgpt/browser.ts'
 import { compilePrompt } from './chatgpt/prompt.ts'
 import type { NativeRoundCleanup, NativeRoundCoordinator, NativeStepLease } from './native/coordinator.ts'
-import type { BrokerCallId, BrokerToolRequest } from './native/types.ts'
+import type {
+  BrokerCallId,
+  BrokerToolRequest,
+  ConnectorRuntime,
+  ConnectorTransport,
+} from './native/types.ts'
+export type { ConnectorRuntime, ConnectorTransport } from './native/types.ts'
 import { CHATGPT_COMPOSER_SELECTOR, detectChatGptAccountCapabilities } from './chatgpt/session.ts'
 import type { ChatGptWebAccountCapabilities } from './chatgpt/session.ts'
 import { COMPOSER_CHAR_BUDGET, prepareTemporaryChatSurface, streamTextTurn } from './chatgpt/turn.ts'
 import type { TextTurnEvent, TextTurnResult } from './chatgpt/turn.ts'
 import { estimateUsage } from './chatgpt/usage.ts'
 import { buildSchemaIndex, parseToolCallsWithSchemas, renderRejectionNotice } from './chatgpt/toolcalls.ts'
-
-/** Transport used to connect ChatGPT to DSH tools. */
-export type ConnectorTransport = 'text' | 'mcp'
 
 /** Monotonic suffix for provider-issued call ids (unique per process). */
 let toolCallSequence = 0
@@ -136,10 +139,14 @@ export interface ChatGptWebConnectionOptions {
   retryPolicy: ResolvedRetryPolicy
   /** ChatGPT tool transport; text remains the default. */
   connectorTransport: ConnectorTransport
+  /** Owner of the MCP tunnel process; external preserves current behavior. */
+  connectorRuntime: ConnectorRuntime
   /** Exact ChatGPT connector title used by the native MCP transport. */
   connectorName: string
   /** Private Unix socket endpoint used by the native MCP façade. */
   brokerSocketPath: string
+  /** Absolute managed runtime configuration path. */
+  nativeRuntimeConfigPath: string
   /** Native MCP invocation and broker TTL budget. */
   mcpInvocationTimeoutMs: number
 }

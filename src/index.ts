@@ -32,12 +32,15 @@ import { defaultProfileDir, resolveChromeExecutable } from './chatgpt/launch.ts'
 import { NativeToolBroker } from './native/broker.ts'
 import { NativeBrokerSocketServer } from './native/broker-socket.ts'
 import { NativeRoundCoordinator } from './native/coordinator.ts'
+import type { ConnectorRuntime } from './native/types.ts'
+import { defaultNativeRuntimeConfigPath } from './native/runtime-config.ts'
 
 export { ChatGptWebAdapter } from './adapter.ts'
 export type {
   ChatGptWebAdapterOptions,
   ChatGptWebCatalogModel,
   ChatGptWebConnectionOptions,
+  ConnectorRuntime,
   ConnectorTransport,
 } from './adapter.ts'
 export { compilePrompt } from './chatgpt/prompt.ts'
@@ -92,6 +95,10 @@ export interface Config {
   retryPolicy?: RetryPolicyConfig
   /** Tool transport; text is the safe default, MCP is opt-in and Unix-only. */
   connectorTransport?: 'text' | 'mcp'
+  /** Tunnel owner; external preserves the existing MCP deployment contract. */
+  connectorRuntime?: ConnectorRuntime
+  /** Managed runtime configuration path; defaults beside the profile. */
+  nativeRuntimeConfigPath?: string
   /** Exact title of the ChatGPT connector used in native MCP mode. */
   connectorName?: string
   /** Optional private Unix socket path for the native broker. */
@@ -123,6 +130,8 @@ export const Config: z<Config> = z.object({
   models: z.array(catalogModel).default(DEFAULT_MODELS),
   retryPolicy: RetryPolicySchema,
   connectorTransport: z.union(['text', 'mcp'] as const).default('text'),
+  connectorRuntime: z.union(['external', 'managed'] as const).default('external'),
+  nativeRuntimeConfigPath: z.string(),
   connectorName: z.string(),
   brokerSocketPath: z.string(),
   mcpInvocationTimeoutMs: z.number().step(1).min(1).max(2_147_483_647).default(90_000),
@@ -180,9 +189,22 @@ function resolveModels(models: readonly ChatGptWebCatalogModel[] | undefined): C
 /**
  * The one explicit resolve step from raw config to validated connection facts.
  */
-export function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptions {
+export function resolveAdapterOptions(
+  config: Config,
+  platform: NodeJS.Platform = process.platform,
+): ChatGptWebConnectionOptions {
   const profileDir = expandHome(config.profileDir ?? defaultProfileDir())
   const connectorTransport = config.connectorTransport ?? 'text'
+  const connectorRuntime = config.connectorRuntime ?? 'external'
+  if (connectorRuntime !== 'external' && connectorRuntime !== 'managed') {
+    throw new Error('llm-chatgpt-web: connectorRuntime must be "external" or "managed"')
+  }
+  if (connectorRuntime === 'managed' && connectorTransport !== 'mcp') {
+    throw new Error('llm-chatgpt-web: managed connectorRuntime requires connectorTransport "mcp"')
+  }
+  if (connectorRuntime === 'managed' && platform === 'win32') {
+    throw new Error('llm-chatgpt-web: managed connectorRuntime is unsupported on win32')
+  }
   if (connectorTransport !== 'text' && connectorTransport !== 'mcp') {
     throw new Error(`llm-chatgpt-web: connectorTransport must be "text" or "mcp"`)
   }
@@ -193,7 +215,7 @@ export function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptio
   if (connectorTransport === 'mcp' && connectorName.length === 0) {
     throw new Error('llm-chatgpt-web: connectorName must be non-empty in MCP mode')
   }
-  if (connectorTransport === 'mcp' && process.platform === 'win32') {
+  if (connectorTransport === 'mcp' && platform === 'win32') {
     throw new Error('llm-chatgpt-web: connectorTransport "mcp" is unsupported on win32; use text transport')
   }
   const mcpInvocationTimeoutMs = config.mcpInvocationTimeoutMs ?? 90_000
@@ -201,11 +223,17 @@ export function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptio
     throw new Error('llm-chatgpt-web: mcpInvocationTimeoutMs must be a positive safe integer no greater than 2147483647')
   }
   const brokerSocketPath = expandHome(config.brokerSocketPath ?? defaultBrokerSocketPath(profileDir))
+  const nativeRuntimeConfigPath = expandHome(
+    config.nativeRuntimeConfigPath ?? defaultNativeRuntimeConfigPath(profileDir),
+  )
   if (connectorTransport === 'mcp' && !isAbsolute(brokerSocketPath)) {
     throw new Error('llm-chatgpt-web: brokerSocketPath must be an absolute Unix socket path in MCP mode')
   }
   if (connectorTransport === 'mcp' && Buffer.byteLength(brokerSocketPath) > 103) {
     throw new Error('llm-chatgpt-web: brokerSocketPath exceeds the 103-byte Unix socket path limit')
+  }
+  if (connectorRuntime === 'managed' && !isAbsolute(nativeRuntimeConfigPath)) {
+    throw new Error('llm-chatgpt-web: nativeRuntimeConfigPath must be absolute in managed mode')
   }
   return {
     profileDir,
@@ -223,8 +251,10 @@ export function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptio
     models: resolveModels(config.models),
     retryPolicy: resolveRetryPolicy(config.retryPolicy, 'llm-chatgpt-web: retryPolicy'),
     connectorTransport,
+    connectorRuntime,
     connectorName: connectorName || 'DSH Native',
     brokerSocketPath,
+    nativeRuntimeConfigPath,
     mcpInvocationTimeoutMs,
   }
 }
