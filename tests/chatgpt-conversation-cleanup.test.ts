@@ -35,6 +35,7 @@ describe('owned conversation UI deletion', () => {
       isVisible: vi.fn(async () => true),
       count: vi.fn(async () => 0),
       click: vi.fn(async () => { clicks.push(name); onClick?.() }),
+      filter(): unknown { return this },
       last(): unknown { return this },
     })
     const header = {
@@ -89,6 +90,7 @@ describe('owned conversation deletion ledger', () => {
       isVisible: vi.fn(async () => true),
       count: vi.fn(async () => 0),
       click: vi.fn(async () => { onClick?.() }),
+      filter(): unknown { return this },
       last(): unknown { return this },
     })
     const page = {
@@ -99,7 +101,9 @@ describe('owned conversation deletion ledger', () => {
       } : undefined),
       locator: (selector: string) => selector === '#conversation-header-actions'
         ? { getByTestId: () => control() }
-        : control(),
+        : selector.startsWith('[data-testid^="conversation-turn-"]')
+          ? { count: vi.fn(async () => 1) }
+          : control(),
     } as unknown as Page
     const ledger = {
       pending: () => [conversationId],
@@ -119,6 +123,7 @@ describe('owned conversation deletion ledger', () => {
     const forget = vi.fn()
     const hiddenControl = {
       isVisible: vi.fn(async () => false),
+      filter(): unknown { return this },
       last(): unknown { return this },
     }
     const page = {
@@ -134,7 +139,7 @@ describe('owned conversation deletion ledger', () => {
       forget,
     }
 
-    await expect(retryPendingConversationDeletions(page, ledger, 0)).rejects.toThrow(/active-header/i)
+    await expect(retryPendingConversationDeletions(page, ledger, 0)).rejects.toThrow(/load|active-header/i)
     expect(forget).not.toHaveBeenCalled()
   })
 })

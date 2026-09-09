@@ -89,7 +89,15 @@ async function visibleConnectorRows(page: Page): Promise<Locator> {
 }
 
 async function rowTitles(rows: Locator): Promise<string[]> {
-  return await rows.evaluateAll(elements => elements.map(element => element.textContent ?? ''))
+  return await rows.evaluateAll(elements => elements.map(element => {
+    // Current ChatGPT renders the connector title and description as sibling
+    // spans without a newline. Prefer the title span so exact matching does
+    // not reject a valid connector because its description was concatenated.
+    return element.querySelector('span.text-token-text-primary')?.textContent
+      ?? element.getAttribute('aria-label')
+      ?? element.textContent
+      ?? ''
+  }))
 }
 
 async function waitForExactConnectorRow(
@@ -180,9 +188,9 @@ export async function selectChatGptConnector(
       await composer.pressSequentially(`@${connectorName}`)
       const row = await waitForExactConnectorRow(page, connectorName, Date.now() + 10_000, signal)
       throwIfAborted(signal)
-      await row.press('Enter')
-      // Enter replaces the React composer subtree; never retain the stale
-      // locator while verifying the attached connector.
+      await row.click({ force: true })
+      // Selecting the row replaces the React composer subtree; never retain
+      // the stale locator while verifying the attached connector.
       await visibleComposer(page)
       await assertConnectorPill(page, connectorName, Date.now() + 10_000, signal)
       return

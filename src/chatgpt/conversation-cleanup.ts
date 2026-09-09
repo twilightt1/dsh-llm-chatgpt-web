@@ -119,6 +119,15 @@ function visible(locator: Locator): Promise<boolean> {
   return locator.isVisible().catch(() => false)
 }
 
+async function waitVisible(locator: Locator, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (await visible(locator)) return true
+    if (Date.now() >= deadline) return false
+    await new Promise(resolveSleep => setTimeout(resolveSleep, 50))
+  }
+}
+
 async function waitForDeletionVerification(page: Page, conversationId: string, timeoutMs: number): Promise<void> {
   const historyLink = page.locator(`a[href="/c/${conversationId}"]`)
   const deadline = Date.now() + timeoutMs
@@ -156,21 +165,43 @@ export async function deleteOwnedConversation(
     .locator('#conversation-header-actions')
     .getByTestId('conversation-options-button')
     .last()
-  if (!await visible(optionsButton)) {
+  if (!await waitVisible(optionsButton, timeoutMs)) {
     throw new LlmError('ChatGPT owned conversation has no active-header conversation-options control.', 'PROVIDER_ERROR')
   }
   await optionsButton.click({ force: true })
-  const deleteButton = page.getByTestId('delete-chat-menu-item').last()
-  if (!await visible(deleteButton)) {
+  const deleteButton = page.getByTestId('delete-chat-menu-item').filter({ visible: true }).last()
+  if (!await waitVisible(deleteButton, timeoutMs)) {
     throw new LlmError('ChatGPT owned conversation has no delete action.', 'PROVIDER_ERROR')
   }
   await deleteButton.click({ force: true })
-  const confirmButton = page.getByTestId('delete-conversation-confirm-button').last()
-  if (!await visible(confirmButton)) {
+  const confirmButton = page.getByTestId('delete-conversation-confirm-button').filter({ visible: true }).last()
+  if (!await waitVisible(confirmButton, timeoutMs)) {
     throw new LlmError('ChatGPT owned conversation deletion has no confirmation action.', 'PROVIDER_ERROR')
   }
   await confirmButton.click({ force: true })
   await waitForDeletionVerification(page, conversationId, timeoutMs)
+}
+
+async function waitForOwnedConversationReady(page: Page, conversationId: string, timeoutMs: number): Promise<void> {
+  const optionsButton = page
+    .locator('#conversation-header-actions')
+    .getByTestId('conversation-options-button')
+    .filter({ visible: true })
+    .last()
+  const turns = page.locator('[data-testid^="conversation-turn-"]')
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (conversationIdFromUrl(page.url()) === conversationId
+      && await visible(optionsButton)
+      && await turns.count().catch(() => 0) > 0) return
+    if (Date.now() >= deadline) {
+      throw new LlmError(
+        'ChatGPT could not load the adapter-owned conversation before cleanup.',
+        'PROVIDER_ERROR',
+      )
+    }
+    await new Promise(resolveSleep => setTimeout(resolveSleep, 100))
+  }
 }
 
 async function waitForSettledHome(page: Page, conversationId: string, timeoutMs: number): Promise<boolean> {
@@ -194,6 +225,7 @@ export async function retryPendingConversationDeletions(
   for (const conversationId of ledger.pending()) {
     await page.goto(conversationUrl(conversationId), { waitUntil: 'domcontentloaded', timeout: 60_000 })
     if (conversationIdFromUrl(page.url()) === conversationId) {
+      await waitForOwnedConversationReady(page, conversationId, timeoutMs)
       await deleteOwnedConversation(page, conversationId, timeoutMs)
     } else if (!await waitForSettledHome(page, conversationId, timeoutMs)) {
       throw new LlmError(
