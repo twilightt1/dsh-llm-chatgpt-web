@@ -193,6 +193,7 @@ function resolveModels(models: readonly ChatGptWebCatalogModel[] | undefined): C
 export function resolveAdapterOptions(
   config: Config,
   platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
 ): ChatGptWebConnectionOptions {
   const profileDir = expandHome(config.profileDir ?? defaultProfileDir())
   const connectorTransport = config.connectorTransport ?? 'text'
@@ -205,6 +206,12 @@ export function resolveAdapterOptions(
   }
   if (connectorRuntime === 'managed' && platform === 'win32') {
     throw new Error('llm-chatgpt-web: managed connectorRuntime is unsupported on win32')
+  }
+  if (connectorRuntime === 'managed' && platform !== 'darwin' && platform !== 'linux') {
+    throw new Error('llm-chatgpt-web: managed connectorRuntime is supported only on darwin or linux')
+  }
+  if (connectorRuntime === 'managed' && arch !== 'x64' && arch !== 'arm64') {
+    throw new Error('llm-chatgpt-web: managed connectorRuntime is unsupported on this architecture')
   }
   if (connectorTransport !== 'text' && connectorTransport !== 'mcp') {
     throw new Error(`llm-chatgpt-web: connectorTransport must be "text" or "mcp"`)

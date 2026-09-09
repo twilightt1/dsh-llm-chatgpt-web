@@ -88,6 +88,14 @@ describe('plugin', () => {
       connectorTransport: 'mcp',
       connectorRuntime: 'managed',
     }, 'win32')).toThrow(/unsupported on win32/)
+    expect(() => resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'managed',
+    }, 'freebsd')).toThrow(/supported.*darwin.*linux/i)
+    expect(() => resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'managed',
+    }, 'darwin', 'x86')).toThrow(/architecture/i)
   })
 
   it('installs native lifecycle listeners and tears down the broker stack', async () => {
