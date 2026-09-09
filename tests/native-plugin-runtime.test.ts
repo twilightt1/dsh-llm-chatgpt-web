@@ -112,6 +112,33 @@ describe('native plugin runtime composition', () => {
     await stack.close()
   })
 
+  it('does not start a tunnel after teardown begins before socket readiness', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-plugin-'))
+    const log: string[] = []
+    let releaseListen!: () => void
+    const listening = new Promise<void>(resolve => { releaseListen = resolve })
+    const { dependencies: baseDependencies } = fakes(log, { managed: true })
+    const socket = {
+      listen: vi.fn(async () => {
+        await listening
+        log.push('socket.listen')
+      }),
+      close: vi.fn(async () => { log.push('socket.close') }),
+    } as unknown as NativeBrokerSocketServer
+    const dependencies: NativePluginRuntimeDependencies = {
+      ...baseDependencies,
+      createSocket: () => socket,
+    }
+    const stack = createNativePluginRuntime(await connection(root), dependencies)
+    const quiescing = stack.quiesce()
+    await new Promise(resolve => setImmediate(resolve))
+    releaseListen()
+    await Promise.all([stack.ready.catch(() => {}), quiescing])
+    await stack.close()
+    expect(log).not.toContain('tunnel.start')
+    expect(log.filter(entry => entry === 'tunnel.stop')).toHaveLength(1)
+  })
+
   it('retains readiness failure and keeps teardown idempotent', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-native-plugin-'))
     const log: string[] = []

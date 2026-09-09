@@ -139,51 +139,59 @@ export function createNativePluginRuntime(
     }
   }
 
+  let quiescing = false
   const ready = socket.listen().then(async () => {
     if (configurationError !== undefined) throw configurationError
+    if (quiescing) return
     if (managed !== undefined) await managed.start()
   })
   void ready.catch(() => {})
 
   let quiescePromise: Promise<void> | undefined
   let closePromise: Promise<void> | undefined
+  const assertConnection = (current: ChatGptWebConnectionOptions): void => {
+    const next = identity(current)
+    const changes: string[] = []
+    if (next.connectorRuntime !== runtimeIdentity.connectorRuntime) changes.push('connector runtime')
+    if (next.connectorName !== runtimeIdentity.connectorName) changes.push('connector name')
+    if (next.brokerSocketPath !== runtimeIdentity.brokerSocketPath) changes.push('broker socket')
+    if (next.nativeRuntimeConfigPath !== runtimeIdentity.nativeRuntimeConfigPath) changes.push('runtime config path')
+    if (next.mcpInvocationTimeoutMs !== runtimeIdentity.mcpInvocationTimeoutMs) changes.push('invocation timeout')
+    if (changes.length > 0) {
+      throw new ManagedRuntimeConfigurationError(`native runtime identity changed: ${changes.join(', ')}`)
+    }
+  }
+  const quiesce = (): Promise<void> => {
+    if (quiescePromise !== undefined) return quiescePromise
+    quiescePromise = (async () => {
+      const errors: unknown[] = []
+      quiescing = true
+      try { await coordinator.dispose() } catch (error) { errors.push(error) }
+      await ready.catch(() => {})
+      try { await managed?.stop() } catch (error) { errors.push(error) }
+      if (errors.length > 0) throw new AggregateError(errors, 'native plugin runtime quiesce failed')
+    })()
+    return quiescePromise
+  }
+  const close = (): Promise<void> => {
+    if (closePromise !== undefined) return closePromise
+    closePromise = (async () => {
+      const errors: unknown[] = []
+      try { await quiesce() } catch (error) { errors.push(error) }
+      try { await socket.close() } catch (error) { errors.push(error) }
+      try { broker.close() } catch (error) { errors.push(error) }
+      if (errors.length > 0) throw new AggregateError(errors, 'native plugin runtime close failed')
+    })()
+    return closePromise
+  }
   return {
     broker,
     socket,
     coordinator,
     ready,
-    assertConnection(current: ChatGptWebConnectionOptions): void {
-      const next = identity(current)
-      const changes: string[] = []
-      if (next.connectorRuntime !== runtimeIdentity.connectorRuntime) changes.push('connector runtime')
-      if (next.connectorName !== runtimeIdentity.connectorName) changes.push('connector name')
-      if (next.brokerSocketPath !== runtimeIdentity.brokerSocketPath) changes.push('broker socket')
-      if (next.nativeRuntimeConfigPath !== runtimeIdentity.nativeRuntimeConfigPath) changes.push('runtime config path')
-      if (next.mcpInvocationTimeoutMs !== runtimeIdentity.mcpInvocationTimeoutMs) changes.push('invocation timeout')
-      if (changes.length > 0) {
-        throw new ManagedRuntimeConfigurationError(`native runtime identity changed: ${changes.join(', ')}`)
-      }
-    },
-    quiesce(): Promise<void> {
-      if (quiescePromise !== undefined) return quiescePromise
-      quiescePromise = (async () => {
-        const errors: unknown[] = []
-        try { await coordinator.dispose() } catch (error) { errors.push(error) }
-        try { await managed?.stop() } catch (error) { errors.push(error) }
-        if (errors.length > 0) throw new AggregateError(errors, 'native plugin runtime quiesce failed')
-      })()
-      return quiescePromise
-    },
-    close(): Promise<void> {
-      if (closePromise !== undefined) return closePromise
-      closePromise = (async () => {
-        const errors: unknown[] = []
-        try { await socket.close() } catch (error) { errors.push(error) }
-        try { broker.close() } catch (error) { errors.push(error) }
-        if (errors.length > 0) throw new AggregateError(errors, 'native plugin runtime close failed')
-      })()
-      return closePromise
-    },
+    assertConnection,
+    quiesce,
+    close,
   }
 }
 
