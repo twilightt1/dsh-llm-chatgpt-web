@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { parseChatGptEffortSliderState } from '../src/chatgpt/session.ts'
+import {
+  assertChatGptSurfaceUrl,
+  chatGptSurfaceUrl,
+  parseChatGptEffortSliderState,
+} from '../src/chatgpt/session.ts'
 import {
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   CHATGPT_WEB_SOL_BACKEND_MODEL,
@@ -8,6 +12,19 @@ import {
 import { resolveSlugBackend } from '../src/chatgpt/effort.ts'
 import { estimateTokens, estimateUsage } from '../src/chatgpt/usage.ts'
 import { defaultChromeExecutable } from '../src/chatgpt/launch.ts'
+
+describe('ChatGPT surface URLs', () => {
+  it('uses Temporary Chat for text and normal chat for connectors', () => {
+    expect(chatGptSurfaceUrl('temporary')).toBe('https://chatgpt.com/?temporary-chat=true')
+    expect(chatGptSurfaceUrl('connector')).toBe('https://chatgpt.com/')
+  })
+
+  it('rejects the connector-disabled Temporary Chat surface for native mode', () => {
+    expect(() => assertChatGptSurfaceUrl('https://chatgpt.com/', 'connector')).not.toThrow()
+    expect(() => assertChatGptSurfaceUrl('https://chatgpt.com/?temporary-chat=true', 'connector')).toThrow(/connector/i)
+    expect(() => assertChatGptSurfaceUrl('https://chatgpt.com/?temporary-chat=true', 'temporary')).not.toThrow()
+  })
+})
 
 describe('parseChatGptEffortSliderState', () => {
   it('accepts a valid 5-option range', () => {

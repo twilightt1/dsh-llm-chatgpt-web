@@ -19,7 +19,27 @@ export interface ChatGptWebAccountCapabilities {
   proAvailable: boolean
 }
 
+export type ChatGptSurface = 'temporary' | 'connector'
 export const CHATGPT_TEMPORARY_CHAT_URL = 'https://chatgpt.com/?temporary-chat=true'
+export const CHATGPT_CONNECTOR_CHAT_URL = 'https://chatgpt.com/'
+
+export function chatGptSurfaceUrl(surface: ChatGptSurface): string {
+  return surface === 'temporary' ? CHATGPT_TEMPORARY_CHAT_URL : CHATGPT_CONNECTOR_CHAT_URL
+}
+
+export function assertChatGptSurfaceUrl(value: string, surface: ChatGptSurface): void {
+  const url = new URL(value)
+  const expected = new URL(chatGptSurfaceUrl(surface))
+  const isTemporary = url.searchParams.get('temporary-chat') === 'true'
+  const valid = url.origin === expected.origin
+    && url.pathname === expected.pathname
+    && (surface === 'temporary' ? isTemporary : !isTemporary)
+  if (valid) return
+  if (surface === 'temporary') {
+    throw new Error(`ChatGPT left the isolated Temporary Chat surface (${value})`)
+  }
+  throw new Error(`ChatGPT left the normal connector-enabled chat surface (${value})`)
+}
 export const CHATGPT_COMPOSER_SELECTOR = [
   '[data-testid="prompt-textarea"]',
   '#prompt-textarea',
@@ -190,11 +210,11 @@ export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> 
 }
 
 export async function assertTemporaryChatPage(page: Page): Promise<void> {
-  const url = new URL(page.url())
-  const expected = new URL(CHATGPT_TEMPORARY_CHAT_URL)
-  if (url.origin !== expected.origin || url.pathname !== expected.pathname || url.searchParams.get('temporary-chat') !== 'true') {
-    throw new Error(`ChatGPT left the isolated Temporary Chat surface (${page.url()})`)
-  }
+  assertChatGptSurfaceUrl(page.url(), 'temporary')
+}
+
+export async function assertConnectorChatPage(page: Page): Promise<void> {
+  assertChatGptSurfaceUrl(page.url(), 'connector')
 }
 
 export async function detectChatGptAccountCapabilities(
