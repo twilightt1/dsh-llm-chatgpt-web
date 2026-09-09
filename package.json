@@ -5,6 +5,9 @@
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
+  "bin": {
+    "dsh-chatgpt-web-mcp": "./lib/mcp-main.js"
+  },
   "exports": {
     ".": {
       "types": "./lib/index.d.ts",
@@ -45,8 +48,12 @@
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "playwright-core": "^1.62.0",
-    "turndown": "7.2.0"
+    "turndown": "7.2.0",
+    "zod": "4.4.3",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

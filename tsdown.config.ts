@@ -1,7 +1,11 @@
 import { defineConfig } from 'tsdown'
 
 export default defineConfig({
-  entry: ['src/index.ts', 'src/chatgpt/daemon-main.ts'],
+  entry: {
+    index: 'src/index.ts',
+    'chatgpt/daemon-main': 'src/chatgpt/daemon-main.ts',
+    'mcp-main': 'src/native/mcp-main.ts',
+  },
   format: ['esm'],
   dts: true,
   outDir: 'lib',

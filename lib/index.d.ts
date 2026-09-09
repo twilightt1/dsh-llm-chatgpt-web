@@ -2,6 +2,8 @@ import z from "@deepseek-ai/schemastery";
 import { GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk } from "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
 //#region src/adapter.d.ts
+/** Transport used to connect ChatGPT to DSH tools. */
+type ConnectorTransport = 'text' | 'mcp';
 /** One advisory model entry (the id is the DSH-facing slug). */
 interface ChatGptWebCatalogModel {
   /** DSH model id, e.g. `chatgpt-web/high`. */
@@ -43,6 +45,14 @@ interface ChatGptWebConnectionOptions {
   models: readonly ChatGptWebCatalogModel[];
   /** Provider-owned model-request retry policy, already resolved. */
   retryPolicy: ResolvedRetryPolicy;
+  /** ChatGPT tool transport; text remains the default. */
+  connectorTransport: ConnectorTransport;
+  /** Exact ChatGPT connector title used by the native MCP transport. */
+  connectorName: string;
+  /** Private Unix socket endpoint used by the native MCP façade. */
+  brokerSocketPath: string;
+  /** Native MCP invocation and broker TTL budget. */
+  mcpInvocationTimeoutMs: number;
 }
 /** Constructor options: the operation-local resolution hooks the plugin owns. */
 interface ChatGptWebAdapterOptions {
@@ -93,6 +103,11 @@ declare class ChatGptWebAdapter extends LlmAdapter {
 }
 //#endregion
 //#region src/chatgpt/prompt.d.ts
+/** Binding for the opt-in native ChatGPT MCP connector contract. */
+interface NativePromptBinding {
+  readonly requestId: string;
+  readonly connectorName: string;
+}
 /**
  * Compile one ChatGPT prompt: transport contract + JSON context envelope.
  *
@@ -101,7 +116,7 @@ declare class ChatGptWebAdapter extends LlmAdapter {
  * protocol rides as its own section and the reminder keeps last-token
  * position.
  */
-declare function compilePrompt(options: GenerateOptions, maxChars: number, notice?: string): string;
+declare function compilePrompt(options: GenerateOptions, maxChars: number, notice?: string, native?: NativePromptBinding): string;
 //#endregion
 //#region src/index.d.ts
 declare const name = "llm-chatgpt-web";
@@ -134,12 +149,25 @@ interface Config {
   models?: ChatGptWebCatalogModel[];
   /** Provider-owned model-request retry policy; omission uses normal defaults. */
   retryPolicy?: RetryPolicyConfig;
+  /** Tool transport; text is the safe default, MCP is opt-in and Unix-only. */
+  connectorTransport?: 'text' | 'mcp';
+  /** Exact title of the ChatGPT connector used in native MCP mode. */
+  connectorName?: string;
+  /** Optional private Unix socket path for the native broker. */
+  brokerSocketPath?: string;
+  /** Native MCP call/round timeout in milliseconds. */
+  mcpInvocationTimeoutMs?: number;
 }
 declare const Config: z<Config>;
+/**
+ * Derive a private, profile-specific Unix endpoint without exposing the
+ * profile path or any credential-bearing configuration in logs.
+ */
+declare function defaultBrokerSocketPath(profileDir: string): string;
 /**
  * The one explicit resolve step from raw config to validated connection facts.
  */
 declare function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptions;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, PROVIDER, apply, compilePrompt, inject, name, resolveAdapterOptions };
+export { ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorTransport, PROVIDER, apply, compilePrompt, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };
