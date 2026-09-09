@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 import {
@@ -133,6 +134,10 @@ export function loadManagedNativeRuntimeConfig(
     )
   }
   assertPrivateRegularFile(config.tunnelClient.path, 'managed tunnel client', true)
+  const binaryHash = createHash('sha256').update(readFileSync(config.tunnelClient.path)).digest('hex')
+  if (binaryHash !== config.tunnelClient.sha256) {
+    throw new Error('managed tunnel client binary hash does not match runtime config')
+  }
   assertPrivateRegularFile(config.tunnel.runtimeKeyFile, 'managed runtime key')
   assertPrivateDirectory(config.tunnel.profileDir, 'managed tunnel profile directory')
   return config

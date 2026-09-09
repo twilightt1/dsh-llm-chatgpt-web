@@ -87,11 +87,31 @@ describe('managed tunnel command and diagnostics', () => {
 })
 
 describe('ManagedTunnelRuntime', () => {
+  it('rejects a binary that reports a different pinned version before connecting', async () => {
+    const calls: Array<readonly string[]> = []
+    const runtime = new ManagedTunnelRuntime({
+      config: config(),
+      nodeExecutable: '/tmp/node',
+      mcpEntrypoint: '/tmp/mcp.js',
+      brokerSocketPath: '/tmp/broker.sock',
+      run: (_command, args) => {
+        calls.push(args)
+        return args[0] === '--version'
+          ? result('tunnel-client 0.0.11')
+          : result(JSON.stringify({ running: true, healthy: true, ready: true }))
+      },
+    })
+
+    await expect(runtime.start()).rejects.toMatchObject({ name: 'ManagedRuntimeConfigurationError' })
+    expect(calls).toEqual([['--version'], ['runtimes', 'stop', 'dsh-chatgpt-web', '--json']])
+  })
+
   it('connects once, waits for readiness, and stops the configured alias idempotently', async () => {
     const calls: Array<{ command: string; args: readonly string[] }> = []
     let statusCalls = 0
     const run: CommandRunner = (command, args) => {
       calls.push({ command, args })
+      if (args[0] === '--version') return result('tunnel-client 0.0.12')
       if (args[1] === 'connect') return result(JSON.stringify({ running: true, healthy: true, ready: true }))
       if (args[1] === 'status') {
         statusCalls += 1
@@ -137,6 +157,7 @@ describe('ManagedTunnelRuntime', () => {
       brokerSocketPath: '/tmp/broker.sock',
       run: (_command, args) => {
         calls.push(args[1] ?? '')
+        if (args[0] === '--version') return result('tunnel-client 0.0.12')
         if (args[1] === 'connect') return result(JSON.stringify({ running: true, healthy: true, ready: true }))
         if (args[1] === 'status') {
           statusCalls += 1
@@ -152,14 +173,16 @@ describe('ManagedTunnelRuntime', () => {
     await new Promise(resolve => setImmediate(resolve))
     const stopping = runtime.stop()
     await Promise.all([starting, stopping])
-    expect(calls).toEqual(['connect', 'status', 'status', 'stop'])
+    expect(calls).toEqual(['', 'connect', 'status', 'status', 'stop'])
   })
 
   it('surfaces a redacted transport failure when connect or readiness fails', async () => {
     const run: CommandRunner = (_command, args) => (
-      args[1] === 'connect'
-        ? result(`tunnel_${'0'.repeat(32)} sk-exampleSecretValue123456789`, 1)
-        : result('', 0)
+      args[0] === '--version'
+        ? result('tunnel-client 0.0.12')
+        : args[1] === 'connect'
+          ? result(`tunnel_${'0'.repeat(32)} sk-exampleSecretValue123456789`, 1)
+          : result('', 0)
     )
     const runtime = new ManagedTunnelRuntime({
       config: config(),
@@ -183,6 +206,7 @@ describe('ManagedTunnelRuntime', () => {
       brokerSocketPath: '/tmp/broker.sock',
       run: (_command, args) => {
         calls.push(args)
+        if (args[0] === '--version') return result('tunnel-client 0.0.12')
         if (args[1] === 'connect') return result(JSON.stringify({ running: true, healthy: true }))
         if (args[1] === 'status') return result(JSON.stringify({
           process_running: true,

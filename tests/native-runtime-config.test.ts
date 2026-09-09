@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { chmodSync, lstatSync, mkdtempSync, symlinkSync, writeFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -20,7 +21,7 @@ function validConfig(root: string): ManagedNativeRuntimeConfig {
     tunnelClient: {
       path: join(root, 'bin', 'tunnel-client'),
       version: '0.0.12',
-      sha256: 'a'.repeat(64),
+      sha256: createHash('sha256').update(new Uint8Array([1])).digest('hex'),
     },
     tunnel: {
       id: `tunnel_${'0'.repeat(32)}`,
@@ -93,6 +94,20 @@ describe('managed native runtime config', () => {
       ...base,
       version: 2,
     })).toThrow(/version/)
+  })
+
+  it('rejects a binary hash mismatch while loading', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-native-config-'))
+    const config = validConfig(root)
+    prepareConfigFiles(config)
+    const path = join(root, 'native-runtime.json')
+    const mismatched = {
+      ...config,
+      tunnelClient: { ...config.tunnelClient, sha256: 'a'.repeat(64) },
+    }
+    atomicWritePrivateFile(path, `${JSON.stringify(mismatched)}\n`)
+    expect(() => loadManagedNativeRuntimeConfig(path, { connectorName: 'DSH Native' }))
+      .toThrow(/hash/i)
   })
 
   it('rejects a connector-name mismatch while loading', () => {

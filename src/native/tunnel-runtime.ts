@@ -1,3 +1,4 @@
+import { MANAGED_TUNNEL_CLIENT_VERSION } from './runtime-config.ts'
 import type { ManagedNativeRuntimeConfig } from './runtime-config.ts'
 import { runCommand } from './process.ts'
 import type { CommandRunner } from './process.ts'
@@ -261,6 +262,17 @@ export class ManagedTunnelRuntime {
 
   private async startInternal(): Promise<void> {
     try {
+      const version = this.run(
+        this.config.tunnelClient.path,
+        ['--version'],
+        { timeoutMs: 10_000 },
+      )
+      const versionOutput = commandOutput(version.stdout, version.stderr)
+      if (version.status !== 0 || !/\b0\.0\.12\b/.test(versionOutput)) {
+        throw new ManagedRuntimeConfigurationError(
+          `managed tunnel client must report version ${MANAGED_TUNNEL_CLIENT_VERSION}: ${redactTunnelDetail(versionOutput)}`,
+        )
+      }
       const connect = this.run(
         this.config.tunnelClient.path,
         [
@@ -303,7 +315,7 @@ export class ManagedTunnelRuntime {
       } catch {
         // Preserve the launch/readiness failure; stop remains available to the caller.
       }
-      if (error instanceof ManagedRuntimeTransportError) throw error
+      if (error instanceof ManagedRuntimeTransportError || error instanceof ManagedRuntimeConfigurationError) throw error
       throw new ManagedRuntimeTransportError(
         `managed tunnel startup failed: ${redactTunnelDetail(error instanceof Error ? error.message : error)}`,
       )
