@@ -1,10 +1,13 @@
 import z from "@deepseek-ai/schemastery";
-import { CallId, ContentBlock, GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, Message, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk, ToolSchema } from "@deepseek-ai/dsh-llm";
+import { ContentBlock, GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, Message, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk, ToolSchema } from "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
 //#region src/native/types.d.ts
+type BrokerCallId = Extract<ContentBlock, {
+  type: 'tool-call';
+}>['id'];
 /** A provider-side tool request handed to the DSH agent loop. */
 interface BrokerToolRequest {
-  readonly callId: CallId;
+  readonly callId: BrokerCallId;
   readonly name: string;
   readonly arguments: Record<string, unknown>;
 }
@@ -52,7 +55,7 @@ declare class NativeToolBroker {
   invoke(requestId: string, activityId: string, name: string, args: Record<string, unknown>): Promise<BrokerToolResult>;
   takeToolBatch(requestId: string, now?: number): readonly BrokerToolRequest[] | undefined;
   beginSettlement(requestId: string): void;
-  completeTool(requestId: string, callId: CallId, result: BrokerToolResult): void;
+  completeTool(requestId: string, callId: BrokerCallId, result: BrokerToolResult): void;
   waitForQuiescence(requestId: string, signal?: AbortSignal): Promise<void>;
   beginCompletionFence(requestId: string): number | undefined;
   commitCompletionFence(requestId: string, revision: number): boolean;

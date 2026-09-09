@@ -34,6 +34,11 @@ describe('package manifest', () => {
     expect(readFileSync(join(root, 'lib/mcp-main.js'), 'utf8')).toMatch(/^#!\/usr\/bin\/env node/)
   })
 
+  it('does not require a version-specific runtime call-id brand export', () => {
+    const built = readFileSync(join(root, 'lib/index.js'), 'utf8')
+    expect(built).not.toMatch(/import \{[^}]*\b(?:CallId|ToolCallId)\b[^}]*\} from ["']@deepseek-ai\/dsh-llm["']/)
+  })
+
   it('targets a supported node runtime', () => {
     const engines = pkg['engines'] as { node?: string }
     expect(engines.node).toMatch(/22/)

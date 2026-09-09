@@ -9,7 +9,7 @@
  * @module dsh-llm-chatgpt-web/adapter
  */
 
-import { CallId, contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   GenerateOptions,
@@ -24,7 +24,7 @@ import type { Page } from 'playwright-core'
 import { ChatGptBrowser } from './chatgpt/browser.ts'
 import { compilePrompt } from './chatgpt/prompt.ts'
 import type { NativeRoundCleanup, NativeRoundCoordinator, NativeStepLease } from './native/coordinator.ts'
-import type { BrokerToolRequest } from './native/types.ts'
+import type { BrokerCallId, BrokerToolRequest } from './native/types.ts'
 import { CHATGPT_COMPOSER_SELECTOR, detectChatGptAccountCapabilities } from './chatgpt/session.ts'
 import type { ChatGptWebAccountCapabilities } from './chatgpt/session.ts'
 import { COMPOSER_CHAR_BUDGET, prepareTemporaryChatSurface, streamTextTurn } from './chatgpt/turn.ts'
@@ -38,9 +38,9 @@ export type ConnectorTransport = 'text' | 'mcp'
 /** Monotonic suffix for provider-issued call ids (unique per process). */
 let toolCallSequence = 0
 
-function mintCallId(): CallId {
+function mintCallId(): BrokerCallId {
   toolCallSequence += 1
-  return CallId(`call-${toolCallSequence}`)
+  return `call-${toolCallSequence}` as BrokerCallId
 }
 
 /** Convert one broker batch into ordinary DSH tool-call chunks. */
