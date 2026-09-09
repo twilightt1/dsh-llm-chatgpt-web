@@ -1,7 +1,19 @@
 import { describe, expect, it, vi } from 'vitest'
+
+const guardFixtures = vi.hoisted(() => ({
+  throwIfRateLimitDialog: vi.fn(async () => {}),
+}))
+
+vi.mock('../src/chatgpt/guards.ts', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/chatgpt/guards.ts')>(),
+  throwIfRateLimitDialog: guardFixtures.throwIfRateLimitDialog,
+}))
+
+import { LlmError } from '@deepseek-ai/dsh-llm'
 import {
   arbitrateNativeObservation,
   exactConnectorRowIndex,
+  selectChatGptConnector,
 } from '../src/chatgpt/connector.ts'
 import { nativeToolBatchChunks } from '../src/adapter.ts'
 import type { NativeBrowserControl } from '../src/chatgpt/connector.ts'
@@ -31,6 +43,40 @@ describe('exact ChatGPT connector selection', () => {
     expect(() => exactConnectorRowIndex(['DSH Native', 'DSH Native'], 'DSH Native')).toThrow(/duplicate/)
     expect(() => exactConnectorRowIndex(['Other'], 'DSH Native')).toThrow(/no row/)
     expect(exactConnectorRowIndex(['DSH Native\nAdditional details'], 'DSH Native')).toBe(0)
+  })
+
+  it('surfaces an existing rate limit before touching connector UI', async () => {
+    const rateLimit = new LlmError('wait before retrying', 'RATE_LIMIT')
+    guardFixtures.throwIfRateLimitDialog.mockReset()
+    guardFixtures.throwIfRateLimitDialog.mockRejectedValueOnce(rateLimit)
+    const page = { locator: vi.fn(() => { throw new Error('connector UI was touched') }) }
+
+    await expect(selectChatGptConnector(page as never, 'DSH Native')).rejects.toBe(rateLimit)
+    expect(page.locator).not.toHaveBeenCalled()
+  })
+
+  it('preserves a rate limit that appears during connector selection', async () => {
+    const rateLimit = new LlmError('wait before retrying', 'RATE_LIMIT')
+    guardFixtures.throwIfRateLimitDialog.mockReset()
+    guardFixtures.throwIfRateLimitDialog
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(rateLimit)
+    const target = {
+      click: vi.fn(async () => { throw new Error('selection blocked') }),
+      press: vi.fn(async () => {}),
+      pressSequentially: vi.fn(async () => {}),
+    }
+    const composers = {
+      filter: vi.fn().mockReturnThis(),
+      count: vi.fn(async () => 1),
+      first: vi.fn(() => target),
+      nth: vi.fn(() => target),
+      evaluateAll: vi.fn(async () => ['DSH Native']),
+    }
+    const page = { locator: vi.fn(() => composers) }
+
+    await expect(selectChatGptConnector(page as never, 'DSH Native')).rejects.toBe(rateLimit)
+    expect(guardFixtures.throwIfRateLimitDialog).toHaveBeenCalledTimes(2)
   })
 })
 

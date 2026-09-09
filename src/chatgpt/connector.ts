@@ -6,6 +6,7 @@ import {
   CHATGPT_CONNECTOR_MENU_ITEM_SELECTOR,
   CHATGPT_CONNECTOR_PILL_SELECTOR,
 } from './session.ts'
+import { throwIfRateLimitDialog } from './guards.ts'
 
 /** Control exposed to the browser turn by one native broker lease. */
 export interface NativeBrowserControl {
@@ -182,6 +183,10 @@ export async function selectChatGptConnector(
   let lastError: unknown
   for (let attempt = 0; attempt < 3; attempt += 1) {
     throwIfAborted(signal)
+    // ChatGPT can surface its throttle dialog before connector rows render.
+    // Fail with RATE_LIMIT instead of spending three UI attempts and masking
+    // the provider condition as a connector-selection failure.
+    await throwIfRateLimitDialog(page)
     try {
       await clearComposer(page)
       const composer = await visibleComposer(page)
@@ -196,6 +201,9 @@ export async function selectChatGptConnector(
       return
     } catch (error) {
       if (signal?.aborted) throw error
+      // A throttle can appear after the menu interaction has started. Preserve
+      // that stable failure code before resetting the composer for a retry.
+      await throwIfRateLimitDialog(page)
       lastError = error
       try {
         await clearFailedConnectorSelection(page)
