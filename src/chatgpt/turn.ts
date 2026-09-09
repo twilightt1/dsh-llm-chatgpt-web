@@ -19,7 +19,6 @@ import type { Locator, Page } from 'playwright-core'
 import {
   CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
-  CHATGPT_STOP_BUTTON_SELECTOR,
   CHATGPT_TEMPORARY_CHAT_URL,
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
@@ -39,8 +38,144 @@ export const COMPOSER_CHAR_BUDGET = 200_000
 
 /** Completion must hold this long before the turn is accepted (upstream settle). */
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000
+/** Grace for a completed response shell to gain visible text. */
+export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000
 /** Grace for the copy action to appear after generation stops (upstream). */
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000
+
+export interface ChatGptCompletionState {
+  responsePresent: boolean
+  running: boolean
+  currentText: string
+  currentHtml?: string
+  completionActionVisible: boolean
+}
+
+/** Require positive completion evidence to remain unchanged before accepting a turn. */
+export class ChatGptCompletionTracker {
+  private candidate: { signature: string; since: number } | undefined
+
+  constructor(private readonly stableMs = CHATGPT_COMPLETION_SETTLE_MS) {}
+
+  update(state: ChatGptCompletionState, now = Date.now()): boolean {
+    const complete = state.responsePresent
+      && !state.running
+      && state.currentText.length > 0
+      && state.completionActionVisible
+    if (!complete) {
+      this.candidate = undefined
+      return false
+    }
+    const signature = `${state.currentText}\0${state.currentHtml ?? state.currentText}`
+    if (this.candidate?.signature !== signature) {
+      this.candidate = { signature, since: now }
+      return false
+    }
+    return now - this.candidate.since >= this.stableMs
+  }
+}
+
+/** Fail closed when response DOM or completed-turn evidence stays unhealthy. */
+export class ChatGptObservationFaultTracker {
+  private consecutive = 0
+
+  constructor(private readonly maximum = 8) {}
+
+  recordSuccess(): void {
+    this.consecutive = 0
+  }
+
+  recordFailure(error: unknown): number {
+    this.consecutive += 1
+    if (this.consecutive > this.maximum) {
+      throw new LlmError(
+        `ChatGPT browser observation failed ${this.consecutive} times in a row: ${error instanceof Error ? error.message : String(error)}`,
+        'TRANSPORT',
+        { cause: error },
+      )
+    }
+    return this.consecutive
+  }
+}
+
+export class ChatGptTurnDomHealthTracker {
+  private sawResponse = false
+  private missingResponseSince: number | undefined
+  private emptyCompletionSince: number | undefined
+  private missingCompletionAction: { text: string; since: number } | undefined
+
+  constructor(
+    private readonly missingResponseMs: number,
+    private readonly emptyCompletionMs = CHATGPT_EMPTY_RESPONSE_GRACE_MS,
+    private readonly missingCompletionActionMs = CHATGPT_COMPLETION_ACTION_GRACE_MS,
+  ) {}
+
+  update(state: Omit<ChatGptCompletionState, 'currentHtml'>, now = Date.now()): string | undefined {
+    if (state.responsePresent) {
+      this.sawResponse = true
+      this.missingResponseSince = undefined
+    } else {
+      this.missingResponseSince ??= now
+      if (now - this.missingResponseSince >= this.missingResponseMs) {
+        return this.sawResponse
+          ? 'ChatGPT response DOM disappeared while the browser turn was active'
+          : 'ChatGPT did not create a response DOM after the message was sent'
+      }
+    }
+
+    const emptyCompletion = state.responsePresent
+      && !state.running
+      && state.currentText.length === 0
+      && state.completionActionVisible
+    if (!emptyCompletion) {
+      this.emptyCompletionSince = undefined
+    } else {
+      this.emptyCompletionSince ??= now
+      if (now - this.emptyCompletionSince >= this.emptyCompletionMs) {
+        return 'ChatGPT browser turn completed without a final answer'
+      }
+    }
+
+    const missingCompletionAction = state.responsePresent
+      && !state.running
+      && state.currentText.length > 0
+      && !state.completionActionVisible
+    if (!missingCompletionAction) {
+      this.missingCompletionAction = undefined
+    } else if (this.missingCompletionAction?.text !== state.currentText) {
+      this.missingCompletionAction = { text: state.currentText, since: now }
+    } else if (now - this.missingCompletionAction.since >= this.missingCompletionActionMs) {
+      return 'ChatGPT stopped generating but did not expose its completed-turn action; the ChatGPT DOM may have changed'
+    }
+    return undefined
+  }
+}
+
+/** Identify exactly one assistant turn created after the submission baseline. */
+export function resolveNewAssistantTurnIdentity(
+  initial: readonly string[],
+  current: readonly string[],
+): string | undefined {
+  const previous = new Set(initial)
+  const added = current.filter(identity => !previous.has(identity))
+  if (added.length > 1) {
+    throw new LlmError(
+      `ChatGPT exposed ${added.length} new assistant turns for one submitted message.`,
+      'PROVIDER_ERROR',
+    )
+  }
+  return added[0]
+}
+
+/** Keep a live binding, or bind the one replacement added since submission. */
+export function resolveReboundAssistantTurnIdentity(
+  initial: readonly string[],
+  boundIdentity: string,
+  current: readonly string[],
+): string | undefined {
+  if (current.includes(boundIdentity)) return boundIdentity
+  return resolveNewAssistantTurnIdentity(initial, current)
+}
 
 export interface TextTurnOptions {
   model: string
@@ -49,14 +184,6 @@ export interface TextTurnOptions {
   turnTimeoutMs: number
   stallTimeoutMs: number
   signal?: AbortSignal
-  /**
-   * In-chat self-correction: when set, an answer with NO tool-call block
-   * while the prompt advertised tools gets up to two follow-up nudges in
-   * the SAME Temporary Chat ("emit the block, do not narrate"), then its
-   * new answer is captured. Detects both ```tool-call fences and
-   * eaten-backtick forms.
-   */
-  requiresToolCall?: boolean
 }
 
 export interface TextTurnResult {
@@ -113,10 +240,6 @@ export async function activeComposer(page: Page, timeoutMs = 30_000): Promise<Lo
   )
 }
 
-async function stopVisible(page: Page): Promise<boolean> {
-  return await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last().isVisible().catch(() => false)
-}
-
 /**
  * One full DOM snapshot of the response turn: answer-root classification
  * (commentary/chain-of-thought/status containers are structurally excluded)
@@ -152,21 +275,21 @@ interface ResponseSnapshot {
  * Build the page-level response snapshot expression (a self-invoking IIFE
  * string). Playwright treats a string as an *expression* (isFunction is
  * false for strings), so it must be invoked inline; arguments cannot be
- * passed to a non-function expression, hence `baseCount` is embedded via
- * JSON. A real module function would break under dev transpilers (tsx/esbuild
+ * passed to a non-function expression, hence the bound response identity is
+ * embedded as JSON. A real module function would break under dev transpilers (tsx/esbuild
  * inject `__name(...)` helpers into the serialized source, which do not
  * exist in the page) — the IIFE string is the only form that survives every
  * pipeline (tsx dev, tsdown lib build) unchanged.
  *
- * The snapshot selects the response turn INSIDE the page: the (baseCount)-th
- * conversation-turn section that contains an assistant-authored message,
+ * The snapshot selects only the assistant turn identity bound after submit;
+ * it never falls back to an older turn or to the whole document,
  * classifies answer roots vs commentary (streaming-status / cot containers),
  * flattens answer roots into semantic block segments with `data-start/
  * data-end` source ranges, and reports completion evidence.
  */
-function buildResponseSnapshotExpression(baseCount: number): string {
+function buildResponseSnapshotExpression(responseIdentity: string): string {
   return `(() => {
-  const BASE = ${JSON.stringify(baseCount)};
+  const RESPONSE_ID = ${JSON.stringify(responseIdentity)};
   const renderedInDom = (candidate) => {
     const style = getComputedStyle(candidate);
     return candidate.isConnected
@@ -174,13 +297,25 @@ function buildResponseSnapshotExpression(baseCount: number): string {
       && style.visibility !== 'hidden'
       && style.opacity !== '0';
   };
-  const sections = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
-  const responseSections = sections.filter(section => (
-    section.querySelector('[data-message-author-role="assistant"]') !== null
-    || section.querySelector('[data-turn="assistant"]') !== null
-  ));
-  const responseSection = responseSections[BASE] ?? responseSections[responseSections.length - 1];
-  const target = responseSection ?? document.body;
+  const running = [...document.querySelectorAll('[data-testid="stop-button"]')].some(renderedInDom);
+  const rateLimited = [...document.querySelectorAll('[role="dialog"]')]
+    .some(dialog => dialog.textContent && /Too many requests/i.test(dialog.textContent)
+      && /making requests too quickly/i.test(dialog.textContent));
+  const sessionExpired = [...document.querySelectorAll('[role="alert"], [role="dialog"]')]
+    .some(alert => alert.textContent && /Your session has expired/i.test(alert.textContent));
+  const target = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')]
+    .find(section => section.getAttribute('data-testid') === RESPONSE_ID);
+  if (!target) {
+    return {
+      responsePresent: false,
+      segments: [],
+      completionActionVisible: false,
+      visibleText: '',
+      running,
+      rateLimited,
+      sessionExpired,
+    };
+  }
   const allMarkdownRoots = [...target.querySelectorAll('.markdown')]
     .filter(candidate => !candidate.parentElement || candidate.parentElement.closest('.markdown') === null)
     .filter(renderedInDom);
@@ -199,7 +334,7 @@ function buildResponseSnapshotExpression(baseCount: number): string {
   };
   const classified = selectAnswerRoots(allMarkdownRoots, streamingStatusContainers);
   const answerRoots = classified.answer;
-  const segments = [];
+  const flattened = [];
   const blockTags = new Set([
     'address','article','aside','blockquote','div','dl','fieldset','figcaption',
     'figure','footer','form','h1','h2','h3','h4','h5','h6','header','hr',
@@ -210,88 +345,116 @@ function buildResponseSnapshotExpression(baseCount: number): string {
     const s = candidate.getAttribute('data-start');
     const e = candidate.getAttribute('data-end');
     if (s === null || e === null || !s.trim() || !e.trim()) return undefined;
-    const start = Number(s), end = Number(e);
-    return Number.isFinite(start) && Number.isFinite(end) && end >= start
-      ? { start, end } : undefined;
+    const sourceStart = Number(s), sourceEnd = Number(e);
+    return Number.isFinite(sourceStart) && Number.isFinite(sourceEnd) && sourceEnd >= sourceStart
+      ? { sourceStart, sourceEnd } : undefined;
   };
-  const appendSegment = (element, html, text, groupHint) => {
-    const range = sourceRange(element);
-    const tag = element.tagName.toLowerCase();
-    let group;
-    if (groupHint !== undefined) group = groupHint;
-    else if (range !== undefined) group = 'block:' + range.start;
-    segments.push({
-      key: (range !== undefined ? 'r:' + range.start + ':' + tag : 'g:' + (group ?? segments.length) + ':' + tag + ':' + segments.length),
-      tag,
-      html,
-      text,
-      ...(group !== undefined ? { group } : {}),
-      ...(range !== undefined ? { sourceStart: range.start, sourceEnd: range.end } : {}),
-      streamable: false,
+  const appendBlock = (child) => {
+    const tag = child.tagName.toLowerCase();
+    const range = sourceRange(child);
+    const listItems = tag === 'ol' || tag === 'ul'
+      ? [...child.children].filter(candidate => candidate.tagName === 'LI')
+      : [];
+    if (listItems.length === 0) {
+      flattened.push({ tag, html: child.outerHTML, text: child.innerText.trim(), ...(range ?? {}) });
+      return;
+    }
+    const group = range
+      ? 'list:' + range.sourceStart + ':' + tag
+      : 'list:' + (listGroupIndex++) + ':' + tag;
+    const orderedStart = tag === 'ol' ? Number(child.getAttribute('start') ?? '1') : undefined;
+    listItems.forEach((item, itemIndex) => {
+      const shell = child.cloneNode(false);
+      shell.removeAttribute('data-is-last-node');
+      if (orderedStart !== undefined && Number.isFinite(orderedStart)) {
+        shell.setAttribute('start', String(orderedStart + itemIndex));
+      }
+      shell.append(item.cloneNode(true));
+      flattened.push({
+        tag: tag + ':item',
+        html: shell.outerHTML,
+        text: item.innerText.trim(),
+        group,
+        ...(sourceRange(item) ?? {}),
+      });
     });
   };
   for (const answerRoot of answerRoots) {
-    const children = [...answerRoot.children].filter(renderedInDom);
-    const visibleChildren = children.length > 0 ? children : [answerRoot];
-    for (const child of visibleChildren) {
-      const tag = child.tagName.toLowerCase();
-      if (!blockTags.has(tag)) {
-        appendSegment(child, child.outerHTML, child.textContent ?? '', undefined);
-        continue;
-      }
-      if (tag === 'ol' || tag === 'ul') {
-        const range = sourceRange(child);
-        const group = range !== undefined
-          ? 'list:' + range.start + ':' + tag
-          : 'list:' + (listGroupIndex++) + ':' + tag;
-        const items = [...child.children].filter(li => li.tagName === 'LI');
-        for (const item of items) {
-          appendSegment(item, item.outerHTML, item.textContent ?? '', group);
-        }
-        continue;
-      }
-      appendSegment(child, child.outerHTML, child.textContent ?? '', undefined);
+    const children = [...answerRoot.children];
+    const hasBlockChildren = children.some(child => blockTags.has(child.tagName.toLowerCase()));
+    if (!hasBlockChildren) {
+      if (answerRoot.innerHTML.trim()) flattened.push({
+        tag: 'root',
+        html: answerRoot.innerHTML,
+        text: answerRoot.innerText.trim(),
+        ...(sourceRange(answerRoot) ?? {}),
+      });
+      continue;
     }
+    let inlineRun = [];
+    const flushInlineRun = () => {
+      if (inlineRun.length === 0) return;
+      const nodes = inlineRun;
+      inlineRun = [];
+      const shell = document.createElement('span');
+      nodes.forEach(node => shell.append(node.cloneNode(true)));
+      const text = (shell.textContent ?? '').trim();
+      if (!text) return;
+      const ranges = nodes.flatMap(node => node instanceof Element
+        ? [node, ...node.querySelectorAll('[data-start][data-end]')]
+        : []).map(sourceRange).filter(Boolean);
+      flattened.push({
+        tag: 'inline',
+        html: shell.outerHTML,
+        text,
+        ...(ranges.length > 0 ? {
+          sourceStart: Math.min(...ranges.map(range => range.sourceStart)),
+          sourceEnd: Math.max(...ranges.map(range => range.sourceEnd)),
+        } : {}),
+      });
+    };
+    answerRoot.childNodes.forEach(node => {
+      if (node instanceof HTMLElement && blockTags.has(node.tagName.toLowerCase())) {
+        flushInlineRun();
+        appendBlock(node);
+      } else {
+        inlineRun.push(node);
+      }
+    });
+    flushInlineRun();
   }
-  for (let i = 0; i < segments.length; i++) {
-    segments[i].streamable = i < segments.length - 1;
-  }
-  const completionActionVisible = [...target.querySelectorAll('button[data-testid="copy-turn-action-button"]')]
-    .some(renderedInDom);
-  const stopButtons = [...document.querySelectorAll('[data-testid="stop-button"]')]
-    .filter(renderedInDom);
-  const rateDialog = [...document.querySelectorAll('[role="dialog"]')]
-    .some(d => d.textContent && /Too many requests/i.test(d.textContent) && /making requests too quickly/i.test(d.textContent));
-  const sessionAlert = [...document.querySelectorAll('[role="alert"], [role="dialog"]')]
-    .some(d => d.textContent && /Your session has expired/i.test(d.textContent));
-  const visibleText = segments.map(s => s.text).join('\\n\\n');
+  const segments = flattened.map((segment, index, all) => ({
+    key: segment.sourceStart !== undefined
+      ? segment.sourceStart + ':' + segment.tag
+      : index + ':' + segment.tag,
+    ...segment,
+    streamable: index < all.length - 1,
+  }));
+  const rendered = answerRoots.at(-1);
+  const completionActionVisible = rendered !== undefined && [...target.querySelectorAll('button[data-testid="copy-turn-action-button"]')]
+    .filter(renderedInDom)
+    .some(candidate => !rendered.contains(candidate)
+      && Boolean(rendered.compareDocumentPosition(candidate) & 4));
+  const visibleText = answerRoots.map(root => root.innerText.trim()).filter(Boolean).join('\\n\\n');
   return {
-    responsePresent: segments.length > 0,
+    responsePresent: true,
     segments,
     completionActionVisible,
     visibleText,
-    running: stopButtons.length > 0,
-    rateLimited: rateDialog,
-    sessionExpired: sessionAlert,
+    running,
+    rateLimited,
+    sessionExpired,
   };
 })()`
 }
 
 /**
- * Snapshot the response turn (assistant turn #`baseCount` on the page) into
- * segments + completion evidence. Page-level IIFE expression: no locator
+ * Snapshot one identity-bound assistant response into segments + completion
+ * evidence. Page-level IIFE expression: no locator
  * handles, no transpiler-sensitive function serialization.
  */
-async function responseSnapshot(page: Page, baseCount: number): Promise<ResponseSnapshot> {
-  const fallback = (): ResponseSnapshot => ({ responsePresent: false, segments: [], completionActionVisible: false, visibleText: '', running: false, rateLimited: false, sessionExpired: false })
-  try {
-    return await page.evaluate(buildResponseSnapshotExpression(baseCount))
-  } catch (error) {
-    console.log(
-      `[dsh-llm-chatgpt-web] snapshot evaluate failed: ${error instanceof Error ? error.message : String(error)}`,
-    )
-    return fallback()
-  }
+async function responseSnapshot(page: Page, responseIdentity: string): Promise<ResponseSnapshot> {
+  return await page.evaluate(buildResponseSnapshotExpression(responseIdentity))
 }
 
 /**
@@ -361,15 +524,28 @@ export async function* streamTextTurn(
     if (page.isClosed()) throw new LlmError('ChatGPT Web page was closed mid-turn.', 'TRANSPORT')
   }
 
-  if (page.url() !== CHATGPT_TEMPORARY_CHAT_URL) {
-    await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 })
-  }
-  await prepareTemporaryChatSurface(page)
-
+  // The caller prepares this exact page once before capability probing. A
+  // second navigation here races a fresh SPA hydration and discards that
+  // settled document.
+  await assertAuthenticatedChatGptPage(page)
+  await assertTemporaryChatPage(page)
   await selectModelEffort(page, options.model, options.capabilities)
 
   const assistantTurns = page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR)
-  const initialAssistantTurns = await assistantTurns.count().catch(() => 0)
+  const assistantTurnIdentities = async (): Promise<string[]> => {
+    const identities = await assistantTurns.evaluateAll(elements => (
+      elements.map(element => element.getAttribute('data-testid'))
+    ))
+    if (identities.some(identity => typeof identity !== 'string' || !identity.startsWith('conversation-turn-'))) {
+      throw new LlmError('ChatGPT assistant turn has no stable identity.', 'PROVIDER_ERROR')
+    }
+    const typed = identities as string[]
+    if (new Set(typed).size !== typed.length) {
+      throw new LlmError('ChatGPT exposed duplicate assistant turn identities.', 'PROVIDER_ERROR')
+    }
+    return typed
+  }
+  const initialAssistantTurns = await assistantTurnIdentities()
 
   /**
    * Code-unit readback (upstream browser-worker): poll the composer text and
@@ -454,7 +630,7 @@ export async function* streamTextTurn(
   }
 
   /** Submit and wait for the model to start answering. */
-  async function submit(baseCount: number): Promise<void> {
+  async function submit(initialIdentities: readonly string[]): Promise<string> {
     const composer = await activeComposer(page)
     const sendButton = composer.locator('xpath=ancestor::form[1]').getByTestId('send-button')
     await sendButton.waitFor({ state: 'visible', timeout: 30_000 })
@@ -476,8 +652,8 @@ export async function* streamTextTurn(
       checkDeadline()
       await throwIfSessionFailureAlert(page)
       await throwIfRateLimitDialog(page)
-      const assistants = await assistantTurns.count().catch(() => 0)
-      if (assistants > baseCount || await stopVisible(page)) break
+      const identity = resolveNewAssistantTurnIdentity(initialIdentities, await assistantTurnIdentities())
+      if (identity !== undefined) return identity
       if (Date.now() >= submitDeadline) {
         await throwIfTerminalError(page)
         throw new LlmError('ChatGPT did not accept the submitted prompt (no turn appeared).', 'PROVIDER_ERROR')
@@ -486,15 +662,13 @@ export async function* streamTextTurn(
     }
   }
 
-  /** Poll one round's assistant turn (created at `baseCount`) to completion. */
-  async function* captureRound(baseCount: number): AsyncGenerator<TextTurnEvent, string> {
+  /** Poll one identity-bound assistant turn to completion. */
+  async function* captureRound(responseIdentity: string): AsyncGenerator<TextTurnEvent, string> {
+    let boundResponseIdentity = responseIdentity
     const markdownBuffer = new ChatGptMarkdownBuffer()
-    let previousVisible = ''
-    let lastGrowth = Date.now()
-    let lastSignature = ''
-    let stableSince: number | undefined
-    let copyMissingSince: number | undefined
-    const REQUIRED_STABLE_MS = CHATGPT_COMPLETION_SETTLE_MS
+    const completionTracker = new ChatGptCompletionTracker()
+    const observationFaults = new ChatGptObservationFaultTracker()
+    const domHealthTracker = new ChatGptTurnDomHealthTracker(options.stallTimeoutMs)
     for (;;) {
       checkDeadline()
       // ONE evaluate per poll (upstream discipline): the snapshot IIFE
@@ -502,7 +676,33 @@ export async function* streamTextTurn(
       // session guards. Per-poll locator round-trips (guard isVisible x4,
       // count, stopVisible) previously throttled ChatGPT's streaming DOM so
       // hard that short answers never finished rendering.
-      const snapshot = await responseSnapshot(page, baseCount)
+      let snapshot: ResponseSnapshot
+      try {
+        snapshot = await responseSnapshot(page, boundResponseIdentity)
+        observationFaults.recordSuccess()
+      } catch (error) {
+        if (page.isClosed()) {
+          throw new LlmError('ChatGPT Web page was closed mid-turn.', 'TRANSPORT', { cause: error })
+        }
+        const fault = observationFaults.recordFailure(error)
+        console.warn(
+          `[dsh-llm-chatgpt-web] tolerated response observation fault ${fault}/8:`
+          + ` ${error instanceof Error ? error.message : String(error)}`,
+        )
+        await new Promise(resolveSleep => setTimeout(resolveSleep, 250))
+        continue
+      }
+      if (!snapshot.responsePresent) {
+        const rebound = resolveReboundAssistantTurnIdentity(
+          initialAssistantTurns,
+          boundResponseIdentity,
+          await assistantTurnIdentities(),
+        )
+        if (rebound !== undefined && rebound !== boundResponseIdentity) {
+          boundResponseIdentity = rebound
+          continue
+        }
+      }
       if (snapshot.rateLimited) {
         throw new LlmError('ChatGPT rate limit: too many requests. Try again in a few minutes.', 'RATE_LIMIT')
       }
@@ -516,7 +716,7 @@ export async function* streamTextTurn(
       const running = snapshot.running
       if (process.env['DSH_CHATGPT_DEBUG'] === '1') {
         console.log(
-          `[dsh-llm-chatgpt-web] poll base=${baseCount} segs=${snapshot.segments.length}`
+          `[dsh-llm-chatgpt-web] poll response=${boundResponseIdentity} segs=${snapshot.segments.length}`
           + ` visible=${snapshot.visibleText.length} copy=${snapshot.completionActionVisible}`
           + ` running=${running}`,
         )
@@ -527,11 +727,8 @@ export async function* streamTextTurn(
         ...segment,
         text: chatGptHtmlToMarkdown(segment.html) || segment.text,
       }))
-      let delta = ''
-      try {
-        delta = markdownBuffer.observe(segments)
-      } catch {
-        // Consistency errors are surfaced as PROVIDER_ERROR below.
+      const delta = markdownBuffer.observe(segments)
+      if (!markdownBuffer.currentSnapshotIsConsistent()) {
         throw new LlmError(
           'ChatGPT rewrote text that was already streamed; the turn cannot be completed safely.',
           'PROVIDER_ERROR',
@@ -546,65 +743,33 @@ export async function* streamTextTurn(
       const visible = snapshot.visibleText.replace(/^Thinking\s*\n+/, '').replace(/(?:^|\s)Answer now\s*$/, '')
       const responsePresent = snapshot.responsePresent
 
-      // Completion (upstream predicate + signature stability): response
-      // present, not running, non-empty text, copy action visible, and the
-      // signature unchanged for REQUIRED_STABLE_MS.
-      const signature = `${visible}\0${snapshot.segments.map(s => s.key).join(',')}`
-      const complete = responsePresent && !running && visible.length > 0 && snapshot.completionActionVisible
-      if (complete && signature === lastSignature) {
-        stableSince ??= Date.now()
-        if (Date.now() - stableSince >= REQUIRED_STABLE_MS) {
+      const healthError = domHealthTracker.update({
+        responsePresent,
+        running,
+        currentText: visible,
+        completionActionVisible: snapshot.completionActionVisible,
+      })
+      if (healthError !== undefined) {
+        throw new LlmError(healthError, 'PROVIDER_ERROR')
+      }
+      if (completionTracker.update({
+        responsePresent,
+        running,
+        currentText: visible,
+        currentHtml: snapshot.segments.map(segment => segment.html).join(''),
+        completionActionVisible: snapshot.completionActionVisible,
+      })) {
+        try {
           const final = markdownBuffer.finish()
           if (final.delta.length > 0) yield { type: 'delta', delta: final.delta }
           return final.markdown.length > 0 ? final.markdown : visible
+        } catch (error) {
+          throw new LlmError(
+            'ChatGPT rewrote text that was already streamed; the turn cannot be completed safely.',
+            'PROVIDER_ERROR',
+            { cause: error },
+          )
         }
-      } else {
-        stableSince = undefined
-      }
-      lastSignature = signature
-      if (visible.length > previousVisible.length) {
-        lastGrowth = Date.now()
-      }
-      previousVisible = visible
-
-      // Settled without a copy action: upstream grants a grace window, then
-      // accepts a quiet finish (some surfaces render no copy button).
-      if (responsePresent && !running && visible.length > 0 && !snapshot.completionActionVisible) {
-        copyMissingSince ??= Date.now()
-        if (Date.now() - copyMissingSince >= CHATGPT_COMPLETION_ACTION_GRACE_MS) {
-          const final = markdownBuffer.finish()
-          if (final.delta.length > 0) yield { type: 'delta', delta: final.delta }
-          return final.markdown.length > 0 ? final.markdown : visible
-        }
-      } else {
-        copyMissingSince = undefined
-      }
-
-      // Stall verdict: only when generation is NOT running and nothing has
-      // grown. A visible stop button proves ChatGPT is still generating
-      // (reasoning models can think for many minutes before first text), so
-      // the whole-turn deadline above — not the stall clock — governs it.
-      if (!running && Date.now() - lastGrowth >= options.stallTimeoutMs) {
-        if (responsePresent && visible.length > 0) {
-          // Quiet finish: settled, no copy action, grace already elapsed.
-          const final = markdownBuffer.finish()
-          if (final.delta.length > 0) yield { type: 'delta', delta: final.delta }
-          return final.markdown.length > 0 ? final.markdown : visible
-        }
-        console.log(
-          `[dsh-llm-chatgpt-web] stall diagnosis: baseCount=${baseCount}`
-          + ` segments=${snapshot.segments.length} visible=${visible.length} running=${running}`
-          + ` copyAction=${snapshot.completionActionVisible} url=${page.url()}`,
-        )
-        if (process.env['DSH_CHATGPT_DEBUG'] === '1') {
-          const stamp = Date.now()
-          await page.screenshot({ path: `/tmp/dsh-stall-${stamp}.png` }).catch(() => {})
-          console.log(`[dsh-llm-chatgpt-web] stall screenshot: /tmp/dsh-stall-${stamp}.png`)
-        }
-        throw new LlmError(
-          `ChatGPT Web turn stalled with no output growth for ${options.stallTimeoutMs}ms.`,
-          'TIMEOUT',
-        )
       }
       // Upstream cadence: a plain 250ms sleep between polls; no dense
       // MutationObserver evaluate inside the streaming loop.
@@ -612,35 +777,11 @@ export async function* streamTextTurn(
     }
   }
 
-  // Rounds: the prompt, then up to two in-chat nudges when the task needs a
-  // tool call but the model narrated instead of emitting a fenced block.
-  const NUDGE = ('[System reminder] Your last reply was narration or a refusal — nothing executed, the task is NOT done. '
-    + 'The tool interface IS available in this chat (the harness executes fenced blocks and returns results here); claiming otherwise is incorrect. '
-    + 'Reply AGAIN with your ENTIRE message being ONLY this shape (real JSON, no prose before or after, use a real tool name and real argument values from the task):\n'
-    + '```tool-call\n{"name": "<one of the advertised tools>", "arguments": {…}}\n```')
-  // A usable fence needs the tag AND a JSON body start inside the block —
-  // a bare "tool-call" word (backticks eaten) with the payload after a
-  // stray fence marker still counts; prose mentioning tool-call does not.
-  const fenceSeen = (text: string): boolean => /`{0,3}\s*tool-call[ \t]*\r?\n?[^{]*\{/.test(text)
-  const maxRounds = options.requiresToolCall ? 3 : 1
-  let captured = ''
-  const round0Base = await assistantTurns.count().catch(() => initialAssistantTurns)
-  for (let round = 0; round < maxRounds; round += 1) {
-    const isNudge = round > 0
-    const baseCount = isNudge
-      ? await assistantTurns.count().catch(() => round0Base)
-      : round0Base
-    await attach(isNudge ? NUDGE : options.prompt)
-    await submit(baseCount)
-    const roundText = yield* captureRound(baseCount)
-    // Only the FINAL round's text is the answer: nudged rounds are failed
-    // attempts (refusals/narration), and including them would duplicate
-    // stale text (observed live: "FILE WRITTEN" x3 from 3 rounds).
-    captured = roundText
-    if (!options.requiresToolCall || fenceSeen(captured)) break
-    if (round === 0) {
-      console.log('[dsh-llm-chatgpt-web] no tool-call block; nudging in-chat')
-    }
-  }
+  // Tool availability never implies that every response must call a tool.
+  // The model decides from the active request; forcing follow-up nudges here
+  // duplicated streamed text and made ordinary final answers impossible.
+  await attach(options.prompt)
+  const responseIdentity = await submit(initialAssistantTurns)
+  const captured = yield* captureRound(responseIdentity)
   return { text: captured, promptChars: options.prompt.length }
 }

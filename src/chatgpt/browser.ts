@@ -59,6 +59,32 @@ function persistStorageState(profileDir: string, state: unknown): void {
   }
 }
 
+/** Open a page, reconnecting once and re-reading the replacement context. */
+export async function openNewPageWithReconnect(
+  currentContext: () => BrowserContext | undefined,
+  reconnect: () => Promise<void>,
+): Promise<Page> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const context = currentContext()
+    if (!context) throw new LlmError('ChatGPT Web browser is not ready.', 'TRANSPORT')
+    try {
+      return await context.newPage()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const connectionDropped = /browser closed|connection closed|context closed|target closed|session closed/i.test(message)
+      if (!connectionDropped || attempt > 0) {
+        throw new LlmError(
+          `ChatGPT Web browser page could not be opened (${message}).`,
+          'TRANSPORT',
+          { cause: error },
+        )
+      }
+      await reconnect()
+    }
+  }
+  throw new LlmError('ChatGPT Web browser page could not be opened.', 'TRANSPORT')
+}
+
 /**
  * One daemon attachment for the adapter's lifetime. Turns are serialized by
  * the caller; each turn gets a FRESH page in the shared context and closes
@@ -78,17 +104,11 @@ export class ChatGptBrowser {
   /** Connect (spawning the daemon on first use) and guarantee a login session. */
   async ensureReady(signal?: AbortSignal): Promise<void> {
     if (this.browser && this.context) {
-      // Liveness check: a daemon that died between turns leaves a connected
-      // (but dead) pipe. A cheap contexts() round-trip proves the wire.
-      try {
-        await this.browser.contexts()
-        return
-      } catch {
-        console.log('[dsh-llm-chatgpt-web] daemon connection dead; reattaching')
-        this.context = undefined
-        this.browser = undefined
-        this.capabilitiesProbed = false
-      }
+      if (this.browser.isConnected()) return
+      console.log('[dsh-llm-chatgpt-web] daemon connection dead; reattaching')
+      this.context = undefined
+      this.browser = undefined
+      this.capabilitiesProbed = false
     }
     mkdirSync(this.options.profileDir, { recursive: true, mode: 0o700 })
     if (!existsSync(storageStatePath(this.options.profileDir))) {
@@ -122,24 +142,10 @@ export class ChatGptBrowser {
    * attempt runs before surfacing the error.
    */
   async newTurnPage(): Promise<Page> {
-    if (!this.context) {
-      throw new LlmError('ChatGPT Web browser is not ready.', 'TRANSPORT')
-    }
     touchEndpoint(this.options.profileDir)
-    const attached = this.context
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        return await attached.newPage()
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        const connectionDropped = /browser closed|connection closed|target closed|session closed/i.test(message)
-        if (!connectionDropped || attempt > 0) {
-          throw new LlmError(
-            `ChatGPT Web browser page could not be opened (${message}).`,
-            'TRANSPORT',
-            { cause: error },
-          )
-        }
+    return openNewPageWithReconnect(
+      () => this.context,
+      async () => {
         // The daemon died between connect and use. Reset the attachment and
         // reconnect (spawning a fresh daemon when needed).
         console.log('[dsh-llm-chatgpt-web] daemon connection lost; reconnecting')
@@ -147,9 +153,8 @@ export class ChatGptBrowser {
         this.browser = undefined
         this.capabilitiesProbed = false
         await this.ensureReady()
-      }
-    }
-    throw new LlmError('ChatGPT Web browser page could not be opened.', 'TRANSPORT')
+      },
+    )
   }
 
   /**

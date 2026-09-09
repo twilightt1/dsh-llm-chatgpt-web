@@ -33,12 +33,13 @@ The prompt transport follows codex-chatgpt-web's proven design: the DSH
 conversation is wrapped in a `<dsh_context_json>` envelope with an explicit
 transport contract (role semantics, read-before-acting, never echo), which
 replaced the old plaintext transcript that made ChatGPT echo instructions
-back. Answer extraction converts ChatGPT's answer-root HTML into Markdown
-(turndown) streamed through an append-only buffer with source ranges, so
-code fences (including ```tool-call blocks), tables, and headings survive and
-ChatGPT re-renders can never retract streamed text. The session is persisted
-back to the profile after every completed turn because ChatGPT rotates
-session tokens.
+back. Answer extraction binds the newly-created assistant turn by its stable
+DOM identity, then converts only that turn's answer-root HTML into Markdown
+(turndown). It never falls back to an older turn or the whole document. An
+append-only buffer with source ranges preserves code fences (including
+```tool-call blocks), tables, and headings without retracting streamed text.
+The session is persisted back to the profile after every completed turn
+because ChatGPT rotates session tokens.
 
 ## Prerequisites
 
@@ -139,10 +140,12 @@ owned browser (the dev `scripts/live-turn.ts` shows the pattern).
   prompt and the model emits fenced ```tool-call blocks the adapter parses
   into harness tool-call chunks; results ride back as tool_result messages
   inside the next prompt's JSON envelope. Live-verified through the real
-  agent loop (session writes execute, answers return). ChatGPT-Web models
-  sometimes refuse the fenced protocol on the lowest effort (Instant);
-  nudging recovers most cases, and medium+ efforts comply reliably.
-  (Driving page-side tool use back into DSH tools is V2 work.)
+  agent loop (session writes execute, answers return). This text protocol is
+  weaker than codex-chatgpt-web's native MCP path: ChatGPT may sometimes
+  narrate or claim an action instead of emitting the fence, even at higher
+  efforts. Tool availability does not force every answer to call a tool, so
+  the adapter does not blindly nudge ordinary/final answers. Native page-side
+  tool bridging and claim validation remain V2 work.
 - Usage is a client-side char-based estimate; the page exposes no measured
   counts.
 - Reasoning/thinking content is not surfaced separately in V1.
@@ -180,9 +183,8 @@ Proven against a real Plus-class account (Sep 2026, after the JSON-envelope
   agent spine: a tool task ("create hello.txt with TOOL-LOOP-OK") — the
   model emits the fenced ```tool-call block, the harness executes `write`,
   the file appears on disk with the exact content, and the final answer is
-  a clean "FILE WRITTEN" (with an in-chat nudge recovering a first-round
-  refusal). Two-task continuity ("remember codeword" → "recall it") replays
-  the JSON envelope history correctly.
+  a clean "FILE WRITTEN". Two-task continuity ("remember codeword" →
+  "recall it") replays the JSON envelope history correctly.
 - The storage state persists after every completed turn (ChatGPT rotates
   session tokens); `storage-state.json` mtime advances per turn.
 - Heavier reasoning efforts (think/medium/high) need the raised budgets

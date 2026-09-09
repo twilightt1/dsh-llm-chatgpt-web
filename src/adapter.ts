@@ -35,6 +35,20 @@ function mintCallId(): ToolCallId {
   return ToolCallId(`call-${toolCallSequence}`)
 }
 
+/** Preserve provider/UI failures instead of labelling every exception as transport. */
+export function classifyTurnFailure(error: unknown): LlmError {
+  if (error instanceof LlmError) return error
+  const detail = error instanceof Error ? error.message : String(error)
+  const transportFailure = /browser.*closed|connection.*closed|context.*closed|target.*closed|session.*closed|page.*closed|websocket|protocol error|execution context was destroyed|ECONNRESET|EPIPE/i.test(detail)
+  const timeoutFailure = (error instanceof Error && error.name === 'TimeoutError')
+    || /\bTimeout \d+ms exceeded\b/i.test(detail)
+  return new LlmError(
+    `ChatGPT Web turn failed: ${detail}`,
+    transportFailure ? 'TRANSPORT' : timeoutFailure ? 'TIMEOUT' : 'PROVIDER_ERROR',
+    { cause: error },
+  )
+}
+
 /** One advisory model entry (the id is the DSH-facing slug). */
 export interface ChatGptWebCatalogModel {
   /** DSH model id, e.g. `chatgpt-web/high`. */
@@ -348,7 +362,6 @@ export class ChatGptWebAdapter extends LlmAdapter {
         browser.markProbed()
       }
       const capabilities = this.capabilities
-      const hasTools = (options.tools?.length ?? 0) > 0
       const turn = streamTextTurn(page, {
         model: options.model,
         prompt,
@@ -356,7 +369,6 @@ export class ChatGptWebAdapter extends LlmAdapter {
         turnTimeoutMs: connection.turnTimeoutMs,
         stallTimeoutMs: connection.stallTimeoutMs,
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
-        ...(hasTools ? { requiresToolCall: true } : {}),
       })
       iterator = turn[Symbol.asyncIterator]()
       let blockIndex = -1
@@ -392,8 +404,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         }
         throw new LlmError('ChatGPT Web request aborted by caller.', 'ABORTED', { cause: error })
       }
-      if (error instanceof LlmError) throw error
-      throw new LlmError('ChatGPT Web turn failed.', 'TRANSPORT', { cause: error })
+      throw classifyTurnFailure(error)
     } finally {
       // The turn page is always closed, and a COMPLETED turn persists the
       // fresh session (ChatGPT rotates tokens; upstream does this per turn).

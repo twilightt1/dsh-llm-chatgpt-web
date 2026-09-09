@@ -1,5 +1,5 @@
 import z from "@deepseek-ai/schemastery";
-import { GenerateOptions, LlmAdapter, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk } from "@deepseek-ai/dsh-llm";
+import { GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk } from "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
 //#region src/adapter.d.ts
 /** One advisory model entry (the id is the DSH-facing slug). */
