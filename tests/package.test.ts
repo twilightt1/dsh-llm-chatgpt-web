@@ -27,7 +27,7 @@ describe('package manifest', () => {
     const deps = pkg['dependencies'] as Record<string, string>
     expect(deps['playwright-core']).toBeDefined()
     expect(deps['@modelcontextprotocol/sdk']).toBeDefined()
-    expect(deps.fflate).toBe('0.8.2')
+    expect(deps.fflate).toBe('0.8.3')
     expect(deps.zod).toBe('4.4.3')
     const bin = pkg['bin'] as Record<string, string>
     expect(bin['dsh-chatgpt-web-mcp']).toBe('./lib/mcp-main.js')
