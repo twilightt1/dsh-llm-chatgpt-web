@@ -159,6 +159,7 @@ function validateExistingInstallation(
   binaryPath: string,
   manifestPath: string,
   run: CommandRunner,
+  expectedAsset: TunnelReleaseAsset,
 ): TunnelInstallManifest | undefined {
   const binaryExists = pathExistsOrSymlink(binaryPath)
   const manifestExists = pathExistsOrSymlink(manifestPath)
@@ -170,6 +171,9 @@ function validateExistingInstallation(
     manifest = parseManifest(JSON.parse(readFileSync(manifestPath, 'utf8')) as unknown)
   } catch (error) {
     throw new Error(`existing tunnel-client manifest failed integrity validation: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (manifest.asset !== expectedAsset.name || manifest.archiveSha256 !== expectedAsset.archiveSha256) {
+    throw new Error('existing tunnel-client manifest does not match the pinned release asset')
   }
   const binary = new Uint8Array(readFileSync(binaryPath))
   if (digest(binary) !== manifest.binarySha256) {
@@ -265,12 +269,15 @@ export async function stageTunnelClient(options: {
   readonly releaseAsset?: TunnelReleaseAsset
 }): Promise<TunnelInstallTransaction> {
   const run = options.run ?? runCommand
-  const existing = validateExistingInstallation(options.binaryPath, options.manifestPath, run)
+  const platform = options.platform ?? process.platform
+  const arch = options.arch ?? process.arch
+  const supportedAsset = tunnelReleaseAsset(platform, arch)
+  const asset = options.releaseAsset ?? supportedAsset
+  const existing = validateExistingInstallation(options.binaryPath, options.manifestPath, run, asset)
   if (existing !== undefined) return noOpTransaction(options.binaryPath, existing)
 
   ensurePrivateDirectory(dirname(options.binaryPath))
   ensurePrivateDirectory(dirname(options.manifestPath))
-  const asset = options.releaseAsset ?? tunnelReleaseAsset(options.platform, options.arch ?? process.arch)
   if (!asset.name.endsWith('.zip') || asset.name.includes('\n') || !SHA256.test(asset.archiveSha256)) {
     throw new Error('tunnel-client release asset is invalid')
   }

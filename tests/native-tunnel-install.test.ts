@@ -190,6 +190,47 @@ describe('staged tunnel-client installation', () => {
     expect(new Uint8Array(readFileSync(binaryPath))).toEqual(binary)
   })
 
+  it('rejects an existing installation for a different release asset', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tunnel-install-'))
+    const { binaryPath, manifestPath, asset, run } = fixture(root)
+    const binary = new TextEncoder().encode('existing tunnel client')
+    atomicWritePrivateFile(binaryPath, binary, 0o700)
+    atomicWritePrivateFile(manifestPath, `${JSON.stringify({
+      version: 1,
+      tunnelClientVersion: VERSION,
+      asset: 'other-release.zip',
+      archiveSha256: 'b'.repeat(64),
+      binarySha256: digest(binary),
+    })}\n`)
+    await expect(stageTunnelClient({
+      binaryPath,
+      manifestPath,
+      run,
+      releaseAsset: asset,
+    })).rejects.toThrow(/asset|integrity/i)
+  })
+
+  it('rejects an existing installation on an unsupported platform', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tunnel-install-'))
+    const { binaryPath, manifestPath, asset, run } = fixture(root)
+    const binary = new TextEncoder().encode('existing tunnel client')
+    atomicWritePrivateFile(binaryPath, binary, 0o700)
+    atomicWritePrivateFile(manifestPath, `${JSON.stringify({
+      version: 1,
+      tunnelClientVersion: VERSION,
+      asset: asset.name,
+      archiveSha256: asset.archiveSha256,
+      binarySha256: digest(binary),
+    })}\n`)
+    await expect(stageTunnelClient({
+      binaryPath,
+      manifestPath,
+      run,
+      platform: 'win32',
+      releaseAsset: asset,
+    })).rejects.toThrow(/unsupported/i)
+  })
+
   it('rejects oversized downloads and archives without unpacking them', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-tunnel-install-'))
     const { binaryPath, manifestPath } = fixture(root)
