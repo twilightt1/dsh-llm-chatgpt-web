@@ -50,6 +50,8 @@ declare class NativeToolBroker {
   register(input: BrokerRoundSnapshot & {
     readonly ttlMs: number;
   }): string;
+  /** Renew the inactivity lease while the owning browser round is polling. */
+  touch(requestId: string): void;
   start(requestId: string): {
     started: true;
     duplicate: boolean;

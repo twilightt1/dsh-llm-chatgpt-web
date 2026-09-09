@@ -54,7 +54,8 @@ interface RoundChannel {
   completionRevision: number | undefined
   readonly retirement: Set<Waiter<void>>
   readonly quiescence: Set<Waiter<void>>
-  readonly expires: ReturnType<typeof setTimeout>
+  expires: ReturnType<typeof setTimeout>
+  readonly ttlMs: number
   batchReadyAt: number | undefined
 }
 
@@ -138,10 +139,22 @@ export class NativeToolBroker {
       retirement: new Set(),
       quiescence: new Set(),
       expires,
+      ttlMs: input.ttlMs,
       batchReadyAt: undefined,
     }
     this.rounds.set(requestId, channel)
     return requestId
+  }
+
+  /** Renew the inactivity lease while the owning browser round is polling. */
+  touch(requestId: string): void {
+    const channel = this.requireRound(requestId)
+    if (channel.state === 'settling') return
+    clearTimeout(channel.expires)
+    channel.expires = setTimeout(() => {
+      this.revoke(requestId, new Error('native broker round expired'))
+    }, channel.ttlMs)
+    channel.expires.unref?.()
   }
 
   start(requestId: string): { started: true; duplicate: boolean } {

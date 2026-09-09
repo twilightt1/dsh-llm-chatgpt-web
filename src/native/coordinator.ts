@@ -143,6 +143,7 @@ class NativeLease implements NativeStepLease {
 
   takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined {
     this.assertOpen()
+    this.hooks.broker.touch(this.requestId)
     return this.hooks.broker.takeToolBatch(this.requestId, now)
   }
 

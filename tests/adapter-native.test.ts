@@ -95,13 +95,18 @@ async function collect(stream: AsyncIterable<StreamChunk>): Promise<StreamChunk[
   return chunks
 }
 
-function input(sessionId: string, tools: readonly ToolSchema[] = [tool]): Parameters<ChatGptWebAdapter['stream']>[0] {
+function input(
+  sessionId: string,
+  tools: readonly ToolSchema[] = [tool],
+  purpose?: 'compaction' | 'session-title',
+): Parameters<ChatGptWebAdapter['stream']>[0] {
   return {
     provider: 'chatgpt-web',
     model: 'chatgpt-web/high',
     messages: [userMessage],
     tools: [...tools],
     sessionId: sessionId as never,
+    ...(purpose === undefined ? {} : { purpose }),
   }
 }
 
@@ -255,6 +260,29 @@ describe('native adapter lifecycle', () => {
     expect(fixtures.browser.ensureReady).not.toHaveBeenCalled()
     expect(fixtures.browser.newTurnPage).not.toHaveBeenCalled()
     await adapter.dispose()
+  })
+
+  it('does not reserve a native round for auxiliary model calls', async () => {
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const beginStep = vi.spyOn(coordinator, 'beginStep')
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'external',
+      profileDir: '/tmp/dsh-native-adapter-title-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-title-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    await collect(adapter.stream(input('title', [], 'session-title')))
+    expect(beginStep).not.toHaveBeenCalled()
+    expect(fixtures.prepare).toHaveBeenCalledWith(expect.anything(), 'temporary', options.profileDir)
+    await adapter.dispose()
+    broker.close()
   })
 
   it('reserves the browser for MCP no-tool turns without attaching a connector', async () => {

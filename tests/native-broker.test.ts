@@ -78,6 +78,22 @@ describe('NativeToolBroker', () => {
     broker.close()
   })
 
+  it('renews an active round while the browser is still polling', async () => {
+    vi.useFakeTimers()
+    const broker = new NativeToolBroker()
+    const requestId = broker.register({
+      sessionId: 's1', tools: [tool], invocationTimeoutMs: 90_000, ttlMs: 20,
+    })
+    await vi.advanceTimersByTimeAsync(15)
+    broker.touch(requestId)
+    await vi.advanceTimersByTimeAsync(10)
+    expect(broker.start(requestId)).toEqual({ started: true, duplicate: false })
+    const retired = broker.waitForRetirement(requestId)
+    await vi.advanceTimersByTimeAsync(10)
+    await expect(retired).resolves.toBeUndefined()
+    broker.close()
+  })
+
   it('revokes waiters and expires without another operation', async () => {
     vi.useFakeTimers()
     const broker = new NativeToolBroker()

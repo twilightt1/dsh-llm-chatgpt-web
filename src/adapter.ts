@@ -428,11 +428,16 @@ export class ChatGptWebAdapter extends LlmAdapter {
     }
     const hasTools = (options.tools?.length ?? 0) > 0
     const nativeMode = connection.connectorTransport === 'mcp'
-    const nativeTools = nativeMode && hasTools
-    if (nativeMode && options.sessionId === undefined) {
+    // Auxiliary model calls (session titles and compaction) share the adapter
+    // but are not DSH agent rounds. They must not enter the native coordinator:
+    // a title request queued while an agent round is parked has no durable
+    // tool_result to resume and would otherwise steal the parked reservation.
+    const nativeRound = nativeMode && options.purpose === undefined
+    const nativeTools = nativeRound && hasTools
+    if (nativeRound && options.sessionId === undefined) {
       throw new LlmError('Native MCP transport requires a sessionId for round ownership.', 'INVALID_REQUEST')
     }
-    if (nativeMode && this.config.native === undefined) {
+    if (nativeRound && this.config.native === undefined) {
       throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
     }
 
@@ -505,7 +510,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
     }
 
     try {
-      if (nativeMode) {
+      if (nativeRound) {
         const nativeRuntime = this.config.native!
         nativeRuntime.assertConnection(connection)
         await nativeRuntime.ready
@@ -540,7 +545,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         activeBrowser.markProbed()
       }
       const capabilities = this.capabilities
-      if (nativeMode) {
+      if (nativeRound) {
         const nativeRuntime = this.config.native!
         lease = await nativeRuntime.coordinator.beginStep({
           sessionId: String(options.sessionId),
