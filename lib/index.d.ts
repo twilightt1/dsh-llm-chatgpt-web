@@ -315,7 +315,7 @@ declare function defaultBrokerSocketPath(profileDir: string): string;
 /**
  * The one explicit resolve step from raw config to validated connection facts.
  */
-declare function resolveAdapterOptions(config: Config, platform?: NodeJS.Platform): ChatGptWebConnectionOptions;
+declare function resolveAdapterOptions(config: Config, platform?: NodeJS.Platform, arch?: string): ChatGptWebConnectionOptions;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
 export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeRoundCleanup, NativeRoundCoordinator, type NativeStepLease, NativeToolBroker, PROVIDER, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };
