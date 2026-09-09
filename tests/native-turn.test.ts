@@ -23,7 +23,7 @@ import {
   selectChatGptConnector,
 } from '../src/chatgpt/connector.ts'
 import { nativeToolBatchChunks } from '../src/adapter.ts'
-import { streamTextTurn } from '../src/chatgpt/turn.ts'
+import { prepareChatGptSurface, streamTextTurn } from '../src/chatgpt/turn.ts'
 import type { NativeBrowserControl } from '../src/chatgpt/connector.ts'
 import type { BrokerToolRequest } from '../src/native/types.ts'
 import { testCallId } from './call-id.ts'
@@ -89,6 +89,26 @@ describe('exact ChatGPT connector selection', () => {
 })
 
 describe('turn preflight', () => {
+  it('checks rate limits before capability probing', async () => {
+    const rateLimit = new LlmError('wait before retrying', 'RATE_LIMIT')
+    guardFixtures.throwIfRateLimitDialog.mockReset()
+    guardFixtures.throwIfRateLimitDialog.mockRejectedValueOnce(rateLimit)
+    const locator = {
+      filter: vi.fn().mockReturnThis(),
+      count: vi.fn(async () => 1),
+      nth: vi.fn().mockReturnThis(),
+      isVisible: vi.fn(async () => false),
+    }
+    const page = {
+      goto: vi.fn(async () => {}),
+      url: vi.fn(() => 'https://chatgpt.com/'),
+      locator: vi.fn(() => locator),
+    }
+
+    await expect(prepareChatGptSurface(page as never, 'connector', undefined, 100)).rejects.toBe(rateLimit)
+    expect(page.goto).toHaveBeenCalledOnce()
+  })
+
   it('checks rate limits before model-effort selection', async () => {
     const rateLimit = new LlmError('wait before retrying', 'RATE_LIMIT')
     guardFixtures.throwIfRateLimitDialog.mockReset()

@@ -505,6 +505,10 @@ export async function prepareChatGptSurface(
     await new Promise(resolveSleep => setTimeout(resolveSleep, 1_000))
   }
   if (surface === 'temporary') await dismissTemporaryChatOnboarding(page)
+  // Run this before account capability probing: a throttle page can leave the
+  // composer mounted while withholding model controls, otherwise the probe
+  // burns its full selector timeout before exposing the real RATE_LIMIT.
+  await throwIfRateLimitDialog(page)
   await throwIfSessionFailureAlert(page)
   try {
     await assertAuthenticatedChatGptPage(page)
