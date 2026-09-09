@@ -203,7 +203,7 @@ interface ChatGptWebAdapterOptions {
 }
 /**
  * ChatGPT Web adapter. One instance owns one browser; concurrent `stream()`
- * calls are serialized so at most one Temporary Chat page is ever active.
+ * calls are serialized so at most one ChatGPT page is ever active.
  */
 declare class ChatGptWebAdapter extends LlmAdapter {
   private readonly config;

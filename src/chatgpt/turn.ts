@@ -585,17 +585,24 @@ export async function* streamTextTurn(
   }
   const initialAssistantTurns = await assistantTurnIdentities()
   let conversationNotified = false
-  const notifyConversationCreated = (): void => {
+  const notifyConversationCreated = async (): Promise<void> => {
     if (options.onConversationCreated === undefined || conversationNotified) return
-    const conversationId = conversationIdFromUrl(page.url())
-    if (conversationId === undefined) {
-      throw new LlmError(
-        'ChatGPT connector turn did not expose a stable conversation ID after submission.',
-        'PROVIDER_ERROR',
-      )
+    const deadline = Date.now() + 10_000
+    for (;;) {
+      const conversationId = conversationIdFromUrl(page.url())
+      if (conversationId !== undefined) {
+        options.onConversationCreated(conversationId)
+        conversationNotified = true
+        return
+      }
+      if (Date.now() >= deadline) {
+        throw new LlmError(
+          'ChatGPT connector turn did not expose a stable conversation ID after submission.',
+          'PROVIDER_ERROR',
+        )
+      }
+      await new Promise(resolveSleep => setTimeout(resolveSleep, 50))
     }
-    options.onConversationCreated(conversationId)
-    conversationNotified = true
   }
 
   /**
@@ -711,13 +718,13 @@ export async function* streamTextTurn(
       if (options.native !== undefined) {
         const decision = arbitrateNativeObservation(options.native, undefined)
         if (decision.kind === 'tool-batch') {
-          notifyConversationCreated()
+          await notifyConversationCreated()
           return decision
         }
       }
       const identity = resolveNewAssistantTurnIdentity(initialIdentities, await assistantTurnIdentities())
       if (identity !== undefined) {
-        notifyConversationCreated()
+        await notifyConversationCreated()
         return { kind: 'assistant', identity }
       }
       if (Date.now() >= submitDeadline) {
@@ -741,7 +748,7 @@ export async function* streamTextTurn(
       if (options.native !== undefined) {
         const decision = arbitrateNativeObservation(options.native, undefined)
         if (decision.kind === 'tool-batch') {
-          notifyConversationCreated()
+          await notifyConversationCreated()
           return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
         }
       }
@@ -815,7 +822,7 @@ export async function* streamTextTurn(
       if (options.native !== undefined) {
         const decision = arbitrateNativeObservation(options.native, undefined)
         if (decision.kind === 'tool-batch') {
-          notifyConversationCreated()
+          await notifyConversationCreated()
           return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
         }
       }

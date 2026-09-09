@@ -1,7 +1,7 @@
 /**
  * Provenance for browser-automation knowledge vendored from codex-chatgpt-web.
  *
- * The DOM selectors, effort-slider mechanics, and Temporary Chat flow in
+ * The DOM selectors, effort-slider mechanics, and ChatGPT page flow in
  * `src/chatgpt/` derive from https://github.com/miuuyy/codex-chatgpt-web
  * (MIT License, (c) 2026 codex-chatgpt-web contributors). Only the
  * ChatGPT-Web driving surface was taken — no Codex task, Responses bridge,

@@ -1,5 +1,5 @@
 /**
- * Model/effort selection on a fresh Temporary Chat page.
+ * Model/effort selection on a fresh ChatGPT page.
  *
  * Mechanics derive from codex-chatgpt-web (MIT): the effort menu owns an ARIA
  * slider, moved one step per arrow key to `min + uiEffortIndex`; Luna-only

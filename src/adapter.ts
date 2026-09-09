@@ -213,7 +213,7 @@ async function describeProbePage(page: import('playwright-core').Page): Promise<
 
 /**
  * ChatGPT Web adapter. One instance owns one browser; concurrent `stream()`
- * calls are serialized so at most one Temporary Chat page is ever active.
+ * calls are serialized so at most one ChatGPT page is ever active.
  */
 export class ChatGptWebAdapter extends LlmAdapter {
   private browser: ChatGptBrowser | undefined

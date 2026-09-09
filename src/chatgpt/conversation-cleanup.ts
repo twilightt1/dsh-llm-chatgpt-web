@@ -149,9 +149,15 @@ export async function deleteOwnedConversation(
       'PROVIDER_ERROR',
     )
   }
-  const optionsButton = page.getByTestId('conversation-options-button').last()
+  // Scope the trigger to the active conversation header. A page-wide options
+  // selector can also match unrelated sidebar rows and must never be used for
+  // destructive cleanup, even though the active URL has already been checked.
+  const optionsButton = page
+    .locator('#conversation-header-actions')
+    .getByTestId('conversation-options-button')
+    .last()
   if (!await visible(optionsButton)) {
-    throw new LlmError('ChatGPT owned conversation has no conversation-options control.', 'PROVIDER_ERROR')
+    throw new LlmError('ChatGPT owned conversation has no active-header conversation-options control.', 'PROVIDER_ERROR')
   }
   await optionsButton.click({ force: true })
   const deleteButton = page.getByTestId('delete-chat-menu-item').last()

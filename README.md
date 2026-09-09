@@ -1,10 +1,13 @@
 # dsh-llm-chatgpt-web
 
 ChatGPT Web as a DeepSeek Harness (`dsh`) provider — standalone. The plugin
-owns its Chromium, signs in once, and drives ChatGPT Temporary Chat directly.
-The default text transport needs no external bridge; an opt-in Unix MCP
-transport adds a local broker and stdio MCP server; a separately provisioned
-connector/tunnel makes it reachable without changing DSH's agent loop.
+owns its Chromium, signs in once, and drives a fresh ChatGPT page per turn.
+Text turns use Temporary Chat; opt-in native MCP turns use a normal
+connector-enabled chat and delete that adapter-owned conversation after its
+round settles. The default text transport needs no external bridge; an opt-in
+Unix MCP transport adds a local broker and stdio MCP server; a separately
+provisioned connector/tunnel makes it reachable without changing DSH's agent
+loop.
 
 ```sh
 dsh plugin --profile web add github:twilightt1/dsh-llm-chatgpt-web
@@ -20,7 +23,7 @@ dsh web
 
 ```
 DSH agent-loop → GenerateOptions → ChatGptWebAdapter.stream()
-  → fresh Temporary Chat page (owned Chromium daemon)
+  → fresh ChatGPT page (Temporary Chat for text; normal chat for native MCP)
   → select effort → attach prompt → send
   → poll answer DOM (block segments → Markdown buffer)
   → text-delta StreamChunks → usage + finish
@@ -29,12 +32,17 @@ Default text tools: JSON envelope + fenced tool-call contract.
 Opt-in native tools: local broker ← stdio MCP façade ← connector/tunnel
   ← exact ChatGPT connector;
   broker batches become ordinary DSH tool-call chunks, then the next step uses
-  a fresh Temporary Chat page with canonical DSH history.
+  a fresh normal connector-enabled chat with canonical DSH history.
+  The adapter deletes each exact owned native conversation after settlement.
 ```
 
-Each turn owns a fresh Temporary Chat page and carries the full visible
-history in its prompt (stateless turns, no cross-turn browser state). Turns
-are serialized: at most one page is ever active.
+Each turn carries the full visible history in its prompt (stateless turns, no
+cross-turn browser state). Text turns use Temporary Chat. Native tool turns
+use a fresh normal chat because ChatGPT disables connectors in Temporary Chat;
+the adapter records its exact conversation ID and deletes that chat after the
+native round completes. A private restart-safe ledger retries failed cleanup
+before the next native turn. Turns are serialized: at most one page is ever
+active.
 
 The prompt transport follows codex-chatgpt-web's proven design: the DSH
 conversation is wrapped in a `<dsh_context_json>` envelope with an explicit
@@ -330,18 +338,23 @@ or retain the managed key intentionally and document the remaining risk.
   Personalized connector named exactly `DSH Native` (or `connectorName`) and
   call `dsh_round_start`, `dsh_tool_inventory`, and `dsh_tool_call`. Broker
   batches are emitted through the normal DSH loop; no nested loop or direct
-  `ctx.tools.execute()` path exists. Native results are text-only, and every
-  DSH step starts a fresh Temporary Chat page. A tunnel/connector is required
-  for live native E2E; this repository's local MCP and broker tests do not
-  claim that external setup.
+  `ctx.tools.execute()` path exists. Native results are text-only. Each native
+  step uses a fresh normal connector-enabled chat, records the exact
+  adapter-created conversation ID, and deletes/verifies it after settlement;
+  failed deletions remain in a private ledger for retry. A tunnel/connector is
+  required for live native E2E; this repository's local MCP and broker tests do
+  not claim that external setup.
 - Usage is a client-side char-based estimate; the page exposes no measured
   counts.
 - Reasoning/thinking content is not surfaced separately in V1.
-- Temporary Chat is a ChatGPT privacy mode, not anonymity: prompts are still
-  processed by OpenAI under your account's settings. This is unofficial
-  browser automation — UI changes break selectors loudly (explicit errors,
-  never silent fallback), and you remain responsible for the applicable
-  terms and workspace policies.
+- Temporary Chat is a ChatGPT privacy mode, not anonymity: text-mode prompts
+  are still processed by OpenAI under your account's settings. Native MCP
+  turns necessarily use normal ChatGPT chats so the connector can run; the
+  adapter deletes only the exact conversation IDs it created after completion
+  and cannot guarantee immediate backend deletion or prevent prior
+  Memory/Personalization effects. This is unofficial browser automation — UI
+  changes break selectors loudly (explicit errors, never silent fallback), and
+  you remain responsible for the applicable terms and workspace policies.
 
 ## Vendoring
 
@@ -369,7 +382,8 @@ Proven against a real Plus-class account (Sep 2026, after the JSON-envelope
   deltas (headings, lists, bold all survive) → usage + `stop` finish, on
   both the src (tsx) and built `lib/` paths.
 - Text-mode tool behavior is covered locally through the adapter contract and
-  DSH chunk tests. Native MCP live E2E is intentionally not claimed until a
+  DSH chunk tests. Native turns use a normal connector-enabled chat and
+  exact-ID cleanup; native MCP live E2E is intentionally not claimed until a
   verifiable ChatGPT connector/tunnel and aligned profile artifacts are
   available.
 - The storage state persists after every completed turn (ChatGPT rotates
@@ -386,6 +400,7 @@ Proven against a real Plus-class account (Sep 2026, after the JSON-envelope
 | `src/chatgpt/session.ts` | Vendored selectors / effort menu / auth / capability probe |
 | `src/chatgpt/model.ts` | Vendored backend+effort resolution |
 | `src/chatgpt/browser.ts` | Daemon attach, login, per-turn fresh page, session persist |
+| `src/chatgpt/conversation-cleanup.ts` | Exact native conversation identity, private ownership ledger, deletion verification |
 | `src/chatgpt/markdown.ts` | Vendored HTML→Markdown + append-only streaming buffer |
 | `src/chatgpt/guards.ts` | Rate-limit / session / onboarding / terminal guards |
 | `src/chatgpt/effort.ts` | Effort slider + Think toggle per turn |
