@@ -124,6 +124,7 @@ export function compilePrompt(
       'Then use dsh_tool_inventory and dsh_tool_call with that same request_id.',
       'If the task asks about a local repository, files, commands, environment, or any other tool-backed fact, you MUST use the connector before answering.',
       'Only connector-backed tool results are evidence that an action ran. Never claim a command or tool ran from memory or inference.',
+      'A tool_result in the JSON context means that call already ran; do not repeat the same call. Use its content to answer unless it is an error or a new action is required.',
       'Never reveal request_id in the answer.',
     )
     if (notice !== undefined && notice.length > 0) {
@@ -153,6 +154,13 @@ export function compilePrompt(
     envelope,
     '</dsh_context_json>',
   ].join('\n'))
+  if (native !== undefined && options.messages.some(message => message.source.kind === 'tool')) {
+    sections.push(
+      '[Native continuation] The DSH tool call(s) in the JSON context have already been executed. '
+      + 'Their tool_result content is authoritative: answer the original user from those results and do not call the connector again for those same calls. '
+      + 'Only make another connector call if the original request explicitly needs a fact that is not in the results.',
+    )
+  }
   if (native === undefined && hasTools) {
     // Tool contract rides LAST (after the envelope, before the reminder) so
     // the executable interface sits next to the task, not buried mid-prompt.

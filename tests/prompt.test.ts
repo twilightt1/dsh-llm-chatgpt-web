@@ -108,6 +108,7 @@ describe('compilePrompt (JSON envelope transport)', () => {
     expect(prompt).toContain('DSH Native')
     expect(prompt).toContain('If the task asks about a local repository, files, commands, environment, or any other tool-backed fact, you MUST use the connector before answering.')
     expect(prompt).toContain('Only connector-backed tool results are evidence that an action ran.')
+    expect(prompt).toContain('A tool_result in the JSON context means that call already ran; do not repeat the same call.')
     expect(prompt).not.toContain('```tool-call')
     expect(prompt).not.toContain('[Tool use]')
 
@@ -116,6 +117,7 @@ describe('compilePrompt (JSON envelope transport)', () => {
       tools: [{ name: 'read', description: 'read', parameters: { type: 'object' } }],
     }, COMPOSER_CHAR_BUDGET)
     expect(textPrompt).not.toContain('Only connector-backed tool results are evidence that an action ran.')
+    expect(textPrompt).not.toContain('A tool_result in the JSON context means that call already ran; do not repeat the same call.')
     const envelopeMatch = /<dsh_context_json>\n([\s\S]*?)\n<\/dsh_context_json>/.exec(prompt)
     expect(envelopeMatch).not.toBeNull()
     expect(JSON.parse(envelopeMatch![1]!).messages[0]).toEqual({
@@ -127,6 +129,24 @@ describe('compilePrompt (JSON envelope transport)', () => {
         arguments: '{"path":"x"}',
       }],
     })
+    const result: Message = {
+      id: MessageId('t1'),
+      role: 'user',
+      content: [{
+        type: 'tool-result',
+        toolCallId: testCallId('call_1'),
+        content: [{ type: 'text', text: 'done' }],
+      }],
+      source: { kind: 'tool', callId: testCallId('call_1') },
+    }
+    const continuationPrompt = compilePrompt({
+      ...baseOptions([assistant, result]),
+      tools: [{ name: 'write', description: 'write', parameters: { type: 'object' } }],
+    }, COMPOSER_CHAR_BUDGET, undefined, {
+      requestId: 'request_abcdefghijklmnopqrstuvwxyz',
+      connectorName: 'DSH Native',
+    })
+    expect(continuationPrompt).toContain('[Native continuation] The DSH tool call(s) in the JSON context have already been executed.')
   })
 
   it('fails loud on unsupported fields instead of dropping them', () => {
