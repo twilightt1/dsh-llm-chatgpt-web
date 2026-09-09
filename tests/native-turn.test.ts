@@ -6,10 +6,10 @@ import {
 import { nativeToolBatchChunks } from '../src/adapter.ts'
 import type { NativeBrowserControl } from '../src/chatgpt/connector.ts'
 import type { BrokerToolRequest } from '../src/native/types.ts'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { testCallId } from './call-id.ts'
 
 const call: BrokerToolRequest = {
-  callId: CallId('call_1'),
+  callId: testCallId('call_1'),
   name: 'write',
   arguments: { path: 'x' },
 }
@@ -41,14 +41,14 @@ describe('native tool chunks', () => {
       {
         type: 'tool-call-delta',
         index: 0,
-        id: CallId('call_1'),
+        id: testCallId('call_1'),
         name: 'write',
         argumentsDelta: '{"path":"x"}',
       },
       {
         type: 'block-end',
         index: 0,
-        block: { type: 'tool-call', id: CallId('call_1'), name: 'write', arguments: '{"path":"x"}' },
+        block: { type: 'tool-call', id: testCallId('call_1'), name: 'write', arguments: '{"path":"x"}' },
       },
       { type: 'usage', usage: expect.any(Object) },
       { type: 'finish', reason: { kind: 'tool-calls' } },
@@ -62,14 +62,14 @@ describe('native tool chunks', () => {
       {
         type: 'tool-call-delta',
         index: 1,
-        id: CallId('call_1'),
+        id: testCallId('call_1'),
         name: 'write',
         argumentsDelta: '{"path":"x"}',
       },
       {
         type: 'block-end',
         index: 1,
-        block: { type: 'tool-call', id: CallId('call_1'), name: 'write', arguments: '{"path":"x"}' },
+        block: { type: 'tool-call', id: testCallId('call_1'), name: 'write', arguments: '{"path":"x"}' },
       },
       { type: 'usage', usage: expect.any(Object) },
       { type: 'finish', reason: { kind: 'tool-calls' } },

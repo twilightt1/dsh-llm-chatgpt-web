@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { LlmError, MessageId, CallId } from '@deepseek-ai/dsh-llm'
+import { LlmError, MessageId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
 import { compilePrompt } from '../src/chatgpt/prompt.ts'
 import { COMPOSER_CHAR_BUDGET } from '../src/chatgpt/turn.ts'
+import { testCallId } from './call-id.ts'
 
 function userMessage(text: string): Message {
   return {
@@ -54,7 +55,7 @@ describe('compilePrompt (JSON envelope transport)', () => {
     const assistant: Message = {
       id: MessageId('a1'),
       role: 'assistant',
-      content: [{ type: 'tool-call', id: CallId('call_1'), name: 'read', arguments: '{"path":"x"}' }],
+      content: [{ type: 'tool-call', id: testCallId('call_1'), name: 'read', arguments: '{"path":"x"}' }],
       source: { kind: 'model', provider: 'chatgpt-web', model: 'chatgpt-web/high' },
     }
     const result: Message = {
@@ -62,10 +63,10 @@ describe('compilePrompt (JSON envelope transport)', () => {
       role: 'user',
       content: [{
         type: 'tool-result',
-        toolCallId: CallId('call_1'),
+        toolCallId: testCallId('call_1'),
         content: [{ type: 'text', text: 'file bytes' }],
       }],
-      source: { kind: 'tool', callId: CallId('call_1') },
+      source: { kind: 'tool', callId: testCallId('call_1') },
     }
     const prompt = compilePrompt(baseOptions([assistant, result]), COMPOSER_CHAR_BUDGET)
     const envelopeMatch = /<dsh_context_json>\n([\s\S]*?)\n<\/dsh_context_json>/.exec(prompt)
@@ -92,7 +93,7 @@ describe('compilePrompt (JSON envelope transport)', () => {
     const assistant: Message = {
       id: MessageId('a1'),
       role: 'assistant',
-      content: [{ type: 'tool-call', id: CallId('call_1'), name: 'write', arguments: '{"path":"x"}' }],
+      content: [{ type: 'tool-call', id: testCallId('call_1'), name: 'write', arguments: '{"path":"x"}' }],
       source: { kind: 'model', provider: 'chatgpt-web', model: 'chatgpt-web/high' },
     }
     const prompt = compilePrompt({

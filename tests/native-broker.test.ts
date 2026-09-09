@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { CallId } from '@deepseek-ai/dsh-llm'
 import type { ToolSchema } from '@deepseek-ai/dsh-llm'
 import { NativeToolBroker } from '../src/native/broker.ts'
 import type { BrokerToolResult } from '../src/native/types.ts'
+import { testCallId } from './call-id.ts'
 
 const tool: ToolSchema = {
   name: 'write',
@@ -127,9 +127,9 @@ describe('NativeToolBroker', () => {
     broker.claimActivity(requestId, activityId)
     const invocation = broker.invoke(requestId, activityId, 'write', { path: 'x' })
     const batch = broker.takeToolBatch(requestId, Date.now() + 100)
-    broker.completeTool(requestId, CallId(String(batch?.[0]?.callId)), ok)
+    broker.completeTool(requestId, testCallId(String(batch?.[0]?.callId)), ok)
     await expect(invocation).resolves.toEqual(ok)
-    expect(() => broker.completeTool(requestId, CallId(String(batch?.[0]?.callId)), ok)).not.toThrow()
+    expect(() => broker.completeTool(requestId, testCallId(String(batch?.[0]?.callId)), ok)).not.toThrow()
     broker.close()
   })
 })

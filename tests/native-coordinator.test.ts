@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { MessageId, CallId } from '@deepseek-ai/dsh-llm'
+import { MessageId } from '@deepseek-ai/dsh-llm'
 import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { NativeToolBroker } from '../src/native/broker.ts'
 import {
   NativeRoundCoordinator,
   correlateToolResults,
 } from '../src/native/coordinator.ts'
-import type { BrokerToolRequest } from '../src/native/types.ts'
+import type { BrokerCallId, BrokerToolRequest } from '../src/native/types.ts'
+import { testCallId } from './call-id.ts'
 
 const tool: ToolSchema = {
   name: 'write',
@@ -14,10 +15,10 @@ const tool: ToolSchema = {
   parameters: { type: 'object' },
 }
 function brokerCall(id: string, name: string): BrokerToolRequest {
-  return { callId: CallId(id), name, arguments: {} }
+  return { callId: testCallId(id), name, arguments: {} }
 }
 
-function toolResultMessage(callId: CallId, text: string, isError = false): Message {
+function toolResultMessage(callId: BrokerCallId, text: string, isError = false): Message {
   return {
     id: MessageId(`result-${String(callId)}-${text}`),
     role: 'user',
@@ -26,7 +27,7 @@ function toolResultMessage(callId: CallId, text: string, isError = false): Messa
   }
 }
 
-function toolImageResultMessage(callId: CallId): Message {
+function toolImageResultMessage(callId: BrokerCallId): Message {
   return {
     id: MessageId(`image-${String(callId)}`),
     role: 'user',
@@ -97,7 +98,7 @@ describe('correlateToolResults', () => {
     const first = brokerCall('call_1', 'read')
     const second = brokerCall('call_2', 'write')
     const messages = [
-      toolResultMessage(CallId('old_call'), 'old'),
+      toolResultMessage(testCallId('old_call'), 'old'),
       toolResultMessage(second.callId, 'second', true),
       toolResultMessage(first.callId, 'first'),
     ]
