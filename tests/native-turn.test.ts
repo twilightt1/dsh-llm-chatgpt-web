@@ -3,10 +3,17 @@ import { describe, expect, it, vi } from 'vitest'
 const guardFixtures = vi.hoisted(() => ({
   throwIfRateLimitDialog: vi.fn(async () => {}),
 }))
+const effortFixtures = vi.hoisted(() => ({
+  selectModelEffort: vi.fn(async () => 'High'),
+}))
 
 vi.mock('../src/chatgpt/guards.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../src/chatgpt/guards.ts')>(),
   throwIfRateLimitDialog: guardFixtures.throwIfRateLimitDialog,
+}))
+vi.mock('../src/chatgpt/effort.ts', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/chatgpt/effort.ts')>(),
+  selectModelEffort: effortFixtures.selectModelEffort,
 }))
 
 import { LlmError } from '@deepseek-ai/dsh-llm'
@@ -16,6 +23,7 @@ import {
   selectChatGptConnector,
 } from '../src/chatgpt/connector.ts'
 import { nativeToolBatchChunks } from '../src/adapter.ts'
+import { streamTextTurn } from '../src/chatgpt/turn.ts'
 import type { NativeBrowserControl } from '../src/chatgpt/connector.ts'
 import type { BrokerToolRequest } from '../src/native/types.ts'
 import { testCallId } from './call-id.ts'
@@ -77,6 +85,34 @@ describe('exact ChatGPT connector selection', () => {
 
     await expect(selectChatGptConnector(page as never, 'DSH Native')).rejects.toBe(rateLimit)
     expect(guardFixtures.throwIfRateLimitDialog).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('turn preflight', () => {
+  it('checks rate limits before model-effort selection', async () => {
+    const rateLimit = new LlmError('wait before retrying', 'RATE_LIMIT')
+    guardFixtures.throwIfRateLimitDialog.mockReset()
+    guardFixtures.throwIfRateLimitDialog.mockRejectedValueOnce(rateLimit)
+    effortFixtures.selectModelEffort.mockClear()
+    const composer = {
+      count: vi.fn(async () => 1),
+      nth: vi.fn(() => ({ isVisible: vi.fn(async () => true) })),
+    }
+    const page = {
+      url: vi.fn(() => 'https://chatgpt.com/'),
+      locator: vi.fn(() => composer),
+    }
+    const turn = streamTextTurn(page as never, {
+      model: 'chatgpt-web/high',
+      prompt: 'hello',
+      capabilities: { solAvailable: true, proAvailable: false },
+      surface: 'connector',
+      turnTimeoutMs: 30_000,
+      stallTimeoutMs: 30_000,
+    })
+
+    await expect(turn.next()).rejects.toBe(rateLimit)
+    expect(effortFixtures.selectModelEffort).not.toHaveBeenCalled()
   })
 })
 

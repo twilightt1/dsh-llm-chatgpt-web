@@ -564,8 +564,13 @@ export async function* streamTextTurn(
   if (options.native !== undefined && surface !== 'connector') {
     throw new LlmError('Native MCP requires the connector-enabled normal ChatGPT surface.', 'PROVIDER_ERROR')
   }
+  // Rate limits can be rendered before either selector hydrates. Check the
+  // settled page first so a throttle is not misreported as a model or
+  // connector UI failure (and is not retried as one).
+  await throwIfRateLimitDialog(page)
   await selectModelEffort(page, options.model, options.capabilities)
   if (options.native !== undefined) {
+    await throwIfRateLimitDialog(page)
     await selectChatGptConnector(page, options.native.connectorName, signal)
   }
 
