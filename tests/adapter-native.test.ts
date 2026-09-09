@@ -3,6 +3,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+const cleanupFixtures = vi.hoisted(() => ({
+  ledger: {
+    pending: vi.fn(() => [] as string[]),
+    remember: vi.fn(),
+    forget: vi.fn(),
+  },
+  deleteOwnedConversation: vi.fn(async () => {}),
+  retryPendingConversationDeletions: vi.fn(async () => {}),
+}))
+
 const fixtures = vi.hoisted(() => {
   const stopLocator = {
     isVisible: vi.fn(async () => false),
@@ -37,13 +47,19 @@ vi.mock('../src/chatgpt/browser.ts', () => ({
   },
 }))
 vi.mock('../src/chatgpt/prompt.ts', () => ({ compilePrompt: fixtures.compile }))
+vi.mock('../src/chatgpt/conversation-cleanup.ts', () => ({
+  conversationIdFromUrl: vi.fn(() => undefined),
+  createOwnedConversationLedger: vi.fn(() => cleanupFixtures.ledger),
+  deleteOwnedConversation: cleanupFixtures.deleteOwnedConversation,
+  retryPendingConversationDeletions: cleanupFixtures.retryPendingConversationDeletions,
+}))
 vi.mock('../src/chatgpt/session.ts', () => ({
   CHATGPT_COMPOSER_SELECTOR: '#prompt-textarea',
   detectChatGptAccountCapabilities: fixtures.detect,
 }))
 vi.mock('../src/chatgpt/turn.ts', () => ({
   COMPOSER_CHAR_BUDGET: 1000,
-  prepareTemporaryChatSurface: fixtures.prepare,
+  prepareChatGptSurface: fixtures.prepare,
   streamTextTurn: fixtures.stream,
 }))
 
@@ -92,6 +108,105 @@ function input(sessionId: string, tools: readonly ToolSchema[] = [tool]): Parame
 describe('native adapter lifecycle', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  it('uses the connector-enabled surface only for native tool turns', async () => {
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const nativeOptions = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'external',
+      profileDir: '/tmp/dsh-native-adapter-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const nativeAdapter = new ChatGptWebAdapter({
+      options: () => nativeOptions,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    await collect(nativeAdapter.stream(input('native')))
+    expect(fixtures.prepare).toHaveBeenCalledWith(expect.anything(), 'connector', nativeOptions.profileDir)
+    expect(cleanupFixtures.retryPendingConversationDeletions).toHaveBeenCalledWith(expect.anything(), cleanupFixtures.ledger)
+    const nativeStreamCall = (fixtures.stream.mock.calls as unknown as Array<[unknown, { surface?: unknown }]>)[0]
+    expect(nativeStreamCall?.[1]).toMatchObject({ surface: 'connector' })
+    await nativeAdapter.dispose()
+    broker.close()
+
+    const textOptions = resolveAdapterOptions({
+      profileDir: '/tmp/dsh-text-adapter-test',
+      brokerSocketPath: '/tmp/dsh-text-adapter-test.sock',
+    })
+    const textAdapter = new ChatGptWebAdapter({ options: () => textOptions })
+    await collect(textAdapter.stream(input('text')))
+    expect(fixtures.prepare).toHaveBeenLastCalledWith(expect.anything(), 'temporary', textOptions.profileDir)
+    const textStreamCall = (fixtures.stream.mock.calls as unknown as Array<[unknown, { surface?: unknown }]>).at(-1)
+    expect(textStreamCall?.[1]).toMatchObject({ surface: 'temporary' })
+    await textAdapter.dispose()
+  })
+
+  it('records and deletes the owned normal-chat conversation after a native turn', async () => {
+    const conversationId = '6aa191d8-a134-83ec-8f59-da2b18ec3024'
+    fixtures.stream.mockImplementationOnce((...args: unknown[]) => {
+      const turnOptions = args[1] as { onConversationCreated?: (id: string) => void }
+      turnOptions.onConversationCreated?.(conversationId)
+      return (async function* () {
+        yield { type: 'delta', delta: 'answer' }
+        return { kind: 'completed', text: 'answer', promptChars: 6 }
+      })()
+    })
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'external',
+      profileDir: '/tmp/dsh-native-adapter-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    await collect(adapter.stream(input('s1')))
+    expect(cleanupFixtures.ledger.remember).toHaveBeenCalledWith(conversationId)
+    expect(cleanupFixtures.deleteOwnedConversation).toHaveBeenCalledWith(expect.anything(), conversationId)
+    expect(cleanupFixtures.ledger.forget).toHaveBeenCalledWith(conversationId)
+    await adapter.dispose()
+    broker.close()
+  })
+
+  it('surfaces deletion failure and still closes the owned page', async () => {
+    const conversationId = '6aa191d8-a134-83ec-8f59-da2b18ec3024'
+    cleanupFixtures.deleteOwnedConversation.mockRejectedValueOnce(new Error('delete unavailable'))
+    fixtures.stream.mockImplementationOnce((...args: unknown[]) => {
+      const turnOptions = args[1] as { onConversationCreated?: (id: string) => void }
+      turnOptions.onConversationCreated?.(conversationId)
+      return (async function* () {
+        yield { type: 'delta', delta: 'answer' }
+        return { kind: 'completed', text: 'answer', promptChars: 6 }
+      })()
+    })
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'external',
+      profileDir: '/tmp/dsh-native-adapter-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    await expect(collect(adapter.stream(input('s1')))).rejects.toThrow(/delete unavailable/i)
+    expect(cleanupFixtures.ledger.forget).not.toHaveBeenCalled()
+    expect(fixtures.page.close).toHaveBeenCalled()
+    await adapter.dispose()
+    broker.close()
   })
 
   it('does not allocate a browser page when managed readiness fails', async () => {

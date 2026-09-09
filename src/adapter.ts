@@ -1,10 +1,11 @@
 /**
- * `ChatGptWebAdapter`: drive ChatGPT Temporary Chat in an owned Chromium and
- * emit harness StreamChunks. Transport-only: connection facts arrive through
- * a thunk resolved once per operation; turns are serialized on one browser.
+ * `ChatGptWebAdapter`: drive fresh ChatGPT pages in an owned Chromium and emit
+ * harness StreamChunks. Transport-only: connection facts arrive through a thunk
+ * resolved once per operation; turns are serialized on one browser.
  *
- * The default text path has no bridge daemon or nested agent loop. The opt-in
- * native MCP path still owns one fresh Temporary Chat page per DSH step and
+ * The default text path has no bridge daemon or nested agent loop and uses
+ * Temporary Chat. The opt-in native MCP path uses a fresh connector-enabled
+ * normal chat page because ChatGPT disables connectors in Temporary Chat, then
  * hands tool execution back to the ordinary DSH loop.
  * @module dsh-llm-chatgpt-web/adapter
  */
@@ -33,9 +34,16 @@ import type {
 export type { ConnectorRuntime, ConnectorTransport } from './native/types.ts'
 import { CHATGPT_COMPOSER_SELECTOR, detectChatGptAccountCapabilities } from './chatgpt/session.ts'
 import type { ChatGptWebAccountCapabilities } from './chatgpt/session.ts'
-import { COMPOSER_CHAR_BUDGET, prepareTemporaryChatSurface, streamTextTurn } from './chatgpt/turn.ts'
+import { COMPOSER_CHAR_BUDGET, prepareChatGptSurface, streamTextTurn } from './chatgpt/turn.ts'
 import type { TextTurnEvent, TextTurnResult } from './chatgpt/turn.ts'
+import type { OwnedConversationLedger } from './chatgpt/conversation-cleanup.ts'
 import { estimateUsage } from './chatgpt/usage.ts'
+import {
+  conversationIdFromUrl,
+  createOwnedConversationLedger,
+  deleteOwnedConversation,
+  retryPendingConversationDeletions,
+} from './chatgpt/conversation-cleanup.ts'
 import { buildSchemaIndex, parseToolCallsWithSchemas, renderRejectionNotice } from './chatgpt/toolcalls.ts'
 import {
   ManagedRuntimeConfigurationError,
@@ -436,6 +444,9 @@ export class ChatGptWebAdapter extends LlmAdapter {
     let nativeReleased = false
     let cleanupPromise: Promise<void> | undefined
     let cleanupRequested: 'stop' | 'close' | undefined
+    let ownedConversationLedger: OwnedConversationLedger | undefined
+    let ownedConversationId: string | undefined
+    let nativePromptSubmitted = false
     const cleanup: NativeRoundCleanup = (mode): Promise<void> => {
       if (cleanupRequested === undefined || mode === 'stop') cleanupRequested = mode
       if (cleanupPromise !== undefined) return cleanupPromise
@@ -450,17 +461,47 @@ export class ChatGptWebAdapter extends LlmAdapter {
             await stopButton.press('Enter').catch(() => {})
           }
         }
+        let cleanupError: unknown
         try {
           await iterator?.return?.()
-        } catch {
-          // The browser close below remains the final cleanup authority.
+          if (nativeTools && ownedConversationLedger !== undefined && page !== undefined) {
+            const conversationId = ownedConversationId
+              ?? (nativePromptSubmitted ? conversationIdFromUrl(page.url()) : undefined)
+            if (conversationId !== undefined) {
+              ownedConversationId = conversationId
+              if (ownedConversationLedger.pending().includes(conversationId) === false) {
+                ownedConversationLedger.remember(conversationId)
+              }
+              await deleteOwnedConversation(page, conversationId)
+              ownedConversationLedger.forget(conversationId)
+              ownedConversationId = undefined
+            } else if (nativePromptSubmitted) {
+              throw new LlmError(
+                'ChatGPT native turn exposed no stable conversation ID; refusing to leave an untracked chat.',
+                'PROVIDER_ERROR',
+              )
+            }
+          }
+        } catch (error) {
+          cleanupError = error
         }
         if (page !== undefined) {
-          await page.close().catch(() => {})
-          await browser?.persistSession().catch(() => {})
+          await page.close().catch(error => { cleanupError ??= error })
+          await browser?.persistSession().catch(error => { cleanupError ??= error })
         }
+        if (cleanupError !== undefined) throw cleanupError
       })()
       return cleanupPromise
+    }
+
+    const rememberConversation = (conversationId: string): void => {
+      ownedConversationId = conversationId
+      ownedConversationLedger?.remember(conversationId)
+    }
+    const markPromptSubmitted = (): void => {
+      nativePromptSubmitted = true
+      const conversationId = page === undefined ? undefined : conversationIdFromUrl(page.url())
+      if (conversationId !== undefined) rememberConversation(conversationId)
     }
 
     try {
@@ -478,6 +519,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         })
         lease.bindCleanup(cleanup)
       }
+      if (nativeTools) ownedConversationLedger = createOwnedConversationLedger(connection.profileDir)
       const activeBrowser = this.browserFor(connection)
       browser = activeBrowser
       const prompt = compilePrompt(
@@ -497,7 +539,11 @@ export class ChatGptWebAdapter extends LlmAdapter {
         await cleanup(cleanupRequested)
         throw new LlmError('ChatGPT Web turn stopped at a turn boundary.', 'ABORTED')
       }
-      await prepareTemporaryChatSurface(page, connection.profileDir)
+      const surface = nativeTools ? 'connector' as const : 'temporary' as const
+      if (nativeTools && ownedConversationLedger !== undefined) {
+        await retryPendingConversationDeletions(page, ownedConversationLedger)
+      }
+      await prepareChatGptSurface(page, surface, connection.profileDir)
       if (!this.capabilities || !activeBrowser.probed) {
         try {
           this.capabilities = await detectChatGptAccountCapabilities(page)
@@ -516,6 +562,11 @@ export class ChatGptWebAdapter extends LlmAdapter {
         model: options.model,
         prompt,
         capabilities,
+        surface,
+        ...(nativeTools ? {
+          onPromptSubmitted: markPromptSubmitted,
+          onConversationCreated: rememberConversation,
+        } : {}),
         turnTimeoutMs: connection.turnTimeoutMs,
         stallTimeoutMs: connection.stallTimeoutMs,
         ...(options.signal !== undefined ? { signal: options.signal } : {}),

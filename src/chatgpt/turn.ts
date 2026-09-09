@@ -1,5 +1,5 @@
 /**
- * One text turn on a fresh Temporary Chat page: prepare → attach → send →
+ * One text turn on a fresh ChatGPT page: prepare → attach → send →
  * stream answer deltas until the completion predicate holds.
  *
  * Extraction is the upstream technique (codex-chatgpt-web browser-worker
@@ -19,9 +19,10 @@ import type { Locator, Page } from 'playwright-core'
 import {
   CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
-  CHATGPT_TEMPORARY_CHAT_URL,
   assertAuthenticatedChatGptPage,
-  assertTemporaryChatPage,
+  assertChatGptSurfaceUrl,
+  chatGptSurfaceUrl,
+  type ChatGptSurface,
 } from './session.ts'
 import {
   dismissTemporaryChatOnboarding,
@@ -30,6 +31,7 @@ import {
   throwIfTerminalError,
 } from './guards.ts'
 import type { ChatGptWebAccountCapabilities } from './session.ts'
+import { conversationIdFromUrl } from './conversation-cleanup.ts'
 import { ChatGptMarkdownBuffer, chatGptHtmlToMarkdown } from './markdown.ts'
 import { selectModelEffort } from './effort.ts'
 import {
@@ -187,6 +189,12 @@ export interface TextTurnOptions {
   model: string
   prompt: string
   capabilities: ChatGptWebAccountCapabilities
+  /** Temporary Chat for text; connector-enabled normal chat for native MCP. */
+  surface?: ChatGptSurface
+  /** Called after ChatGPT accepts the prompt and creates a normal conversation. */
+  onPromptSubmitted?: () => void
+  /** Called with the exact newly-created normal conversation ID. */
+  onConversationCreated?: (conversationId: string) => void
   turnTimeoutMs: number
   stallTimeoutMs: number
   signal?: AbortSignal
@@ -469,19 +477,22 @@ async function responseSnapshot(page: Page, responseIdentity: string): Promise<R
 }
 
 /**
- * Prepare a fresh page: Temporary Chat navigation, onboarding, auth asserts.
- * Exported so the adapter can probe account capabilities on a settled
- * surface before the turn starts streaming. On auth failure, saves a
+ * Prepare a fresh page: surface navigation, onboarding when applicable, and
+ * auth asserts. Exported so the adapter can probe account capabilities on a
+ * settled surface before the turn starts streaming. On auth failure, saves a
  * screenshot + URL/title into `diagDir` (when given) for diagnosis.
  */
-export async function prepareTemporaryChatSurface(
+export async function prepareChatGptSurface(
   page: Page,
+  surface: ChatGptSurface = 'temporary',
   diagDir?: string,
   settleTimeoutMs = 45_000,
 ): Promise<void> {
-  // Always navigate: a fresh Temporary Chat load guarantees an empty
-  // conversation (temp chats never persist, so no history leaks between turns).
-  await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 })
+  // Always navigate: a fresh page prevents transcript and autocomplete state
+  // from leaking between turns. Temporary Chat additionally prevents history
+  // persistence; connector turns use normal chat because ChatGPT disables
+  // connectors in Temporary Chat.
+  await page.goto(chatGptSurfaceUrl(surface), { waitUntil: 'domcontentloaded', timeout: 60_000 })
   // Hydration grace: the SPA shell (bot-gate interstitial, React hydration)
   // can take many seconds after domcontentloaded. Wait for a visible
   // composer before any assert runs.
@@ -493,11 +504,11 @@ export async function prepareTemporaryChatSurface(
     if (Date.now() >= settleDeadline) break
     await new Promise(resolveSleep => setTimeout(resolveSleep, 1_000))
   }
-  await dismissTemporaryChatOnboarding(page)
+  if (surface === 'temporary') await dismissTemporaryChatOnboarding(page)
   await throwIfSessionFailureAlert(page)
   try {
     await assertAuthenticatedChatGptPage(page)
-    await assertTemporaryChatPage(page)
+    assertChatGptSurfaceUrl(page.url(), surface)
   } catch (error) {
     if (diagDir) {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-')
@@ -512,6 +523,15 @@ export async function prepareTemporaryChatSurface(
     }
     throw error
   }
+}
+
+/** Backward-compatible text-mode helper for callers that explicitly need Temporary Chat. */
+export async function prepareTemporaryChatSurface(
+  page: Page,
+  diagDir?: string,
+  settleTimeoutMs = 45_000,
+): Promise<void> {
+  return prepareChatGptSurface(page, 'temporary', diagDir, settleTimeoutMs)
 }
 
 /**
@@ -538,8 +558,12 @@ export async function* streamTextTurn(
   // The caller prepares this exact page once before capability probing. A
   // second navigation here races a fresh SPA hydration and discards that
   // settled document.
+  const surface = options.surface ?? 'temporary'
   await assertAuthenticatedChatGptPage(page)
-  await assertTemporaryChatPage(page)
+  assertChatGptSurfaceUrl(page.url(), surface)
+  if (options.native !== undefined && surface !== 'connector') {
+    throw new LlmError('Native MCP requires the connector-enabled normal ChatGPT surface.', 'PROVIDER_ERROR')
+  }
   await selectModelEffort(page, options.model, options.capabilities)
   if (options.native !== undefined) {
     await selectChatGptConnector(page, options.native.connectorName, signal)
@@ -560,6 +584,19 @@ export async function* streamTextTurn(
     return typed
   }
   const initialAssistantTurns = await assistantTurnIdentities()
+  let conversationNotified = false
+  const notifyConversationCreated = (): void => {
+    if (options.onConversationCreated === undefined || conversationNotified) return
+    const conversationId = conversationIdFromUrl(page.url())
+    if (conversationId === undefined) {
+      throw new LlmError(
+        'ChatGPT connector turn did not expose a stable conversation ID after submission.',
+        'PROVIDER_ERROR',
+      )
+    }
+    options.onConversationCreated(conversationId)
+    conversationNotified = true
+  }
 
   /**
    * Code-unit readback (upstream browser-worker): poll the composer text and
@@ -664,6 +701,7 @@ export async function* streamTextTurn(
       await new Promise(resolveSleep => setTimeout(resolveSleep, 200))
     }
     await sendButton.press('Enter')
+    options.onPromptSubmitted?.()
     checkDeadline()
     const submitDeadline = Date.now() + 60_000
     for (;;) {
@@ -672,10 +710,16 @@ export async function* streamTextTurn(
       await throwIfRateLimitDialog(page)
       if (options.native !== undefined) {
         const decision = arbitrateNativeObservation(options.native, undefined)
-        if (decision.kind === 'tool-batch') return decision
+        if (decision.kind === 'tool-batch') {
+          notifyConversationCreated()
+          return decision
+        }
       }
       const identity = resolveNewAssistantTurnIdentity(initialIdentities, await assistantTurnIdentities())
-      if (identity !== undefined) return { kind: 'assistant', identity }
+      if (identity !== undefined) {
+        notifyConversationCreated()
+        return { kind: 'assistant', identity }
+      }
       if (Date.now() >= submitDeadline) {
         await throwIfTerminalError(page)
         throw new LlmError('ChatGPT did not accept the submitted prompt (no turn appeared).', 'PROVIDER_ERROR')
@@ -697,6 +741,7 @@ export async function* streamTextTurn(
       if (options.native !== undefined) {
         const decision = arbitrateNativeObservation(options.native, undefined)
         if (decision.kind === 'tool-batch') {
+          notifyConversationCreated()
           return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
         }
       }
@@ -770,6 +815,7 @@ export async function* streamTextTurn(
       if (options.native !== undefined) {
         const decision = arbitrateNativeObservation(options.native, undefined)
         if (decision.kind === 'tool-batch') {
+          notifyConversationCreated()
           return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
         }
       }
