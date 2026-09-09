@@ -49,7 +49,7 @@ import { ChatGptWebAdapter } from '../src/adapter.ts'
 import { NativeRoundCoordinator } from '../src/native/coordinator.ts'
 import { NativeToolBroker } from '../src/native/broker.ts'
 import { resolveAdapterOptions } from '../src/index.ts'
-import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { Message, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 
 const tool: ToolSchema = {
   name: 'write',
@@ -128,6 +128,34 @@ describe('native adapter lifecycle', () => {
     const next = await waiting
     await next.complete(async () => {})
     await adapter.dispose()
+  })
+
+  it('preserves the empty completed-response block shape', async () => {
+    fixtures.stream.mockImplementationOnce(() => (async function* () {
+      return { kind: 'completed', text: '', promptChars: 6 }
+    })())
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      profileDir: '/tmp/dsh-native-adapter-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve() },
+    })
+
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream(input('s1'))) chunks.push(chunk)
+    expect(chunks.slice(0, 2)).toEqual([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'block-end', index: 0, block: { type: 'text', text: '' } },
+    ])
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error' } })
+    await adapter.dispose()
+    broker.close()
   })
 
   it('revokes an unfinished native lease when the consumer closes after finish', async () => {

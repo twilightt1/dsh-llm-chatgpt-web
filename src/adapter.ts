@@ -544,6 +544,12 @@ export class ChatGptWebAdapter extends LlmAdapter {
         await lease.park(cleanup)
         ownershipTransferred = true
       } else {
+        if (blockIndex < 0) {
+          // Completed with no deltas: still close the protocol shape, then fail
+          // as an empty response (mirrors the reference adapters).
+          blockIndex = 0
+          yield { type: 'block-start', index: blockIndex, blockType: 'text' }
+        }
         yield* this.emitTurnResult(options, prompt, fullText, blockIndex)
         if (lease !== undefined) {
           await lease.complete(cleanup)
