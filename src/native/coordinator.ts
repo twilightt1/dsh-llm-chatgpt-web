@@ -51,6 +51,14 @@ interface BeginWaiter {
 
 type LeaseState = 'open' | 'parked' | 'transitioning' | 'terminal'
 
+interface NativeLeaseHooks {
+  readonly broker: NativeToolBroker
+  readonly isCurrent: () => boolean
+  readonly park: () => Promise<void>
+  readonly complete: (cleanup: NativeRoundCleanup) => Promise<void>
+  readonly fail: (cleanup: NativeRoundCleanup, cause: Error) => Promise<void>
+}
+
 class RoundRecord {
   readonly lease: NativeLease
   state: LeaseState = 'open'
@@ -61,11 +69,11 @@ class RoundRecord {
   resumeWaiter: BeginWaiter | undefined
 
   constructor(
-    owner: NativeRoundCoordinator,
     readonly sessionId: string,
     readonly requestId: string,
+    hooks: NativeLeaseHooks,
   ) {
-    this.lease = new NativeLease(owner, this, requestId)
+    this.lease = new NativeLease(this, hooks)
   }
 }
 
@@ -122,11 +130,10 @@ class NativeLease implements NativeStepLease {
   readonly requestId: string
 
   constructor(
-    private readonly owner: NativeRoundCoordinator,
     private readonly record: RoundRecord,
-    requestId: string,
+    private readonly hooks: NativeLeaseHooks,
   ) {
-    this.requestId = requestId
+    this.requestId = record.requestId
   }
 
   bindCleanup(cleanup: NativeRoundCleanup): void {
@@ -136,17 +143,17 @@ class NativeLease implements NativeStepLease {
 
   takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined {
     this.assertOpen()
-    return this.owner.broker.takeToolBatch(this.requestId, now)
+    return this.hooks.broker.takeToolBatch(this.requestId, now)
   }
 
   beginCompletionFence(): number | undefined {
     this.assertOpen()
-    return this.owner.broker.beginCompletionFence(this.requestId)
+    return this.hooks.broker.beginCompletionFence(this.requestId)
   }
 
   commitCompletionFence(revision: number): boolean {
     this.assertOpen()
-    return this.owner.broker.commitCompletionFence(this.requestId, revision)
+    return this.hooks.broker.commitCompletionFence(this.requestId, revision)
   }
 
   async park(cleanup: NativeRoundCleanup): Promise<void> {
@@ -154,20 +161,20 @@ class NativeLease implements NativeStepLease {
     if (this.record.state !== 'open') throw new Error('native step lease is already parked or terminal')
     this.setCleanup(cleanup)
     this.record.state = 'parked'
-    this.owner.watchParkedRound(this.record)
+    await this.hooks.park()
   }
 
   async complete(cleanup: NativeRoundCleanup): Promise<void> {
     this.assertOpen()
     if (this.record.state !== 'open') throw new Error('native step lease cannot complete after park or termination')
     this.setCleanup(cleanup)
-    await this.owner.finish(this.record, 'close', cleanup)
+    await this.hooks.complete(cleanup)
   }
 
   async fail(cleanup: NativeRoundCleanup, cause: Error): Promise<void> {
     this.assertOpen()
     this.setCleanup(cleanup)
-    await this.owner.finish(this.record, 'stop', cleanup, cause)
+    await this.hooks.fail(cleanup, cause)
   }
 
   private setCleanup(cleanup: NativeRoundCleanup): void {
@@ -181,7 +188,7 @@ class NativeLease implements NativeStepLease {
     if (this.record.state === 'terminal' || this.record.released || this.record.retired) {
       throw new Error('native step lease is already terminal')
     }
-    if (this.owner.currentRecord() !== this.record) {
+    if (!this.hooks.isCurrent()) {
       throw new Error('native step lease is no longer owned by the coordinator')
     }
   }
@@ -194,7 +201,7 @@ export class NativeRoundCoordinator {
   private draining = false
   private disposed = false
 
-  constructor(readonly broker: NativeToolBroker) {}
+  constructor(private readonly broker: NativeToolBroker) {}
 
   beginStep(input: BeginStepInput): Promise<NativeStepLease> {
     if (this.disposed) return Promise.reject(new Error('native round coordinator is disposed'))
@@ -232,20 +239,6 @@ export class NativeRoundCoordinator {
     if (record !== undefined) {
       await this.finish(record, 'stop', record.cleanup, error).catch(() => {})
     }
-  }
-
-  currentRecord(): RoundRecord | undefined {
-    return this.reservation
-  }
-
-  /** Called by a lease only after it has transferred page ownership. */
-  watchParkedRound(record: RoundRecord): void {
-    if (this.reservation !== record || record.state !== 'parked') {
-      throw new Error('native parked round is no longer owned by the coordinator')
-    }
-    // Retirement observation starts at registration; scheduling here lets an
-    // owner waiter resume immediately if it was queued in the same tick.
-    this.scheduleDrain()
   }
 
   private scheduleDrain(): void {
@@ -287,6 +280,26 @@ export class NativeRoundCoordinator {
     return waiter
   }
 
+  private createRecord(sessionId: string, requestId: string): RoundRecord {
+    let record!: RoundRecord
+    const hooks: NativeLeaseHooks = {
+      broker: this.broker,
+      isCurrent: () => this.reservation === record,
+      park: async () => {
+        if (this.reservation !== record || record.state !== 'parked') {
+          throw new Error('native parked round is no longer owned by the coordinator')
+        }
+        // Retirement observation starts at registration; scheduling here lets
+        // an owner waiter resume immediately if it was queued in the same tick.
+        this.scheduleDrain()
+      },
+      complete: cleanup => this.finish(record, 'close', cleanup),
+      fail: (cleanup, cause) => this.finish(record, 'stop', cleanup, cause),
+    }
+    record = new RoundRecord(sessionId, requestId, hooks)
+    return record
+  }
+
   private async grant(waiter: BeginWaiter): Promise<void> {
     try {
       const requestId = this.broker.register({
@@ -295,7 +308,7 @@ export class NativeRoundCoordinator {
         ttlMs: waiter.input.ttlMs,
         invocationTimeoutMs: waiter.input.invocationTimeoutMs,
       })
-      const record = new RoundRecord(this, waiter.input.sessionId, requestId)
+      const record = this.createRecord(waiter.input.sessionId, requestId)
       this.reservation = record
       this.watchRetirement(record)
       this.resolveWaiter(waiter, record.lease)
@@ -339,13 +352,13 @@ export class NativeRoundCoordinator {
       ttlMs: input.ttlMs,
       invocationTimeoutMs: input.invocationTimeoutMs,
     })
-    const record = new RoundRecord(this, input.sessionId, requestId)
+    const record = this.createRecord(input.sessionId, requestId)
     this.reservation = record
     this.watchRetirement(record)
     return record.lease
   }
 
-  async finish(
+  private async finish(
     record: RoundRecord,
     mode: 'stop' | 'close',
     cleanup: NativeRoundCleanup | undefined,

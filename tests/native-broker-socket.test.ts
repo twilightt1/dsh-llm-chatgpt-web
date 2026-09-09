@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { chmodSync, statSync, symlinkSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { createConnection } from 'node:net'
 import { join } from 'node:path'
@@ -105,6 +106,59 @@ describe('NativeBrokerSocketServer', () => {
     await expect(new NativeBrokerSocketServer(socketPath, broker).listen()).rejects.toThrow(/not a socket/i)
     broker.close()
     await rm(root, { recursive: true, force: true })
+  })
+
+  it('does not replace or unlink a live endpoint owned by another server', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-socket-'))
+    chmodSync(root, 0o700)
+    const socketPath = join(root, 'broker.sock')
+    const firstBroker = new NativeToolBroker()
+    const secondBroker = new NativeToolBroker()
+    const firstServer = new NativeBrokerSocketServer(socketPath, firstBroker)
+    const secondServer = new NativeBrokerSocketServer(socketPath, secondBroker)
+    await firstServer.listen()
+    try {
+      await expect(secondServer.listen()).rejects.toThrow(/already owned|another process/i)
+      await secondServer.close()
+      expect(statSync(socketPath).isSocket()).toBe(true)
+    } finally {
+      await secondServer.close().catch(() => {})
+      await firstServer.close()
+      firstBroker.close()
+      secondBroker.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reclaims a same-user stale socket after a refused probe', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-socket-'))
+    chmodSync(root, 0o700)
+    const socketPath = join(root, 'broker.sock')
+    const stale = spawn(process.execPath, [
+      '-e',
+      "require('node:net').createServer().listen(process.argv[1], () => process.stdout.write('ready'))",
+      socketPath,
+    ], { stdio: ['ignore', 'pipe', 'inherit'] })
+    try {
+      await once(stale.stdout!, 'data')
+      chmodSync(socketPath, 0o600)
+      stale.kill('SIGKILL')
+      await once(stale, 'exit')
+    } finally {
+      stale.kill('SIGKILL')
+    }
+    expect(statSync(socketPath).isSocket()).toBe(true)
+
+    const broker = new NativeToolBroker()
+    const server = new NativeBrokerSocketServer(socketPath, broker)
+    try {
+      await expect(server.listen()).resolves.toBeUndefined()
+      expect(statSync(socketPath).isSocket()).toBe(true)
+    } finally {
+      await server.close().catch(() => {})
+      broker.close()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('bounds malformed JSON lines and closes an aborted invoke socket', async () => {

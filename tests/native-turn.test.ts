@@ -35,6 +35,26 @@ describe('exact ChatGPT connector selection', () => {
 })
 
 describe('native tool chunks', () => {
+  it('starts a tool-only broker batch at index zero without an empty text block', () => {
+    expect([...nativeToolBatchChunks(12, '', undefined, [call])]).toEqual([
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      {
+        type: 'tool-call-delta',
+        index: 0,
+        id: CallId('call_1'),
+        name: 'write',
+        argumentsDelta: '{"path":"x"}',
+      },
+      {
+        type: 'block-end',
+        index: 0,
+        block: { type: 'tool-call', id: CallId('call_1'), name: 'write', arguments: '{"path":"x"}' },
+      },
+      { type: 'usage', usage: expect.any(Object) },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ])
+  })
+
   it('closes mixed text before emitting stable broker call ids', () => {
     expect([...nativeToolBatchChunks(12, 'before call', 0, [call])]).toEqual([
       { type: 'block-end', index: 0, block: { type: 'text', text: 'before call' } },

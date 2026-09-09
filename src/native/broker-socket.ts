@@ -68,6 +68,7 @@ export interface BrokerRpcClient {
 export class NativeBrokerSocketServer {
   private server: Server | undefined
   private listenPromise: Promise<void> | undefined
+  private ownsEndpoint = false
   private readonly sockets = new Set<Socket>()
   private readonly maxLineBytes: number
 
@@ -109,11 +110,27 @@ export class NativeBrokerSocketServer {
         if ((error as NodeJS.ErrnoException)?.code !== 'ERR_SERVER_NOT_RUNNING') throw error
       })
     }
-    try {
-      const stat = lstatSync(this.socketPath)
-      if (stat.isSocket()) unlinkSync(this.socketPath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    if (this.ownsEndpoint) {
+      this.ownsEndpoint = false
+      try {
+        const stat = lstatSync(this.socketPath)
+        if (stat.isSocket()) {
+          // Do not unlink a replacement process's endpoint if it won the
+          // bind race after this server stopped listening.
+          let stale = true
+          try {
+            await this.probeExistingEndpoint()
+          } catch {
+            stale = false
+          }
+          if (stale) {
+            const current = lstatSync(this.socketPath)
+            if (current.isSocket()) unlinkSync(this.socketPath)
+          }
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
     }
     this.listenPromise = undefined
   }
@@ -141,7 +158,29 @@ export class NativeBrokerSocketServer {
     }
     if (existing !== undefined) {
       if (!existing.isSocket()) throw new Error('broker endpoint exists and is not a socket')
-      unlinkSync(this.socketPath)
+      if (typeof process.getuid === 'function' && existing.uid !== process.getuid()) {
+        throw new Error('broker endpoint is not owned by the current user')
+      }
+      if ((Number(existing.mode) & 0o077) !== 0) {
+        throw new Error('broker endpoint has unsafe permissions')
+      }
+      await this.probeExistingEndpoint()
+      let afterProbe: ReturnType<typeof lstatSync> | undefined
+      try {
+        afterProbe = lstatSync(this.socketPath)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      if (afterProbe !== undefined) {
+        if (!afterProbe.isSocket()) throw new Error('broker endpoint exists and is not a socket')
+        if (typeof process.getuid === 'function' && afterProbe.uid !== process.getuid()) {
+          throw new Error('broker endpoint is not owned by the current user')
+        }
+        if ((Number(afterProbe.mode) & 0o077) !== 0) {
+          throw new Error('broker endpoint has unsafe permissions')
+        }
+        unlinkSync(this.socketPath)
+      }
     }
 
     await new Promise<void>((resolve, reject) => {
@@ -153,6 +192,7 @@ export class NativeBrokerSocketServer {
       }
       const onListening = (): void => {
         server.off('error', onError)
+        this.ownsEndpoint = true
         try {
           chmodSync(this.socketPath, 0o600)
           resolve()
@@ -165,12 +205,39 @@ export class NativeBrokerSocketServer {
       server.listen(this.socketPath)
     }).catch((error: unknown) => {
       this.server = undefined
-      try {
-        if (existsSync(this.socketPath) && lstatSync(this.socketPath).isSocket()) unlinkSync(this.socketPath)
-      } catch {
-        // Preserve the listen error; cleanup is best effort.
+      if (this.ownsEndpoint) {
+        try {
+          if (existsSync(this.socketPath) && lstatSync(this.socketPath).isSocket()) unlinkSync(this.socketPath)
+        } catch {
+          // Preserve the listen error; cleanup is best effort.
+        } finally {
+          this.ownsEndpoint = false
+        }
       }
       throw error
+    })
+  }
+
+  private async probeExistingEndpoint(): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const probe = createConnection(this.socketPath)
+      let settled = false
+      const finish = (action: () => void): void => {
+        if (settled) return
+        settled = true
+        probe.destroy()
+        action()
+      }
+      probe.setTimeout(2_000, () => finish(() => reject(new Error('timed out while probing existing broker endpoint'))))
+      probe.once('connect', () => finish(() => reject(new Error('broker endpoint is already owned by another process'))))
+      probe.once('error', error => {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === 'ECONNREFUSED' || code === 'ENOENT') {
+          finish(resolve)
+        } else {
+          finish(() => reject(new Error(`could not probe existing broker endpoint: ${error.message}`)))
+        }
+      })
     })
   }
 

@@ -83,11 +83,6 @@ interface NativeStepLease {
   complete(cleanup: NativeRoundCleanup): Promise<void>;
   fail(cleanup: NativeRoundCleanup, cause: Error): Promise<void>;
 }
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  readonly resolve: (value: T | PromiseLike<T>) => void;
-  readonly reject: (reason?: unknown) => void;
-}
 interface BeginStepInput {
   readonly sessionId: string;
   readonly messages: readonly Message[];
@@ -95,24 +90,6 @@ interface BeginStepInput {
   readonly ttlMs: number;
   readonly invocationTimeoutMs: number;
   readonly signal?: AbortSignal;
-}
-interface BeginWaiter {
-  readonly input: BeginStepInput;
-  readonly deferred: Deferred<NativeStepLease>;
-  onAbort?: () => void;
-}
-type LeaseState = 'open' | 'parked' | 'transitioning' | 'terminal';
-declare class RoundRecord {
-  readonly sessionId: string;
-  readonly requestId: string;
-  readonly lease: NativeLease;
-  state: LeaseState;
-  cleanup: NativeRoundCleanup | undefined;
-  cleanupCalled: boolean;
-  released: boolean;
-  retired: boolean;
-  resumeWaiter: BeginWaiter | undefined;
-  constructor(owner: NativeRoundCoordinator, sessionId: string, requestId: string);
 }
 /**
  * Correlate the durable tool results for one broker batch.
@@ -123,24 +100,9 @@ declare class RoundRecord {
  * replayed through the text-only ChatGPT connector.
  */
 declare function correlateToolResults(messages: readonly Message[], calls: readonly BrokerToolRequest[]): readonly BrokerToolResult[];
-declare class NativeLease implements NativeStepLease {
-  private readonly owner;
-  private readonly record;
-  readonly requestId: string;
-  constructor(owner: NativeRoundCoordinator, record: RoundRecord, requestId: string);
-  bindCleanup(cleanup: NativeRoundCleanup): void;
-  takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined;
-  beginCompletionFence(): number | undefined;
-  commitCompletionFence(revision: number): boolean;
-  park(cleanup: NativeRoundCleanup): Promise<void>;
-  complete(cleanup: NativeRoundCleanup): Promise<void>;
-  fail(cleanup: NativeRoundCleanup, cause: Error): Promise<void>;
-  private setCleanup;
-  private assertOpen;
-}
 /** Serialize one browser reservation while giving its parked owner priority. */
 declare class NativeRoundCoordinator {
-  readonly broker: NativeToolBroker;
+  private readonly broker;
   private reservation;
   private readonly waiters;
   private draining;
@@ -149,16 +111,14 @@ declare class NativeRoundCoordinator {
   beginStep(input: BeginStepInput): Promise<NativeStepLease>;
   stopAtTurnBoundary(sessionId: string): Promise<void>;
   dispose(): Promise<void>;
-  currentRecord(): RoundRecord | undefined;
-  /** Called by a lease only after it has transferred page ownership. */
-  watchParkedRound(record: RoundRecord): void;
   private scheduleDrain;
   private drain;
   private takeNextWaiter;
+  private createRecord;
   private grant;
   private resume;
   private registerFresh;
-  finish(record: RoundRecord, mode: 'stop' | 'close', cleanup: NativeRoundCleanup | undefined, cause?: Error): Promise<void>;
+  private finish;
   private releaseRecord;
   private watchRetirement;
   private onRetired;

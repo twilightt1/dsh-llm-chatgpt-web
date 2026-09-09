@@ -3,7 +3,8 @@
 ChatGPT Web as a DeepSeek Harness (`dsh`) provider — standalone. The plugin
 owns its Chromium, signs in once, and drives ChatGPT Temporary Chat directly.
 The default text transport needs no external bridge; an opt-in Unix MCP
-transport adds a local broker and stdio tunnel without changing DSH's agent loop.
+transport adds a local broker and stdio MCP server; a separately provisioned
+connector/tunnel makes it reachable without changing DSH's agent loop.
 
 ```sh
 dsh plugin --profile web add github:twilightt1/dsh-llm-chatgpt-web
@@ -25,7 +26,8 @@ DSH agent-loop → GenerateOptions → ChatGptWebAdapter.stream()
   → text-delta StreamChunks → usage + finish
 
 Default text tools: JSON envelope + fenced tool-call contract.
-Opt-in native tools: local broker ← MCP stdio tunnel ← exact ChatGPT connector;
+Opt-in native tools: local broker ← stdio MCP façade ← connector/tunnel
+  ← exact ChatGPT connector;
   broker batches become ordinary DSH tool-call chunks, then the next step uses
   a fresh Temporary Chat page with canonical DSH history.
 ```
@@ -151,17 +153,22 @@ config:
   mcpInvocationTimeoutMs: 90000
 ```
 
-Configure a ChatGPT Personalized connector named exactly `DSH Native` to run
-this external MCP tunnel command:
+The package executable below is a **stdio MCP server**, not a network tunnel:
 
 ```sh
 dsh-chatgpt-web-mcp --broker-socket "$HOME/.dsh-chatgpt-web/native-broker.sock"
 ```
 
-The socket is created with a private directory and `0600` endpoint. Native
-mode exposes only the three fixed DSH broker tools, returns text results, and
-keeps execution in the normal DSH agent loop. Do not put credentials, bearer
-tokens, or profile secrets in this repository or in the command above.
+Run that command as the MCP child of a separately provisioned, verified
+ChatGPT connector/tunnel runtime. The Personalized connector must be named
+exactly `DSH Native` (or the configured `connectorName`) and must reach that
+runtime; configuring the command alone does not make a local stdio process
+reachable from ChatGPT. This package does not provision or authenticate the
+external tunnel. The socket is created with a private directory and `0600`
+endpoint. Native mode exposes only the three fixed DSH broker tools, returns
+text results, and keeps execution in the normal DSH agent loop. Do not put
+credentials, bearer tokens, or profile secrets in this repository or in the
+command above.
 
 Before a live native E2E run, align the profile without printing secrets:
 

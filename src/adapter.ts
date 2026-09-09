@@ -47,11 +47,15 @@ function mintCallId(): CallId {
 export function* nativeToolBatchChunks(
   promptChars: number,
   fullText: string,
-  textIndex: number,
+  textIndex: number | undefined,
   calls: readonly BrokerToolRequest[],
 ): Generator<StreamChunk> {
-  yield { type: 'block-end', index: textIndex, block: { type: 'text', text: fullText } }
-  let index = textIndex + 1
+  let index = 0
+  if (fullText.length > 0) {
+    if (textIndex === undefined) throw new LlmError('Native tool batch text is missing its block index.', 'TRANSPORT')
+    yield { type: 'block-end', index: textIndex, block: { type: 'text', text: fullText } }
+    index = textIndex + 1
+  }
   for (const call of calls) {
     const argumentsText = JSON.stringify(call.arguments)
     if (argumentsText === undefined) throw new LlmError(`Native broker arguments for ${String(call.callId)} are not JSON serializable.`, 'PROVIDER_ERROR')
@@ -397,11 +401,12 @@ export class ChatGptWebAdapter extends LlmAdapter {
       }
     }
     const hasTools = (options.tools?.length ?? 0) > 0
-    const nativeRequested = connection.connectorTransport === 'mcp' && hasTools
-    if (nativeRequested && options.sessionId === undefined) {
+    const nativeMode = connection.connectorTransport === 'mcp'
+    const nativeTools = nativeMode && hasTools
+    if (nativeMode && options.sessionId === undefined) {
       throw new LlmError('Native MCP transport requires a sessionId for round ownership.', 'INVALID_REQUEST')
     }
-    if (nativeRequested && this.config.native === undefined) {
+    if (nativeMode && this.config.native === undefined) {
       throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
     }
 
@@ -441,7 +446,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
     }
 
     try {
-      if (nativeRequested) {
+      if (nativeMode) {
         const nativeRuntime = this.config.native!
         await nativeRuntime.ready
         lease = await nativeRuntime.coordinator.beginStep({
@@ -458,10 +463,10 @@ export class ChatGptWebAdapter extends LlmAdapter {
         options,
         COMPOSER_CHAR_BUDGET,
         this.takeNotice(options),
-        lease === undefined ? undefined : {
+        nativeTools && lease !== undefined ? {
           requestId: lease.requestId,
           connectorName: connection.connectorName,
-        },
+        } : undefined,
       )
       await browser.ensureReady(options.signal)
       // Fresh page per turn (upstream pageForNewTurn): a reused SPA page
@@ -493,7 +498,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         turnTimeoutMs: connection.turnTimeoutMs,
         stallTimeoutMs: connection.stallTimeoutMs,
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
-        ...(lease === undefined ? {} : {
+        ...(nativeTools && lease !== undefined ? {
           native: {
             connectorName: connection.connectorName,
             requestId: lease.requestId,
@@ -501,7 +506,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
             beginCompletionFence: () => lease!.beginCompletionFence(),
             commitCompletionFence: (revision: number) => lease!.commitCompletionFence(revision),
           },
-        }),
+        } : {}),
       })
       iterator = turn[Symbol.asyncIterator]()
       if (cleanupRequested !== undefined) {
@@ -525,16 +530,17 @@ export class ChatGptWebAdapter extends LlmAdapter {
         fullText += step.value.delta
         yield { type: 'text-delta', index: blockIndex, text: step.value.delta }
       }
-      if (blockIndex < 0) {
-        // Completed with no deltas: still close the protocol shape, then fail
-        // as an empty response (mirrors the reference adapters).
-        blockIndex = 0
-        yield { type: 'block-start', index: blockIndex, blockType: 'text' }
-      }
       if (turnResult === undefined) throw new LlmError('ChatGPT Web turn ended without a result.', 'TRANSPORT')
       if (turnResult.kind === 'tool-batch') {
-        yield* nativeToolBatchChunks(prompt.length, fullText, blockIndex, turnResult.calls)
-        if (lease === undefined) throw new LlmError('Native tool batch returned without a native lease.', 'TRANSPORT')
+        if (!nativeTools || lease === undefined) {
+          throw new LlmError('Native tool batch returned outside native MCP tool mode.', 'TRANSPORT')
+        }
+        if (blockIndex < 0 && fullText.length > 0) {
+          blockIndex = 0
+          yield { type: 'block-start', index: blockIndex, blockType: 'text' }
+        }
+        yield* nativeToolBatchChunks(prompt.length, fullText, fullText.length > 0 ? blockIndex : undefined, turnResult.calls)
+
         await lease.park(cleanup)
         ownershipTransferred = true
       } else {
@@ -556,7 +562,17 @@ export class ChatGptWebAdapter extends LlmAdapter {
       }
       throw failure
     } finally {
-      if (!ownershipTransferred && !nativeReleased) await cleanup('close')
+      if (!ownershipTransferred && !nativeReleased) {
+        if (lease !== undefined) {
+          await lease.fail(
+            cleanup,
+            new LlmError('ChatGPT Web stream closed before the native round settled.', 'ABORTED'),
+          ).catch(() => {})
+          nativeReleased = true
+        } else {
+          await cleanup('close')
+        }
+      }
     }
   }
 }

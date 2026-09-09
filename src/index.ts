@@ -264,12 +264,12 @@ export function apply(ctx: Context, config: Config): void {
       void adapter.stopNativeRound(String(session.id)).catch(() => {})
     })
   }
-  // Reverse ownership order: stop browser work, then the coordinator, the
-  // socket endpoint, and finally the in-memory broker.
+  // Revoke native rounds first: their cleanup callbacks own active pages and
+  // iterators, so browser/endpoint disposal must not race them.
   ctx.effect(() => async () => {
+    if (native !== undefined) await native.coordinator.dispose().catch(() => {})
     await adapter.dispose().catch(() => {})
     if (native === undefined) return
-    await native.coordinator.dispose().catch(() => {})
     await native.socket.close().catch(() => {})
     native.broker.close()
   })
