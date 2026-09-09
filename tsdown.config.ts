@@ -5,6 +5,7 @@ export default defineConfig({
     index: 'src/index.ts',
     'chatgpt/daemon-main': 'src/chatgpt/daemon-main.ts',
     'mcp-main': 'src/native/mcp-main.ts',
+    'native-setup-main': 'src/native/setup-main.ts',
   },
   format: ['esm'],
   dts: true,

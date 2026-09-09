@@ -6,7 +6,8 @@
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
   "bin": {
-    "dsh-chatgpt-web-mcp": "./lib/mcp-main.js"
+    "dsh-chatgpt-web-mcp": "./lib/mcp-main.js",
+    "dsh-chatgpt-web-native": "./lib/native-setup-main.js"
   },
   "exports": {
     ".": {

@@ -22,6 +22,10 @@ interface BrokerRoundSnapshot {
   readonly tools: readonly ToolSchema[];
   readonly invocationTimeoutMs: number;
 }
+/** The two supported adapter-level connector transports. */
+type ConnectorTransport = 'text' | 'mcp';
+/** Owner of the native MCP tunnel process. */
+type ConnectorRuntime = 'external' | 'managed';
 /** JSON-RPC request/response values used by the private broker socket. */
 interface BrokerRpcError {
   readonly message: string;
@@ -132,8 +136,6 @@ declare class NativeRoundCoordinator {
 }
 //#endregion
 //#region src/adapter.d.ts
-/** Transport used to connect ChatGPT to DSH tools. */
-type ConnectorTransport = 'text' | 'mcp';
 /** One advisory model entry (the id is the DSH-facing slug). */
 interface ChatGptWebCatalogModel {
   /** DSH model id, e.g. `chatgpt-web/high`. */
@@ -177,10 +179,14 @@ interface ChatGptWebConnectionOptions {
   retryPolicy: ResolvedRetryPolicy;
   /** ChatGPT tool transport; text remains the default. */
   connectorTransport: ConnectorTransport;
+  /** Owner of the MCP tunnel process; external preserves current behavior. */
+  connectorRuntime: ConnectorRuntime;
   /** Exact ChatGPT connector title used by the native MCP transport. */
   connectorName: string;
   /** Private Unix socket endpoint used by the native MCP façade. */
   brokerSocketPath: string;
+  /** Absolute managed runtime configuration path. */
+  nativeRuntimeConfigPath: string;
   /** Native MCP invocation and broker TTL budget. */
   mcpInvocationTimeoutMs: number;
 }
@@ -288,6 +294,10 @@ interface Config {
   retryPolicy?: RetryPolicyConfig;
   /** Tool transport; text is the safe default, MCP is opt-in and Unix-only. */
   connectorTransport?: 'text' | 'mcp';
+  /** Tunnel owner; external preserves the existing MCP deployment contract. */
+  connectorRuntime?: ConnectorRuntime;
+  /** Managed runtime configuration path; defaults beside the profile. */
+  nativeRuntimeConfigPath?: string;
   /** Exact title of the ChatGPT connector used in native MCP mode. */
   connectorName?: string;
   /** Optional private Unix socket path for the native broker. */
@@ -304,7 +314,7 @@ declare function defaultBrokerSocketPath(profileDir: string): string;
 /**
  * The one explicit resolve step from raw config to validated connection facts.
  */
-declare function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptions;
+declare function resolveAdapterOptions(config: Config, platform?: NodeJS.Platform): ChatGptWebConnectionOptions;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorTransport, type NativeRoundCleanup, NativeRoundCoordinator, type NativeStepLease, NativeToolBroker, PROVIDER, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };
+export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeRoundCleanup, NativeRoundCoordinator, type NativeStepLease, NativeToolBroker, PROVIDER, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };

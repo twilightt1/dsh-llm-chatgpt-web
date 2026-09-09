@@ -27,16 +27,21 @@ describe('package manifest', () => {
     const deps = pkg['dependencies'] as Record<string, string>
     expect(deps['playwright-core']).toBeDefined()
     expect(deps['@modelcontextprotocol/sdk']).toBeDefined()
+    expect(deps.fflate).toBe('0.8.2')
     expect(deps.zod).toBe('4.4.3')
     const bin = pkg['bin'] as Record<string, string>
     expect(bin['dsh-chatgpt-web-mcp']).toBe('./lib/mcp-main.js')
-    expect(existsSync(join(root, 'lib/mcp-main.js'))).toBe(true)
-    expect(readFileSync(join(root, 'lib/mcp-main.js'), 'utf8')).toMatch(/^#!\/usr\/bin\/env node/)
+    expect(bin['dsh-chatgpt-web-native']).toBe('./lib/native-setup-main.js')
+    for (const file of ['lib/mcp-main.js', 'lib/native-setup-main.js']) {
+      expect(existsSync(join(root, file))).toBe(true)
+      expect(readFileSync(join(root, file), 'utf8')).toMatch(/^#!\/usr\/bin\/env node/)
+    }
   })
 
   it('does not require a version-specific runtime call-id brand export', () => {
     const built = readFileSync(join(root, 'lib/index.js'), 'utf8')
     expect(built).not.toMatch(/import \{[^}]*\b(?:CallId|ToolCallId)\b[^}]*\} from ["']@deepseek-ai\/dsh-llm["']/)
+    expect(built).not.toMatch(/sk-[A-Za-z0-9_-]{12,}/)
   })
 
   it('targets a supported node runtime', () => {
