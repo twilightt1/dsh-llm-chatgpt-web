@@ -106,8 +106,16 @@ describe('compilePrompt (JSON envelope transport)', () => {
     expect(prompt).toContain('dsh_round_start')
     expect(prompt).toContain('request_abcdefghijklmnopqrstuvwxyz')
     expect(prompt).toContain('DSH Native')
+    expect(prompt).toContain('If the task asks about a local repository, files, commands, environment, or any other tool-backed fact, you MUST use the connector before answering.')
+    expect(prompt).toContain('Only connector-backed tool results are evidence that an action ran.')
     expect(prompt).not.toContain('```tool-call')
     expect(prompt).not.toContain('[Tool use]')
+
+    const textPrompt = compilePrompt({
+      ...baseOptions([userMessage('what did I ask?')]),
+      tools: [{ name: 'read', description: 'read', parameters: { type: 'object' } }],
+    }, COMPOSER_CHAR_BUDGET)
+    expect(textPrompt).not.toContain('Only connector-backed tool results are evidence that an action ran.')
     const envelopeMatch = /<dsh_context_json>\n([\s\S]*?)\n<\/dsh_context_json>/.exec(prompt)
     expect(envelopeMatch).not.toBeNull()
     expect(JSON.parse(envelopeMatch![1]!).messages[0]).toEqual({

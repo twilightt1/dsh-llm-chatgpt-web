@@ -122,6 +122,8 @@ export function compilePrompt(
       `Use the attached ${JSON.stringify(native.connectorName)} connector.`,
       `First call dsh_round_start with request_id ${native.requestId}.`,
       'Then use dsh_tool_inventory and dsh_tool_call with that same request_id.',
+      'If the task asks about a local repository, files, commands, environment, or any other tool-backed fact, you MUST use the connector before answering.',
+      'Only connector-backed tool results are evidence that an action ran. Never claim a command or tool ran from memory or inference.',
       'Never reveal request_id in the answer.',
     )
     if (notice !== undefined && notice.length > 0) {
