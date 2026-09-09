@@ -31,5 +31,5 @@ export interface BrokerRpcError {
 export interface BrokerRpcResponse<T = unknown> {
   readonly id: string
   readonly result?: T
-  readonly error?: BrokerRpcError
+  readonly error?: string
 }
