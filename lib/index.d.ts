@@ -101,16 +101,17 @@ interface BeginWaiter {
   onAbort?: () => void;
 }
 type LeaseState = 'open' | 'parked' | 'transitioning' | 'terminal';
-interface RoundRecord {
+declare class RoundRecord {
   readonly sessionId: string;
   readonly requestId: string;
   readonly lease: NativeLease;
   state: LeaseState;
-  cleanup?: NativeRoundCleanup;
+  cleanup: NativeRoundCleanup | undefined;
   cleanupCalled: boolean;
   released: boolean;
   retired: boolean;
   resumeWaiter: BeginWaiter | undefined;
+  constructor(owner: NativeRoundCoordinator, sessionId: string, requestId: string);
 }
 /**
  * Correlate the durable tool results for one broker batch.

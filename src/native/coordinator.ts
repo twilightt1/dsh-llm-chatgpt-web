@@ -50,16 +50,22 @@ interface BeginWaiter {
 
 type LeaseState = 'open' | 'parked' | 'transitioning' | 'terminal'
 
-interface RoundRecord {
-  readonly sessionId: string
-  readonly requestId: string
+class RoundRecord {
   readonly lease: NativeLease
-  state: LeaseState
-  cleanup?: NativeRoundCleanup
-  cleanupCalled: boolean
-  released: boolean
-  retired: boolean
+  state: LeaseState = 'open'
+  cleanup: NativeRoundCleanup | undefined
+  cleanupCalled = false
+  released = false
+  retired = false
   resumeWaiter: BeginWaiter | undefined
+
+  constructor(
+    owner: NativeRoundCoordinator,
+    readonly sessionId: string,
+    readonly requestId: string,
+  ) {
+    this.lease = new NativeLease(owner, this, requestId)
+  }
 }
 
 /**
@@ -85,7 +91,14 @@ export function correlateToolResults(
     for (const block of message.content) {
       if (block.type !== 'tool-result') continue
       const key = String(block.toolCallId)
+      const sourceKey = message.source.kind === 'tool' ? String(message.source.callId) : undefined
+      if (sourceKey !== undefined && sourceKey !== key && (pending.has(sourceKey) || pending.has(key))) {
+        throw new Error(`mismatched tool result identity for ${key}`)
+      }
       if (!pending.has(key)) continue
+      if (message.source.kind !== 'tool' || sourceKey !== key || message.content.length !== 1) {
+        throw new Error(`malformed tool result identity for ${key}`)
+      }
       if (found.has(key)) throw new Error(`duplicate tool result for ${key}`)
       if (contentHasImage(block.content) || block.content.some(item => item.type !== 'text')) {
         throw new Error(`unsupported non-text content in tool result for ${key}`)
@@ -215,9 +228,12 @@ export class NativeRoundCoordinator {
 
   /** Called by a lease only after it has transferred page ownership. */
   watchParkedRound(record: RoundRecord): void {
-    // The watcher is installed at registration time as well. This method is a
-    // named hook so the transfer point stays explicit and easy to audit.
-    void record
+    if (this.reservation !== record || record.state !== 'parked') {
+      throw new Error('native parked round is no longer owned by the coordinator')
+    }
+    // Retirement observation starts at registration; scheduling here lets an
+    // owner waiter resume immediately if it was queued in the same tick.
+    this.scheduleDrain()
   }
 
   private scheduleDrain(): void {
@@ -267,20 +283,10 @@ export class NativeRoundCoordinator {
         ttlMs: waiter.input.ttlMs,
         invocationTimeoutMs: waiter.input.invocationTimeoutMs,
       })
-      const record = {} as RoundRecord
-      const lease = new NativeLease(this, record, requestId)
-      Object.assign(record, {
-        sessionId: waiter.input.sessionId,
-        requestId,
-        lease,
-        state: 'open' as const,
-        cleanupCalled: false,
-        released: false,
-        retired: false,
-      })
+      const record = new RoundRecord(this, waiter.input.sessionId, requestId)
       this.reservation = record
       this.watchRetirement(record)
-      this.resolveWaiter(waiter, lease)
+      this.resolveWaiter(waiter, record.lease)
     } catch (error) {
       this.rejectWaiter(waiter, error)
     }
@@ -321,20 +327,10 @@ export class NativeRoundCoordinator {
       ttlMs: input.ttlMs,
       invocationTimeoutMs: input.invocationTimeoutMs,
     })
-    const record = {} as RoundRecord
-    const lease = new NativeLease(this, record, requestId)
-    Object.assign(record, {
-      sessionId: input.sessionId,
-      requestId,
-      lease,
-      state: 'open' as const,
-      cleanupCalled: false,
-      released: false,
-      retired: false,
-    })
+    const record = new RoundRecord(this, input.sessionId, requestId)
     this.reservation = record
     this.watchRetirement(record)
-    return lease
+    return record.lease
   }
 
   async finish(

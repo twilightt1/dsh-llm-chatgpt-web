@@ -1,8 +1,8 @@
 # Example composition entry: mount ChatGPT Web as a DSH provider route.
 #
-# No bridge daemon, no Codex: the plugin owns its Chromium and drives
-# ChatGPT Temporary Chat directly. First run opens a headed window for
-# manual sign-in; later turns run headless on the saved session.
+# The plugin owns its Chromium and drives ChatGPT Temporary Chat directly.
+# Text transport is the default. Native MCP is an explicit Unix-only option;
+# see README for the external Personalized connector/tunnel setup.
 
 - id: llm-chatgpt-web
   name: '../../dsh-llm-chatgpt-web/src/index.ts'
@@ -10,6 +10,10 @@
     # profileDir: ~/.dsh-chatgpt-web      # login session lives here
     # chromeExecutablePath: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
     # headed: false
+    # connectorTransport: mcp
+    # connectorName: DSH Native
+    # brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
+    # mcpInvocationTimeoutMs: 90000
     # turnTimeoutMs: 300000
     # stallTimeoutMs: 120000
     models:

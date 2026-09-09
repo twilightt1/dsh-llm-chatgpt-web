@@ -13,6 +13,7 @@ const INVENTORY_QUERY_MAX = 500
 const INVENTORY_LIMIT_MAX = 50
 const TOOL_NAME_MAX = 1_000
 const INVOCATION_ACTIVITY_PREFIX = 'activity_'
+const MAX_HANDSHAKES = 256
 
 function requestIdSchema() {
   return z.string().min(1).max(REQUEST_ID_MAX)
@@ -104,6 +105,20 @@ function mcpContent(result: BrokerToolResult): { content: Array<{ type: 'text'; 
  */
 export function createDshNativeMcpServer(client: BrokerRpcClient): McpServer {
   const server = new McpServer({ name: 'dsh-native-chatgpt-web', version: '1.0.0' })
+  const startedRequests = new Map<string, true>()
+  const rememberHandshake = (requestId: string): void => {
+    startedRequests.delete(requestId)
+    if (startedRequests.size >= MAX_HANDSHAKES) {
+      const oldest = startedRequests.keys().next()
+      if (!oldest.done) startedRequests.delete(oldest.value)
+    }
+    startedRequests.set(requestId, true)
+  }
+  const requireHandshake = (requestId: string): void => {
+    if (!startedRequests.has(requestId)) {
+      throw new Error('native MCP round handshake required: call dsh_round_start first')
+    }
+  }
 
   server.registerTool(
     'dsh_round_start',
@@ -115,7 +130,9 @@ export function createDshNativeMcpServer(client: BrokerRpcClient): McpServer {
     async ({ request_id }) => {
       logRequest('dsh_round_start', request_id)
       try {
-        return textResult(await client.start(request_id))
+        const result = await client.start(request_id)
+        rememberHandshake(request_id)
+        return textResult(result)
       } catch (error) {
         return errorResult(error)
       }
@@ -137,6 +154,11 @@ export function createDshNativeMcpServer(client: BrokerRpcClient): McpServer {
     },
     async ({ request_id, query, offset, limit, include_schema }, extra) => {
       logRequest('dsh_tool_inventory', request_id, `query_chars=${query?.length ?? 0}`)
+      try {
+        requireHandshake(request_id)
+      } catch (error) {
+        return errorResult(error)
+      }
       return await withActivity(client, request_id, extra.signal, async snapshot => (
         textResult(inventory(snapshot, query, offset, limit, include_schema))
       ))
@@ -156,6 +178,11 @@ export function createDshNativeMcpServer(client: BrokerRpcClient): McpServer {
     },
     async ({ request_id, wire_name, arguments: args }, extra) => {
       logRequest('dsh_tool_call', request_id, `name_chars=${wire_name.length} args_chars=${jsonText(args ?? {}).length}`)
+      try {
+        requireHandshake(request_id)
+      } catch (error) {
+        return errorResult(error)
+      }
       return await withActivity(client, request_id, extra.signal, async (snapshot, id, signal) => {
         const tool = snapshot.tools.find(candidate => candidate.name === wire_name)
         if (tool === undefined) throw new Error(`native MCP tool is not advertised: ${wire_name}`)
@@ -171,6 +198,7 @@ export function createDshNativeMcpServer(client: BrokerRpcClient): McpServer {
           )
         } catch (error) {
           await client.release(request_id).catch(() => {})
+          startedRequests.delete(request_id)
           throw error
         }
         return mcpContent(result)

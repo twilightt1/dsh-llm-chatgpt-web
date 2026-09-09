@@ -416,15 +416,20 @@ export class ChatGptWebAdapter extends LlmAdapter {
       if (cleanupPromise !== undefined) return cleanupPromise
       cleanupPromise = (async () => {
         if (mode === 'stop' && page !== undefined && !page.isClosed()) {
-          await page.locator('[data-testid="stop-button"]').last().press('Enter').catch(() => {})
+          const stopButton = page.locator('[data-testid="stop-button"]').last()
+          if (await stopButton.isVisible().catch(() => false)) {
+            await stopButton.press('Enter').catch(() => {})
+          }
         }
         try {
           await iterator?.return?.()
         } catch {
           // The browser close below remains the final cleanup authority.
         }
-        if (page !== undefined) await page.close().catch(() => {})
-        await browser.persistSession().catch(() => {})
+        if (page !== undefined) {
+          await page.close().catch(() => {})
+          await browser.persistSession().catch(() => {})
+        }
       })()
       return cleanupPromise
     }

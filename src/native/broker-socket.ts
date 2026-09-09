@@ -89,6 +89,8 @@ export class NativeBrokerSocketServer {
   }
 
   async close(): Promise<void> {
+    const pendingListen = this.listenPromise
+    if (pendingListen !== undefined) await pendingListen.catch(() => {})
     const server = this.server
     this.server = undefined
     for (const socket of this.sockets) socket.destroy()
@@ -314,8 +316,9 @@ export function createBrokerRpcClient(socketPath: string): BrokerRpcClient {
     signal?: AbortSignal,
     timeoutMs = DEFAULT_RPC_TIMEOUT_MS,
   ): Promise<T> => {
-    const id = rpcId()
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('native broker RPC timeout must be positive')
+    if (signal?.aborted) throw abortError('native broker RPC aborted')
+    const id = rpcId()
     return await new Promise<T>((resolve, reject) => {
       const socket = createConnection(socketPath)
       let settled = false

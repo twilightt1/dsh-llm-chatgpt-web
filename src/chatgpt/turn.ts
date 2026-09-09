@@ -786,7 +786,12 @@ export async function* streamTextTurn(
         completionActionVisible: snapshot.completionActionVisible,
       })
       if (healthError !== undefined) {
-        throw new LlmError(healthError, 'PROVIDER_ERROR')
+        const nativeActivityOpen = options.native !== undefined
+          && options.native.beginCompletionFence() === undefined
+        const suspendableWhileNativeWaits = /completed without a final answer|completed-turn action/.test(healthError)
+        if (!nativeActivityOpen || !suspendableWhileNativeWaits) {
+          throw new LlmError(healthError, 'PROVIDER_ERROR')
+        }
       }
       if (completionTracker.update({
         responsePresent,

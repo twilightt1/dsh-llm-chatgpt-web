@@ -11,7 +11,7 @@
 
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { join, resolve as resolvePath } from 'node:path'
+import { isAbsolute, join, resolve as resolvePath } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
@@ -197,8 +197,15 @@ export function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptio
     throw new Error('llm-chatgpt-web: connectorTransport "mcp" is unsupported on win32; use text transport')
   }
   const mcpInvocationTimeoutMs = config.mcpInvocationTimeoutMs ?? 90_000
-  if (!Number.isSafeInteger(mcpInvocationTimeoutMs) || mcpInvocationTimeoutMs < 1) {
-    throw new Error('llm-chatgpt-web: mcpInvocationTimeoutMs must be a positive safe integer')
+  if (!Number.isSafeInteger(mcpInvocationTimeoutMs) || mcpInvocationTimeoutMs < 1 || mcpInvocationTimeoutMs > 2_147_483_647) {
+    throw new Error('llm-chatgpt-web: mcpInvocationTimeoutMs must be a positive safe integer no greater than 2147483647')
+  }
+  const brokerSocketPath = expandHome(config.brokerSocketPath ?? defaultBrokerSocketPath(profileDir))
+  if (connectorTransport === 'mcp' && !isAbsolute(brokerSocketPath)) {
+    throw new Error('llm-chatgpt-web: brokerSocketPath must be an absolute Unix socket path in MCP mode')
+  }
+  if (connectorTransport === 'mcp' && Buffer.byteLength(brokerSocketPath) > 103) {
+    throw new Error('llm-chatgpt-web: brokerSocketPath exceeds the 103-byte Unix socket path limit')
   }
   return {
     profileDir,
@@ -217,7 +224,7 @@ export function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptio
     retryPolicy: resolveRetryPolicy(config.retryPolicy, 'llm-chatgpt-web: retryPolicy'),
     connectorTransport,
     connectorName: connectorName || 'DSH Native',
-    brokerSocketPath: expandHome(config.brokerSocketPath ?? defaultBrokerSocketPath(profileDir)),
+    brokerSocketPath,
     mcpInvocationTimeoutMs,
   }
 }

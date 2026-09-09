@@ -1,6 +1,7 @@
 # dsh-llm-chatgpt-web bundle layer.
 # One plugin row: registers the `chatgpt-web` provider route. All fields are
-# optional — schema defaults apply (headed turns, auto-detected browser).
+# optional — schema defaults apply. Text tools are the default; native MCP is
+# an explicit Unix-only opt-in (see README).
 #
 # `name` must be the FULL package specifier as installed in the profile's
 # node_modules. Quote the value: a YAML scalar starting with `@` would parse
@@ -10,3 +11,7 @@
       name: dsh-llm-chatgpt-web
       config:
         headed: true
+        # connectorTransport: mcp
+        # connectorName: DSH Native
+        # brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
+        # mcpInvocationTimeoutMs: 90000

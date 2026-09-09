@@ -171,6 +171,7 @@ export async function selectChatGptConnector(
       await assertConnectorPill(page, connectorName, Date.now() + 10_000)
       return
     } catch (error) {
+      if (signal?.aborted) throw error
       lastError = error
       await clearFailedConnectorSelection(page).catch(() => {})
     }
