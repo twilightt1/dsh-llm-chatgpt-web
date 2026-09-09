@@ -1,0 +1,35 @@
+import type { ContentBlock, ToolCallId, ToolSchema } from '@deepseek-ai/dsh-llm'
+
+/** A provider-side tool request handed to the DSH agent loop. */
+export interface BrokerToolRequest {
+  readonly callId: ToolCallId
+  readonly name: string
+  readonly arguments: Record<string, unknown>
+}
+
+/** A DSH tool result held until the model-facing result is available. */
+export interface BrokerToolResult {
+  readonly content: ContentBlock[]
+  readonly isError: boolean
+}
+
+/** Immutable facts captured when one provider round is registered. */
+export interface BrokerRoundSnapshot {
+  readonly sessionId: string
+  readonly tools: readonly ToolSchema[]
+  readonly invocationTimeoutMs: number
+}
+
+/** The two supported adapter-level connector transports. */
+export type ConnectorTransport = 'text' | 'mcp'
+
+/** JSON-RPC request/response values used by the private broker socket. */
+export interface BrokerRpcError {
+  readonly message: string
+}
+
+export interface BrokerRpcResponse<T = unknown> {
+  readonly id: string
+  readonly result?: T
+  readonly error?: BrokerRpcError
+}
