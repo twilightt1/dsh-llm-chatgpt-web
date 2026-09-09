@@ -795,14 +795,6 @@ export async function* streamTextTurn(
       }
       if (page.isClosed()) throw new LlmError('ChatGPT Web page was closed mid-turn.', 'TRANSPORT')
       const running = snapshot.running
-      if (process.env['DSH_CHATGPT_DEBUG'] === '1') {
-        console.log(
-          `[dsh-llm-chatgpt-web] poll response=${boundResponseIdentity} segs=${snapshot.segments.length}`
-          + ` visible=${snapshot.visibleText.length} copy=${snapshot.completionActionVisible}`
-          + ` running=${running}`,
-        )
-      }
-
       // Segment texts are raw DOM text; commit Markdown via the buffer.
       const segments = snapshot.segments.map(segment => ({
         ...segment,
