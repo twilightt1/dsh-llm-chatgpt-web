@@ -9,6 +9,9 @@
  * @module dsh-llm-chatgpt-web
  */
 
+import { createHash } from 'node:crypto'
+import { tmpdir } from 'node:os'
+import { join, resolve as resolvePath } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
@@ -30,6 +33,7 @@ export type {
   ChatGptWebAdapterOptions,
   ChatGptWebCatalogModel,
   ChatGptWebConnectionOptions,
+  ConnectorTransport,
 } from './adapter.ts'
 export { compilePrompt } from './chatgpt/prompt.ts'
 
@@ -77,6 +81,14 @@ export interface Config {
   models?: ChatGptWebCatalogModel[]
   /** Provider-owned model-request retry policy; omission uses normal defaults. */
   retryPolicy?: RetryPolicyConfig
+  /** Tool transport; text is the safe default, MCP is opt-in and Unix-only. */
+  connectorTransport?: 'text' | 'mcp'
+  /** Exact title of the ChatGPT connector used in native MCP mode. */
+  connectorName?: string
+  /** Optional private Unix socket path for the native broker. */
+  brokerSocketPath?: string
+  /** Native MCP call/round timeout in milliseconds. */
+  mcpInvocationTimeoutMs?: number
 }
 
 const catalogModel: z<ChatGptWebCatalogModel> = z.object({
@@ -101,6 +113,10 @@ export const Config: z<Config> = z.object({
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
   models: z.array(catalogModel).default(DEFAULT_MODELS),
   retryPolicy: RetryPolicySchema,
+  connectorTransport: z.union(['text', 'mcp'] as const).default('text'),
+  connectorName: z.string(),
+  brokerSocketPath: z.string(),
+  mcpInvocationTimeoutMs: z.number().step(1).min(1).max(2_147_483_647).default(90_000),
 })
 
 function expandHome(path: string): string {
@@ -109,6 +125,22 @@ function expandHome(path: string): string {
     return home + path.slice(1)
   }
   return path
+}
+
+/**
+ * Derive a private, profile-specific Unix endpoint without exposing the
+ * profile path or any credential-bearing configuration in logs.
+ */
+export function defaultBrokerSocketPath(profileDir: string): string {
+  const profileFingerprint = createHash('sha256')
+    .update(resolvePath(profileDir))
+    .digest('hex')
+    .slice(0, 24)
+  const userFingerprint = createHash('sha256')
+    .update(String(typeof process.getuid === 'function' ? process.getuid() : process.env['USER'] ?? 'user'))
+    .digest('hex')
+    .slice(0, 16)
+  return join(tmpdir(), `dsh-chatgpt-web-${userFingerprint}`, `native-broker-${profileFingerprint}.sock`)
 }
 
 /** Resolve, validate, and detach the advisory model catalog. */
@@ -136,8 +168,27 @@ function resolveModels(models: readonly ChatGptWebCatalogModel[] | undefined): C
  * The one explicit resolve step from raw config to validated connection facts.
  */
 export function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptions {
+  const profileDir = expandHome(config.profileDir ?? defaultProfileDir())
+  const connectorTransport = config.connectorTransport ?? 'text'
+  if (connectorTransport !== 'text' && connectorTransport !== 'mcp') {
+    throw new Error(`llm-chatgpt-web: connectorTransport must be "text" or "mcp"`)
+  }
+  const suppliedConnectorName = config.connectorName
+  const connectorName = suppliedConnectorName === undefined
+    ? 'DSH Native'
+    : suppliedConnectorName.trim()
+  if (connectorTransport === 'mcp' && connectorName.length === 0) {
+    throw new Error('llm-chatgpt-web: connectorName must be non-empty in MCP mode')
+  }
+  if (connectorTransport === 'mcp' && process.platform === 'win32') {
+    throw new Error('llm-chatgpt-web: connectorTransport "mcp" is unsupported on win32; use text transport')
+  }
+  const mcpInvocationTimeoutMs = config.mcpInvocationTimeoutMs ?? 90_000
+  if (!Number.isSafeInteger(mcpInvocationTimeoutMs) || mcpInvocationTimeoutMs < 1) {
+    throw new Error('llm-chatgpt-web: mcpInvocationTimeoutMs must be a positive safe integer')
+  }
   return {
-    profileDir: expandHome(config.profileDir ?? defaultProfileDir()),
+    profileDir,
     chromeExecutablePath: config.chromeExecutablePath
       ? expandHome(config.chromeExecutablePath)
       : resolveChromeExecutable(),
@@ -151,6 +202,10 @@ export function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptio
     defaultContextWindow: config.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
     models: resolveModels(config.models),
     retryPolicy: resolveRetryPolicy(config.retryPolicy, 'llm-chatgpt-web: retryPolicy'),
+    connectorTransport,
+    connectorName: connectorName || 'DSH Native',
+    brokerSocketPath: expandHome(config.brokerSocketPath ?? defaultBrokerSocketPath(profileDir)),
+    mcpInvocationTimeoutMs,
   }
 }
 

@@ -73,13 +73,50 @@ describe('compilePrompt (JSON envelope transport)', () => {
     const envelope = JSON.parse(envelopeMatch![1]!)
     expect(envelope.messages[0]).toEqual({
       role: 'assistant',
-      content: [{ type: 'tool_call', name: 'read', arguments: '{"path":"x"}' }],
+      content: [{
+        type: 'tool_call',
+        tool_call_id: 'call_1',
+        name: 'read',
+        arguments: '{"path":"x"}',
+      }],
     })
     expect(envelope.messages[1]).toEqual({
       role: 'tool_result',
       tool_call_id: 'call_1',
       is_error: false,
       content: 'file bytes',
+    })
+  })
+
+  it('uses the native connector contract without the fenced text protocol', () => {
+    const assistant: Message = {
+      id: MessageId('a1'),
+      role: 'assistant',
+      content: [{ type: 'tool-call', id: ToolCallId('call_1'), name: 'write', arguments: '{"path":"x"}' }],
+      source: { kind: 'model', provider: 'chatgpt-web', model: 'chatgpt-web/high' },
+    }
+    const prompt = compilePrompt({
+      ...baseOptions([assistant]),
+      tools: [{ name: 'write', description: 'write', parameters: { type: 'object' } }],
+    }, COMPOSER_CHAR_BUDGET, undefined, {
+      requestId: 'request_abcdefghijklmnopqrstuvwxyz',
+      connectorName: 'DSH Native',
+    })
+    expect(prompt).toContain('dsh_round_start')
+    expect(prompt).toContain('request_abcdefghijklmnopqrstuvwxyz')
+    expect(prompt).toContain('DSH Native')
+    expect(prompt).not.toContain('```tool-call')
+    expect(prompt).not.toContain('[Tool use]')
+    const envelopeMatch = /<dsh_context_json>\n([\s\S]*?)\n<\/dsh_context_json>/.exec(prompt)
+    expect(envelopeMatch).not.toBeNull()
+    expect(JSON.parse(envelopeMatch![1]!).messages[0]).toEqual({
+      role: 'assistant',
+      content: [{
+        type: 'tool_call',
+        tool_call_id: 'call_1',
+        name: 'write',
+        arguments: '{"path":"x"}',
+      }],
     })
   })
 

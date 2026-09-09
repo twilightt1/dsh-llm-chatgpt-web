@@ -37,12 +37,25 @@ describe('plugin', () => {
 
   it('resolves defaults and validates the catalog', () => {
     const options = resolveAdapterOptions({})
+    expect(options.connectorTransport).toBe('text')
     expect(options.profileDir.length).toBeGreaterThan(0)
     expect(options.models.map(m => m.id)).toContain('chatgpt-web/high')
     expect(() => resolveAdapterOptions({ models: [{ id: 'openai/gpt-4' }] })).toThrowError(/chatgpt-web\//)
     expect(() => resolveAdapterOptions({
       models: [{ id: 'chatgpt-web/high' }, { id: 'chatgpt-web/high' }],
     })).toThrowError(/duplicate/i)
+  })
+
+  it('resolves native connector defaults and rejects an empty connector name', () => {
+    const options = resolveAdapterOptions({ connectorTransport: 'mcp' })
+    expect(options.connectorTransport).toBe('mcp')
+    expect(options.connectorName).toBe('DSH Native')
+    expect(options.mcpInvocationTimeoutMs).toBe(90_000)
+    expect(options.brokerSocketPath).toContain('native-broker-')
+    expect(() => resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorName: '   ',
+    })).toThrowError(/connectorName/i)
   })
 
   it('exposes a schemastery Config schema', () => {

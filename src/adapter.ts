@@ -27,6 +27,9 @@ import { COMPOSER_CHAR_BUDGET, prepareTemporaryChatSurface, streamTextTurn } fro
 import { estimateUsage } from './chatgpt/usage.ts'
 import { buildSchemaIndex, parseToolCallsWithSchemas, renderRejectionNotice } from './chatgpt/toolcalls.ts'
 
+/** Transport used to connect ChatGPT to DSH tools. */
+export type ConnectorTransport = 'text' | 'mcp'
+
 /** Monotonic suffix for provider-issued call ids (unique per process). */
 let toolCallSequence = 0
 
@@ -91,6 +94,14 @@ export interface ChatGptWebConnectionOptions {
   models: readonly ChatGptWebCatalogModel[]
   /** Provider-owned model-request retry policy, already resolved. */
   retryPolicy: ResolvedRetryPolicy
+  /** ChatGPT tool transport; text remains the default. */
+  connectorTransport: ConnectorTransport
+  /** Exact ChatGPT connector title used by the native MCP transport. */
+  connectorName: string
+  /** Private Unix socket endpoint used by the native MCP façade. */
+  brokerSocketPath: string
+  /** Native MCP invocation and broker TTL budget. */
+  mcpInvocationTimeoutMs: number
 }
 
 /** Constructor options: the operation-local resolution hooks the plugin owns. */

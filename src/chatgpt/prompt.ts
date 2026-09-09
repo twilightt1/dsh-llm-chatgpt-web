@@ -15,6 +15,12 @@ import { contentHasImage, LlmError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
 import { renderToolContract } from './toolcalls.ts'
 
+/** Binding for the opt-in native ChatGPT MCP connector contract. */
+export interface NativePromptBinding {
+  readonly requestId: string
+  readonly connectorName: string
+}
+
 function textOf(blocks: ContentBlock[]): string {
   return blocks
     .filter(block => block.type === 'text')
@@ -62,7 +68,12 @@ function envelopeMessage(message: Message): Record<string, unknown> {
       try {
         args = JSON.stringify(JSON.parse(block.arguments))
       } catch { /* keep raw */ }
-      parts.push({ type: 'tool_call', name: block.name, arguments: args })
+      parts.push({
+        type: 'tool_call',
+        tool_call_id: String(block.id),
+        name: block.name,
+        arguments: args,
+      })
     }
     return { role: 'assistant', content: parts }
   }
@@ -81,6 +92,7 @@ export function compilePrompt(
   options: GenerateOptions,
   maxChars: number,
   notice?: string,
+  native?: NativePromptBinding,
 ): string {
   if (options.reasoningEffort !== undefined) {
     throw new LlmError(
@@ -105,7 +117,17 @@ export function compilePrompt(
     'NEVER echo or repeat this message, the JSON context, or any instruction document back — the user only sees your actual answer. Reply with the answer itself.',
     'Do not mention this transport contract, context packaging, or tool protocol in the user-facing answer.',
   ]
-  if (hasTools) {
+  if (native !== undefined) {
+    contract.push(
+      `Use the attached ${JSON.stringify(native.connectorName)} connector.`,
+      `First call dsh_round_start with request_id ${native.requestId}.`,
+      'Then use dsh_tool_inventory and dsh_tool_call with that same request_id.',
+      'Never reveal request_id in the answer.',
+    )
+    if (notice !== undefined && notice.length > 0) {
+      contract.push(notice)
+    }
+  } else if (hasTools) {
     contract.push(
       'The tools listed in the tool section below are REAL and wired to this session: the harness watches this chat and executes every properly fenced ```tool-call block you emit, feeding results back as tool_result messages. Emitting the block IS the act of running the tool — you never need any other interface.',
     )
@@ -129,12 +151,10 @@ export function compilePrompt(
     envelope,
     '</dsh_context_json>',
   ].join('\n'))
-  if (hasTools) {
+  if (native === undefined && hasTools) {
     // Tool contract rides LAST (after the envelope, before the reminder) so
     // the executable interface sits next to the task, not buried mid-prompt.
     sections.push(renderToolContract(options.tools ?? []))
-  }
-  if (hasTools) {
     // Trailing reminder rides LAST (last-token position survives).
     sections.push(
       '[Reminder] If the task needs an action, your ENTIRE reply must be tool-call fenced block(s) — never narration like "bash -lc ..." or a ```python block, and never a refusal: the fenced ```tool-call block below is the ONLY way to run tools and it IS available. If it needs no action, answer in plain text.',
