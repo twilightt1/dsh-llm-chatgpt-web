@@ -1,6 +1,169 @@
 import z from "@deepseek-ai/schemastery";
-import { GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk } from "@deepseek-ai/dsh-llm";
+import { CallId, ContentBlock, GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, Message, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk, ToolSchema } from "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
+//#region src/native/types.d.ts
+/** A provider-side tool request handed to the DSH agent loop. */
+interface BrokerToolRequest {
+  readonly callId: CallId;
+  readonly name: string;
+  readonly arguments: Record<string, unknown>;
+}
+/** A DSH tool result held until the model-facing result is available. */
+interface BrokerToolResult {
+  readonly content: ContentBlock[];
+  readonly isError: boolean;
+}
+/** Immutable facts captured when one provider round is registered. */
+interface BrokerRoundSnapshot {
+  readonly sessionId: string;
+  readonly tools: readonly ToolSchema[];
+  readonly invocationTimeoutMs: number;
+}
+/** JSON-RPC request/response values used by the private broker socket. */
+interface BrokerRpcError {
+  readonly message: string;
+}
+interface BrokerRpcResponse<T = unknown> {
+  readonly id: string;
+  readonly result?: T;
+  readonly error?: string;
+}
+//#endregion
+//#region src/native/broker.d.ts
+/**
+ * In-memory owner-side broker for one native ChatGPT provider round.
+ *
+ * The MCP subprocess sees only the socket façade. The adapter/coordinator keep
+ * this object in-process so tool calls retain ordinary DSH loop ownership.
+ */
+declare class NativeToolBroker {
+  private readonly rounds;
+  private readonly retired;
+  private closed;
+  register(input: BrokerRoundSnapshot & {
+    readonly ttlMs: number;
+  }): string;
+  start(requestId: string): {
+    started: true;
+    duplicate: boolean;
+  };
+  claimActivity(requestId: string, activityId: string): BrokerRoundSnapshot;
+  completeActivity(requestId: string, activityId: string): void;
+  invoke(requestId: string, activityId: string, name: string, args: Record<string, unknown>): Promise<BrokerToolResult>;
+  takeToolBatch(requestId: string, now?: number): readonly BrokerToolRequest[] | undefined;
+  beginSettlement(requestId: string): void;
+  completeTool(requestId: string, callId: CallId, result: BrokerToolResult): void;
+  waitForQuiescence(requestId: string, signal?: AbortSignal): Promise<void>;
+  beginCompletionFence(requestId: string): number | undefined;
+  commitCompletionFence(requestId: string, revision: number): boolean;
+  revoke(requestId: string, reason?: Error): void;
+  waitForRetirement(requestId: string, signal?: AbortSignal): Promise<void>;
+  close(): void;
+  private requireRound;
+  private requestsFor;
+  private wait;
+  private resolveWaiter;
+  private rejectWaiter;
+  private settleQuiescence;
+  private assertActivityId;
+  private rememberRetired;
+}
+//#endregion
+//#region src/native/coordinator.d.ts
+/** Cleanup owned by one browser turn; stop preserves the page until close follows. */
+type NativeRoundCleanup = (mode: 'stop' | 'close') => Promise<void>;
+/** The adapter-facing lease for one registered provider round. */
+interface NativeStepLease {
+  readonly requestId: string;
+  takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined;
+  beginCompletionFence(): number | undefined;
+  commitCompletionFence(revision: number): boolean;
+  park(cleanup: NativeRoundCleanup): Promise<void>;
+  complete(cleanup: NativeRoundCleanup): Promise<void>;
+  fail(cleanup: NativeRoundCleanup, cause: Error): Promise<void>;
+}
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T | PromiseLike<T>) => void;
+  readonly reject: (reason?: unknown) => void;
+}
+interface BeginStepInput {
+  readonly sessionId: string;
+  readonly messages: readonly Message[];
+  readonly tools: readonly ToolSchema[];
+  readonly ttlMs: number;
+  readonly invocationTimeoutMs: number;
+  readonly signal?: AbortSignal;
+}
+interface BeginWaiter {
+  readonly input: BeginStepInput;
+  readonly deferred: Deferred<NativeStepLease>;
+  onAbort?: () => void;
+}
+type LeaseState = 'open' | 'parked' | 'transitioning' | 'terminal';
+interface RoundRecord {
+  readonly sessionId: string;
+  readonly requestId: string;
+  readonly lease: NativeLease;
+  state: LeaseState;
+  cleanup?: NativeRoundCleanup;
+  cleanupCalled: boolean;
+  released: boolean;
+  retired: boolean;
+  resumeWaiter: BeginWaiter | undefined;
+}
+/**
+ * Correlate the durable tool results for one broker batch.
+ *
+ * Results not belonging to the pending batch are intentionally ignored: the
+ * session can contain older completed calls. Every pending call must occur
+ * exactly once, and image-bearing results are rejected before they can be
+ * replayed through the text-only ChatGPT connector.
+ */
+declare function correlateToolResults(messages: readonly Message[], calls: readonly BrokerToolRequest[]): readonly BrokerToolResult[];
+declare class NativeLease implements NativeStepLease {
+  private readonly owner;
+  private readonly record;
+  readonly requestId: string;
+  constructor(owner: NativeRoundCoordinator, record: RoundRecord, requestId: string);
+  takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined;
+  beginCompletionFence(): number | undefined;
+  commitCompletionFence(revision: number): boolean;
+  park(cleanup: NativeRoundCleanup): Promise<void>;
+  complete(cleanup: NativeRoundCleanup): Promise<void>;
+  fail(cleanup: NativeRoundCleanup, cause: Error): Promise<void>;
+  private assertOpen;
+}
+/** Serialize one browser reservation while giving its parked owner priority. */
+declare class NativeRoundCoordinator {
+  readonly broker: NativeToolBroker;
+  private reservation;
+  private readonly waiters;
+  private draining;
+  private disposed;
+  constructor(broker: NativeToolBroker);
+  beginStep(input: BeginStepInput): Promise<NativeStepLease>;
+  stopAtTurnBoundary(sessionId: string): Promise<void>;
+  dispose(): Promise<void>;
+  currentRecord(): RoundRecord | undefined;
+  /** Called by a lease only after it has transferred page ownership. */
+  watchParkedRound(record: RoundRecord): void;
+  private scheduleDrain;
+  private drain;
+  private takeNextWaiter;
+  private grant;
+  private resume;
+  private registerFresh;
+  finish(record: RoundRecord, mode: 'stop' | 'close', cleanup: NativeRoundCleanup | undefined, cause?: Error): Promise<void>;
+  private releaseRecord;
+  private watchRetirement;
+  private onRetired;
+  private rejectQueuedSession;
+  private resolveWaiter;
+  private rejectWaiter;
+  private removeAbortListener;
+}
+//#endregion
 //#region src/adapter.d.ts
 /** Transport used to connect ChatGPT to DSH tools. */
 type ConnectorTransport = 'text' | 'mcp';
@@ -58,6 +221,11 @@ interface ChatGptWebConnectionOptions {
 interface ChatGptWebAdapterOptions {
   /** Current validated connection facts; called once per operation. */
   options: () => ChatGptWebConnectionOptions;
+  /** Plugin-owned native broker lifecycle; omitted for the default text path. */
+  native?: {
+    readonly coordinator: NativeRoundCoordinator;
+    readonly ready: Promise<void>;
+  };
 }
 /**
  * ChatGPT Web adapter. One instance owns one browser; concurrent `stream()`
@@ -77,6 +245,8 @@ declare class ChatGptWebAdapter extends LlmAdapter {
   listModels(provider: string): Promise<readonly LlmModelInfo[]>;
   resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+  /** Stop a parked native round at a durable agent turn boundary. */
+  stopNativeRound(sessionId: string): Promise<void>;
   /** Release the owned browser. Hosts should call this on plugin unload. */
   dispose(): Promise<void>;
   /** Serialize turns: one page at a time, in call order. */
@@ -170,4 +340,4 @@ declare function defaultBrokerSocketPath(profileDir: string): string;
 declare function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptions;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorTransport, PROVIDER, apply, compilePrompt, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };
+export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorTransport, type NativeRoundCleanup, NativeRoundCoordinator, type NativeStepLease, NativeToolBroker, PROVIDER, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { CallId } from '@deepseek-ai/dsh-llm'
 import type {
   BrokerRoundSnapshot,
   BrokerToolRequest,
@@ -43,10 +43,10 @@ interface Waiter<T> {
 interface RoundChannel {
   state: RoundState
   readonly snapshot: BrokerRoundSnapshot
-  readonly queued: ToolCallId[]
-  readonly delivered: ToolCallId[]
-  readonly invocations: Map<ToolCallId, PendingInvocation>
-  readonly completed: Map<ToolCallId, string>
+  readonly queued: CallId[]
+  readonly delivered: CallId[]
+  readonly invocations: Map<CallId, PendingInvocation>
+  readonly completed: Map<CallId, string>
   readonly activities: Set<string>
   readonly completedActivities: Set<string>
   activityRevision: number
@@ -196,7 +196,7 @@ export class NativeToolBroker {
     if (args === null || typeof args !== 'object' || Array.isArray(args)) {
       return Promise.reject(new Error('native broker tool arguments must be an object'))
     }
-    const callId = ToolCallId(opaqueId('call'))
+    const callId = CallId(opaqueId('call'))
     const request: BrokerToolRequest = deepFreeze({
       callId,
       name,
@@ -235,7 +235,7 @@ export class NativeToolBroker {
     this.settleQuiescence(channel)
   }
 
-  completeTool(requestId: string, callId: ToolCallId, result: BrokerToolResult): void {
+  completeTool(requestId: string, callId: CallId, result: BrokerToolResult): void {
     const channel = this.requireRound(requestId)
     const canonical = canonicalResult(result)
     const previous = channel.completed.get(callId)
@@ -324,7 +324,7 @@ export class NativeToolBroker {
     throw new Error(`native broker request_id ${fingerprint(requestId)}${suffix}`)
   }
 
-  private requestsFor(channel: RoundChannel, ids: readonly ToolCallId[]): readonly BrokerToolRequest[] {
+  private requestsFor(channel: RoundChannel, ids: readonly CallId[]): readonly BrokerToolRequest[] {
     return ids
       .map(id => channel.invocations.get(id)?.request)
       .filter((request): request is BrokerToolRequest => request !== undefined)

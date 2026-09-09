@@ -1,19 +1,28 @@
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { apply, Config, PROVIDER, resolveAdapterOptions } from '../src/index.ts'
 
 function stubCtx() {
   const routes: Array<{ providers: string[]; adapter: unknown }> = []
-  const effects: Array<() => void> = []
+  const effects: Array<() => void | Promise<void>> = []
+  const events: string[] = []
   return {
     routes,
     effects,
+    events,
     llm: {
       registerAdapter(providers: string[], adapter: unknown) {
         routes.push({ providers, adapter })
         return { replace: (_next: string[]) => {} }
       },
     },
-    effect(setup: () => () => void) {
+    on(name: string, _listener: unknown) {
+      events.push(name)
+      return () => {}
+    },
+    effect(setup: () => () => void | Promise<void>) {
       effects.push(setup())
       return () => {}
     },
@@ -51,11 +60,28 @@ describe('plugin', () => {
     expect(options.connectorTransport).toBe('mcp')
     expect(options.connectorName).toBe('DSH Native')
     expect(options.mcpInvocationTimeoutMs).toBe(90_000)
-    expect(options.brokerSocketPath).toContain('native-broker-')
+    expect(options.brokerSocketPath).toMatch(/dsh-[^/]+\/b-[^/]+\.sock$/)
     expect(() => resolveAdapterOptions({
       connectorTransport: 'mcp',
       connectorName: '   ',
     })).toThrowError(/connectorName/i)
+  })
+
+  it('installs native lifecycle listeners and tears down the broker stack', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-plugin-native-'))
+    const ctx = stubCtx()
+    apply(ctx as never, {
+      connectorTransport: 'mcp',
+      brokerSocketPath: join(root, 'broker.sock'),
+    })
+    expect(ctx.events).toEqual(['agent/turn-stopping', 'session/event'])
+    await ctx.effects[0]?.()
+  })
+
+  it('keeps text mode free of native lifecycle listeners', () => {
+    const ctx = stubCtx()
+    apply(ctx as never, {})
+    expect(ctx.events).toEqual([])
   })
 
   it('exposes a schemastery Config schema', () => {

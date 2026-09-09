@@ -29,6 +29,10 @@ export const CHATGPT_COMPOSER_SELECTOR = [
   '[contenteditable="true"].ProseMirror',
   '[role="textbox"][aria-label="Chat with ChatGPT"]',
 ].join(', ')
+/** Visible mention rows used by the Personalized connector picker. */
+export const CHATGPT_CONNECTOR_MENU_ITEM_SELECTOR = '.__menu-item[tabindex="0"]'
+/** Connector pills are verified by exact keyword after mention selection. */
+export const CHATGPT_CONNECTOR_PILL_SELECTOR = '[data-id^="plugin:"][data-keyword]'
 export const CHATGPT_EFFORT_CONTROL_SELECTOR = [
   'button[aria-haspopup="menu"][data-tone="neutral"]',
   'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]',

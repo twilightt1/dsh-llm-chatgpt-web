@@ -1,8 +1,8 @@
-import type { ContentBlock, ToolCallId, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, CallId, ToolSchema } from '@deepseek-ai/dsh-llm'
 
 /** A provider-side tool request handed to the DSH agent loop. */
 export interface BrokerToolRequest {
-  readonly callId: ToolCallId
+  readonly callId: CallId
   readonly name: string
   readonly arguments: Record<string, unknown>
 }

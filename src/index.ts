@@ -13,6 +13,8 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join, resolve as resolvePath } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
 import type { ModelModality, RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
@@ -27,6 +29,9 @@ import {
 } from './adapter.ts'
 import type { ChatGptWebCatalogModel, ChatGptWebConnectionOptions } from './adapter.ts'
 import { defaultProfileDir, resolveChromeExecutable } from './chatgpt/launch.ts'
+import { NativeToolBroker } from './native/broker.ts'
+import { NativeBrokerSocketServer } from './native/broker-socket.ts'
+import { NativeRoundCoordinator } from './native/coordinator.ts'
 
 export { ChatGptWebAdapter } from './adapter.ts'
 export type {
@@ -36,6 +41,10 @@ export type {
   ConnectorTransport,
 } from './adapter.ts'
 export { compilePrompt } from './chatgpt/prompt.ts'
+export { NativeToolBroker } from './native/broker.ts'
+export { NativeRoundCoordinator, correlateToolResults } from './native/coordinator.ts'
+export type { NativeRoundCleanup, NativeStepLease } from './native/coordinator.ts'
+export type { BrokerRoundSnapshot, BrokerRpcError, BrokerRpcResponse, BrokerToolRequest, BrokerToolResult } from './native/types.ts'
 
 export const name = 'llm-chatgpt-web'
 export const inject = ['llm']
@@ -140,7 +149,11 @@ export function defaultBrokerSocketPath(profileDir: string): string {
     .update(String(typeof process.getuid === 'function' ? process.getuid() : process.env['USER'] ?? 'user'))
     .digest('hex')
     .slice(0, 16)
-  return join(tmpdir(), `dsh-chatgpt-web-${userFingerprint}`, `native-broker-${profileFingerprint}.sock`)
+  const relative = join(`dsh-${userFingerprint.slice(0, 8)}`, `b-${profileFingerprint.slice(0, 16)}.sock`)
+  const candidate = join(tmpdir(), relative)
+  // macOS temporary roots can be long enough to exceed the Unix-domain path
+  // limit; /tmp remains a private-directory root and keeps the endpoint valid.
+  return Buffer.byteLength(candidate) <= 103 ? candidate : join('/tmp', relative)
 }
 
 /** Resolve, validate, and detach the advisory model catalog. */
@@ -211,14 +224,46 @@ export function resolveAdapterOptions(config: Config): ChatGptWebConnectionOptio
 
 export function apply(ctx: Context, config: Config): void {
   const options = (): ChatGptWebConnectionOptions => resolveAdapterOptions(config)
-  options()
+  const resolved = options()
+  let native: {
+    readonly broker: NativeToolBroker
+    readonly socket: NativeBrokerSocketServer
+    readonly coordinator: NativeRoundCoordinator
+    readonly ready: Promise<void>
+  } | undefined
+  if (resolved.connectorTransport === 'mcp') {
+    const broker = new NativeToolBroker()
+    const socket = new NativeBrokerSocketServer(resolved.brokerSocketPath, broker)
+    const coordinator = new NativeRoundCoordinator(broker)
+    const ready = socket.listen()
+    // Keep the rejection attached until an adapter request awaits it; plugin
+    // startup must not produce an unhandled-rejection process failure.
+    void ready.catch(() => {})
+    native = { broker, socket, coordinator, ready }
+  }
 
-  const adapter = new ChatGptWebAdapter({ options })
+  const adapter = new ChatGptWebAdapter({
+    options,
+    ...(native === undefined ? {} : { native }),
+  })
   const registration = ctx.llm.registerAdapter([PROVIDER], adapter)
   void registration
-  // Release the owned browser with the calling fiber (same pattern as the
-  // persistent-bash providers): HMR/reload/unload never strands Chromium.
-  ctx.effect(() => () => {
-    void adapter.dispose().catch(() => {})
+  if (native !== undefined) {
+    ctx.on('agent/turn-stopping', async ({ agent }: { agent: Agent }) => {
+      await adapter.stopNativeRound(String(agent.session.id))
+    })
+    ctx.on('session/event', (session: Session, event: SessionEvent) => {
+      if (event.type !== 'turn/end') return
+      void adapter.stopNativeRound(String(session.id)).catch(() => {})
+    })
+  }
+  // Reverse ownership order: stop browser work, then the coordinator, the
+  // socket endpoint, and finally the in-memory broker.
+  ctx.effect(() => async () => {
+    await adapter.dispose().catch(() => {})
+    if (native === undefined) return
+    await native.coordinator.dispose().catch(() => {})
+    await native.socket.close().catch(() => {})
+    native.broker.close()
   })
 }

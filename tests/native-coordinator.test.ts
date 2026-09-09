@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { MessageId, ToolCallId } from '@deepseek-ai/dsh-llm'
+import { MessageId, CallId } from '@deepseek-ai/dsh-llm'
 import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { NativeToolBroker } from '../src/native/broker.ts'
 import {
@@ -14,10 +14,10 @@ const tool: ToolSchema = {
   parameters: { type: 'object' },
 }
 function brokerCall(id: string, name: string): BrokerToolRequest {
-  return { callId: ToolCallId(id), name, arguments: {} }
+  return { callId: CallId(id), name, arguments: {} }
 }
 
-function toolResultMessage(callId: ToolCallId, text: string, isError = false): Message {
+function toolResultMessage(callId: CallId, text: string, isError = false): Message {
   return {
     id: MessageId(`result-${String(callId)}-${text}`),
     role: 'user',
@@ -26,7 +26,7 @@ function toolResultMessage(callId: ToolCallId, text: string, isError = false): M
   }
 }
 
-function toolImageResultMessage(callId: ToolCallId): Message {
+function toolImageResultMessage(callId: CallId): Message {
   return {
     id: MessageId(`image-${String(callId)}`),
     role: 'user',
@@ -97,7 +97,7 @@ describe('correlateToolResults', () => {
     const first = brokerCall('call_1', 'read')
     const second = brokerCall('call_2', 'write')
     const messages = [
-      toolResultMessage(ToolCallId('old_call'), 'old'),
+      toolResultMessage(CallId('old_call'), 'old'),
       toolResultMessage(second.callId, 'second', true),
       toolResultMessage(first.callId, 'first'),
     ]

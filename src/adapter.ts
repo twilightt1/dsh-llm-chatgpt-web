@@ -3,12 +3,13 @@
  * emit harness StreamChunks. Transport-only: connection facts arrive through
  * a thunk resolved once per operation; turns are serialized on one browser.
  *
- * No bridge daemon, no Codex task, no MCP: each turn owns a fresh Temporary
- * Chat page and the full DSH history is compiled into its prompt.
+ * The default text path has no bridge daemon or nested agent loop. The opt-in
+ * native MCP path still owns one fresh Temporary Chat page per DSH step and
+ * hands tool execution back to the ordinary DSH loop.
  * @module dsh-llm-chatgpt-web/adapter
  */
 
-import { ToolCallId, contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { CallId, contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   GenerateOptions,
@@ -19,11 +20,15 @@ import type {
   ResolvedRetryPolicy,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import type { Page } from 'playwright-core'
 import { ChatGptBrowser } from './chatgpt/browser.ts'
 import { compilePrompt } from './chatgpt/prompt.ts'
+import type { NativeRoundCleanup, NativeRoundCoordinator, NativeStepLease } from './native/coordinator.ts'
+import type { BrokerToolRequest } from './native/types.ts'
 import { CHATGPT_COMPOSER_SELECTOR, detectChatGptAccountCapabilities } from './chatgpt/session.ts'
 import type { ChatGptWebAccountCapabilities } from './chatgpt/session.ts'
 import { COMPOSER_CHAR_BUDGET, prepareTemporaryChatSurface, streamTextTurn } from './chatgpt/turn.ts'
+import type { TextTurnEvent, TextTurnResult } from './chatgpt/turn.ts'
 import { estimateUsage } from './chatgpt/usage.ts'
 import { buildSchemaIndex, parseToolCallsWithSchemas, renderRejectionNotice } from './chatgpt/toolcalls.ts'
 
@@ -33,9 +38,40 @@ export type ConnectorTransport = 'text' | 'mcp'
 /** Monotonic suffix for provider-issued call ids (unique per process). */
 let toolCallSequence = 0
 
-function mintCallId(): ToolCallId {
+function mintCallId(): CallId {
   toolCallSequence += 1
-  return ToolCallId(`call-${toolCallSequence}`)
+  return CallId(`call-${toolCallSequence}`)
+}
+
+/** Convert one broker batch into ordinary DSH tool-call chunks. */
+export function* nativeToolBatchChunks(
+  promptChars: number,
+  fullText: string,
+  textIndex: number,
+  calls: readonly BrokerToolRequest[],
+): Generator<StreamChunk> {
+  yield { type: 'block-end', index: textIndex, block: { type: 'text', text: fullText } }
+  let index = textIndex + 1
+  for (const call of calls) {
+    const argumentsText = JSON.stringify(call.arguments)
+    if (argumentsText === undefined) throw new LlmError(`Native broker arguments for ${String(call.callId)} are not JSON serializable.`, 'PROVIDER_ERROR')
+    yield { type: 'block-start', index, blockType: 'tool-call' }
+    yield {
+      type: 'tool-call-delta',
+      index,
+      id: call.callId,
+      name: call.name,
+      argumentsDelta: argumentsText,
+    }
+    yield {
+      type: 'block-end',
+      index,
+      block: { type: 'tool-call', id: call.callId, name: call.name, arguments: argumentsText },
+    }
+    index += 1
+  }
+  yield { type: 'usage', usage: estimateUsage(promptChars, fullText.length) }
+  yield { type: 'finish', reason: { kind: 'tool-calls' } }
 }
 
 /** Preserve provider/UI failures instead of labelling every exception as transport. */
@@ -108,6 +144,11 @@ export interface ChatGptWebConnectionOptions {
 export interface ChatGptWebAdapterOptions {
   /** Current validated connection facts; called once per operation. */
   options: () => ChatGptWebConnectionOptions
+  /** Plugin-owned native broker lifecycle; omitted for the default text path. */
+  native?: {
+    readonly coordinator: NativeRoundCoordinator
+    readonly ready: Promise<void>
+  }
 }
 
 /** Default whole-turn budget (15 minutes: reasoning models think long). */
@@ -185,6 +226,11 @@ export class ChatGptWebAdapter extends LlmAdapter {
 
   override stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     return this.enqueue(() => this.runTurn(options))
+  }
+
+  /** Stop a parked native round at a durable agent turn boundary. */
+  async stopNativeRound(sessionId: string): Promise<void> {
+    await this.config.native?.coordinator.stopAtTurnBoundary(sessionId)
   }
 
   /** Release the owned browser. Hosts should call this on plugin unload. */
@@ -350,14 +396,65 @@ export class ChatGptWebAdapter extends LlmAdapter {
         )
       }
     }
-    const prompt = compilePrompt(options, COMPOSER_CHAR_BUDGET, this.takeNotice(options))
+    const hasTools = (options.tools?.length ?? 0) > 0
+    const nativeRequested = connection.connectorTransport === 'mcp' && hasTools
+    if (nativeRequested && options.sessionId === undefined) {
+      throw new LlmError('Native MCP transport requires a sessionId for round ownership.', 'INVALID_REQUEST')
+    }
+    if (nativeRequested && this.config.native === undefined) {
+      throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
+    }
+
     const browser = this.browserFor(connection)
-    await browser.ensureReady(options.signal)
-    // Fresh page per turn (upstream pageForNewTurn): a reused SPA page
-    // retains the previous transcript and autocomplete DOM.
-    const page = await browser.newTurnPage()
-    let iterator: AsyncIterator<{ type: 'delta'; delta: string }, { text: string; promptChars: number }> | undefined
+    let page: Page | undefined
+    let iterator: AsyncIterator<TextTurnEvent, TextTurnResult> | undefined
+    let lease: NativeStepLease | undefined
+    let ownershipTransferred = false
+    let nativeReleased = false
+    let cleanupPromise: Promise<void> | undefined
+    const cleanup: NativeRoundCleanup = (mode): Promise<void> => {
+      if (cleanupPromise !== undefined) return cleanupPromise
+      cleanupPromise = (async () => {
+        if (mode === 'stop' && page !== undefined && !page.isClosed()) {
+          await page.locator('[data-testid="stop-button"]').last().press('Enter').catch(() => {})
+        }
+        try {
+          await iterator?.return?.()
+        } catch {
+          // The browser close below remains the final cleanup authority.
+        }
+        if (page !== undefined) await page.close().catch(() => {})
+        await browser.persistSession().catch(() => {})
+      })()
+      return cleanupPromise
+    }
+
     try {
+      if (nativeRequested) {
+        const nativeRuntime = this.config.native!
+        await nativeRuntime.ready
+        lease = await nativeRuntime.coordinator.beginStep({
+          sessionId: String(options.sessionId),
+          messages: options.messages,
+          tools: options.tools ?? [],
+          ttlMs: connection.mcpInvocationTimeoutMs,
+          invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+          ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        })
+      }
+      const prompt = compilePrompt(
+        options,
+        COMPOSER_CHAR_BUDGET,
+        this.takeNotice(options),
+        lease === undefined ? undefined : {
+          requestId: lease.requestId,
+          connectorName: connection.connectorName,
+        },
+      )
+      await browser.ensureReady(options.signal)
+      // Fresh page per turn (upstream pageForNewTurn): a reused SPA page
+      // retains the previous transcript and autocomplete DOM.
+      page = await browser.newTurnPage()
       await prepareTemporaryChatSurface(page, connection.profileDir)
       if (!this.capabilities || !browser.probed) {
         try {
@@ -380,13 +477,24 @@ export class ChatGptWebAdapter extends LlmAdapter {
         turnTimeoutMs: connection.turnTimeoutMs,
         stallTimeoutMs: connection.stallTimeoutMs,
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        ...(lease === undefined ? {} : {
+          native: {
+            connectorName: connection.connectorName,
+            requestId: lease.requestId,
+            takeToolBatch: (now?: number) => lease!.takeToolBatch(now),
+            beginCompletionFence: () => lease!.beginCompletionFence(),
+            commitCompletionFence: (revision: number) => lease!.commitCompletionFence(revision),
+          },
+        }),
       })
       iterator = turn[Symbol.asyncIterator]()
       let blockIndex = -1
       let fullText = ''
+      let turnResult: TextTurnResult | undefined
       for (;;) {
         const step = await iterator.next()
         if (step.done) {
+          turnResult = step.value
           fullText = step.value.text
           break
         }
@@ -403,24 +511,32 @@ export class ChatGptWebAdapter extends LlmAdapter {
         blockIndex = 0
         yield { type: 'block-start', index: blockIndex, blockType: 'text' }
       }
-      yield* this.emitTurnResult(options, prompt, fullText, blockIndex)
-    } catch (error: unknown) {
-      if (options.signal?.aborted) {
-        // Stop server-side generation; the turn page is closed below.
-        await page.locator('[data-testid="stop-button"]').last().press('Enter').catch(() => {})
-        try {
-          await iterator?.return?.()
-        } catch {
-          // Termination already owned by the abort path.
+      if (turnResult === undefined) throw new LlmError('ChatGPT Web turn ended without a result.', 'TRANSPORT')
+      if (turnResult.kind === 'tool-batch') {
+        yield* nativeToolBatchChunks(prompt.length, fullText, blockIndex, turnResult.calls)
+        if (lease === undefined) throw new LlmError('Native tool batch returned without a native lease.', 'TRANSPORT')
+        await lease.park(cleanup)
+        ownershipTransferred = true
+      } else {
+        yield* this.emitTurnResult(options, prompt, fullText, blockIndex)
+        if (lease !== undefined) {
+          await lease.complete(cleanup)
+          nativeReleased = true
         }
-        throw new LlmError('ChatGPT Web request aborted by caller.', 'ABORTED', { cause: error })
       }
-      throw classifyTurnFailure(error)
+    } catch (error: unknown) {
+      const failure = options.signal?.aborted
+        ? new LlmError('ChatGPT Web request aborted by caller.', 'ABORTED', { cause: error })
+        : classifyTurnFailure(error)
+      if (lease !== undefined && !ownershipTransferred && !nativeReleased) {
+        await lease.fail(cleanup, failure).catch(() => {})
+        nativeReleased = true
+      } else if (options.signal?.aborted) {
+        await cleanup('stop')
+      }
+      throw failure
     } finally {
-      // The turn page is always closed, and a COMPLETED turn persists the
-      // fresh session (ChatGPT rotates tokens; upstream does this per turn).
-      await page.close().catch(() => {})
-      await browser.persistSession().catch(() => {})
+      if (!ownershipTransferred && !nativeReleased) await cleanup('close')
     }
   }
 }

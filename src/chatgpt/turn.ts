@@ -32,6 +32,12 @@ import {
 import type { ChatGptWebAccountCapabilities } from './session.ts'
 import { ChatGptMarkdownBuffer, chatGptHtmlToMarkdown } from './markdown.ts'
 import { selectModelEffort } from './effort.ts'
+import {
+  arbitrateNativeObservation,
+  selectChatGptConnector,
+  type NativeBrowserControl,
+} from './connector.ts'
+import type { BrokerToolRequest } from '../native/types.ts'
 
 /** Composer budget in chars (measured upstream envelope, fail-closed). */
 export const COMPOSER_CHAR_BUDGET = 200_000
@@ -184,12 +190,17 @@ export interface TextTurnOptions {
   turnTimeoutMs: number
   stallTimeoutMs: number
   signal?: AbortSignal
+  native?: NativeBrowserControl
 }
 
-export interface TextTurnResult {
-  text: string
-  promptChars: number
-}
+export type TextTurnResult =
+  | { readonly kind: 'completed'; readonly text: string; readonly promptChars: number }
+  | {
+      readonly kind: 'tool-batch'
+      readonly text: string
+      readonly promptChars: number
+      readonly calls: readonly BrokerToolRequest[]
+    }
 
 /** Events from a streaming turn: deltas, then return of the final result. */
 export type TextTurnEvent =
@@ -530,6 +541,9 @@ export async function* streamTextTurn(
   await assertAuthenticatedChatGptPage(page)
   await assertTemporaryChatPage(page)
   await selectModelEffort(page, options.model, options.capabilities)
+  if (options.native !== undefined) {
+    await selectChatGptConnector(page, options.native.connectorName, signal)
+  }
 
   const assistantTurns = page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR)
   const assistantTurnIdentities = async (): Promise<string[]> => {
@@ -629,8 +643,12 @@ export async function* streamTextTurn(
     )
   }
 
-  /** Submit and wait for the model to start answering. */
-  async function submit(initialIdentities: readonly string[]): Promise<string> {
+  type SubmitResult =
+    | { readonly kind: 'assistant'; readonly identity: string }
+    | { readonly kind: 'tool-batch'; readonly calls: readonly BrokerToolRequest[] }
+
+  /** Submit and wait for either the model turn identity or an early MCP batch. */
+  async function submit(initialIdentities: readonly string[]): Promise<SubmitResult> {
     const composer = await activeComposer(page)
     const sendButton = composer.locator('xpath=ancestor::form[1]').getByTestId('send-button')
     await sendButton.waitFor({ state: 'visible', timeout: 30_000 })
@@ -652,8 +670,12 @@ export async function* streamTextTurn(
       checkDeadline()
       await throwIfSessionFailureAlert(page)
       await throwIfRateLimitDialog(page)
+      if (options.native !== undefined) {
+        const decision = arbitrateNativeObservation(options.native, undefined)
+        if (decision.kind === 'tool-batch') return decision
+      }
       const identity = resolveNewAssistantTurnIdentity(initialIdentities, await assistantTurnIdentities())
-      if (identity !== undefined) return identity
+      if (identity !== undefined) return { kind: 'assistant', identity }
       if (Date.now() >= submitDeadline) {
         await throwIfTerminalError(page)
         throw new LlmError('ChatGPT did not accept the submitted prompt (no turn appeared).', 'PROVIDER_ERROR')
@@ -662,15 +684,22 @@ export async function* streamTextTurn(
     }
   }
 
-  /** Poll one identity-bound assistant turn to completion. */
-  async function* captureRound(responseIdentity: string): AsyncGenerator<TextTurnEvent, string> {
+  /** Poll one identity-bound assistant turn to completion or native batch. */
+  async function* captureRound(responseIdentity: string): AsyncGenerator<TextTurnEvent, TextTurnResult> {
     let boundResponseIdentity = responseIdentity
+    let emittedText = ''
     const markdownBuffer = new ChatGptMarkdownBuffer()
     const completionTracker = new ChatGptCompletionTracker()
     const observationFaults = new ChatGptObservationFaultTracker()
     const domHealthTracker = new ChatGptTurnDomHealthTracker(options.stallTimeoutMs)
     for (;;) {
       checkDeadline()
+      if (options.native !== undefined) {
+        const decision = arbitrateNativeObservation(options.native, undefined)
+        if (decision.kind === 'tool-batch') {
+          return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
+        }
+      }
       // ONE evaluate per poll (upstream discipline): the snapshot IIFE
       // carries answer segments, stop-button (running), and the rate-limit /
       // session guards. Per-poll locator round-trips (guard isVisible x4,
@@ -735,7 +764,14 @@ export async function* streamTextTurn(
         )
       }
       if (delta.length > 0) {
+        emittedText += delta
         yield { type: 'delta', delta }
+      }
+      if (options.native !== undefined) {
+        const decision = arbitrateNativeObservation(options.native, undefined)
+        if (decision.kind === 'tool-batch') {
+          return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
+        }
       }
 
       // Upstream chrome filters: a bare "Thinking" header or an "Answer now"
@@ -759,10 +795,24 @@ export async function* streamTextTurn(
         currentHtml: snapshot.segments.map(segment => segment.html).join(''),
         completionActionVisible: snapshot.completionActionVisible,
       })) {
+        const candidate = { text: visible, promptChars: options.prompt.length }
+        if (options.native !== undefined) {
+          const decision = arbitrateNativeObservation(options.native, candidate)
+          if (decision.kind === 'tool-batch') {
+            return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
+          }
+          if (decision.kind !== 'completed') {
+            await new Promise(resolveSleep => setTimeout(resolveSleep, 250))
+            continue
+          }
+        }
         try {
           const final = markdownBuffer.finish()
-          if (final.delta.length > 0) yield { type: 'delta', delta: final.delta }
-          return final.markdown.length > 0 ? final.markdown : visible
+          if (final.delta.length > 0) {
+            emittedText += final.delta
+            yield { type: 'delta', delta: final.delta }
+          }
+          return { kind: 'completed', text: final.markdown.length > 0 ? final.markdown : visible, promptChars: options.prompt.length }
         } catch (error) {
           throw new LlmError(
             'ChatGPT rewrote text that was already streamed; the turn cannot be completed safely.',
@@ -781,7 +831,9 @@ export async function* streamTextTurn(
   // The model decides from the active request; forcing follow-up nudges here
   // duplicated streamed text and made ordinary final answers impossible.
   await attach(options.prompt)
-  const responseIdentity = await submit(initialAssistantTurns)
-  const captured = yield* captureRound(responseIdentity)
-  return { text: captured, promptChars: options.prompt.length }
+  const submitted = await submit(initialAssistantTurns)
+  if (submitted.kind === 'tool-batch') {
+    return { kind: 'tool-batch', text: '', promptChars: options.prompt.length, calls: submitted.calls }
+  }
+  return yield* captureRound(submitted.identity)
 }
