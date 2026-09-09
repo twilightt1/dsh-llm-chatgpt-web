@@ -209,6 +209,29 @@ describe('native adapter lifecycle', () => {
     broker.close()
   })
 
+  it('does not let slow browser setup consume the native broker TTL', async () => {
+    fixtures.browser.ensureReady.mockImplementationOnce(async () => {
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      profileDir: '/tmp/dsh-native-adapter-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-test.sock',
+      mcpInvocationTimeoutMs: 10,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    const chunks = await collect(adapter.stream(input('slow-setup')))
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
+    await adapter.dispose()
+    broker.close()
+  })
+
   it('does not allocate a browser page when managed readiness fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-native-adapter-ready-'))
     const broker = new NativeToolBroker()

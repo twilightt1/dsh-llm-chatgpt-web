@@ -509,28 +509,10 @@ export class ChatGptWebAdapter extends LlmAdapter {
         const nativeRuntime = this.config.native!
         nativeRuntime.assertConnection(connection)
         await nativeRuntime.ready
-        lease = await nativeRuntime.coordinator.beginStep({
-          sessionId: String(options.sessionId),
-          messages: options.messages,
-          tools: options.tools ?? [],
-          ttlMs: connection.mcpInvocationTimeoutMs,
-          invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
-          ...(options.signal !== undefined ? { signal: options.signal } : {}),
-        })
-        lease.bindCleanup(cleanup)
       }
       if (nativeTools) ownedConversationLedger = createOwnedConversationLedger(connection.profileDir)
       const activeBrowser = this.browserFor(connection)
       browser = activeBrowser
-      const prompt = compilePrompt(
-        options,
-        COMPOSER_CHAR_BUDGET,
-        this.takeNotice(options),
-        nativeTools && lease !== undefined ? {
-          requestId: lease.requestId,
-          connectorName: connection.connectorName,
-        } : undefined,
-      )
       await activeBrowser.ensureReady(options.signal)
       // Fresh page per turn (upstream pageForNewTurn): a reused SPA page
       // retains the previous transcript and autocomplete DOM.
@@ -558,6 +540,27 @@ export class ChatGptWebAdapter extends LlmAdapter {
         activeBrowser.markProbed()
       }
       const capabilities = this.capabilities
+      if (nativeMode) {
+        const nativeRuntime = this.config.native!
+        lease = await nativeRuntime.coordinator.beginStep({
+          sessionId: String(options.sessionId),
+          messages: options.messages,
+          tools: options.tools ?? [],
+          ttlMs: connection.mcpInvocationTimeoutMs,
+          invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+          ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        })
+        lease.bindCleanup(cleanup)
+      }
+      const prompt = compilePrompt(
+        options,
+        COMPOSER_CHAR_BUDGET,
+        this.takeNotice(options),
+        nativeTools && lease !== undefined ? {
+          requestId: lease.requestId,
+          connectorName: connection.connectorName,
+        } : undefined,
+      )
       const turn = streamTextTurn(page, {
         model: options.model,
         prompt,
