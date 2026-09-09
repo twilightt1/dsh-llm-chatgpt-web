@@ -37,6 +37,10 @@ import { COMPOSER_CHAR_BUDGET, prepareTemporaryChatSurface, streamTextTurn } fro
 import type { TextTurnEvent, TextTurnResult } from './chatgpt/turn.ts'
 import { estimateUsage } from './chatgpt/usage.ts'
 import { buildSchemaIndex, parseToolCallsWithSchemas, renderRejectionNotice } from './chatgpt/toolcalls.ts'
+import {
+  ManagedRuntimeConfigurationError,
+  ManagedRuntimeTransportError,
+} from './native/tunnel-runtime.ts'
 
 /** Monotonic suffix for provider-issued call ids (unique per process). */
 let toolCallSequence = 0
@@ -84,6 +88,12 @@ export function* nativeToolBatchChunks(
 /** Preserve provider/UI failures instead of labelling every exception as transport. */
 export function classifyTurnFailure(error: unknown): LlmError {
   if (error instanceof LlmError) return error
+  if (error instanceof ManagedRuntimeTransportError) {
+    return new LlmError(`ChatGPT Web managed native runtime failed: ${error.message}`, 'TRANSPORT', { cause: error })
+  }
+  if (error instanceof ManagedRuntimeConfigurationError) {
+    return new LlmError(`ChatGPT Web managed native runtime configuration failed: ${error.message}`, 'PROVIDER_ERROR', { cause: error })
+  }
   const detail = error instanceof Error ? error.message : String(error)
   const transportFailure = /browser.*closed|connection.*closed|context.*closed|target.*closed|session.*closed|page.*closed|websocket|protocol error|execution context was destroyed|ECONNRESET|EPIPE/i.test(detail)
   const timeoutFailure = (error instanceof Error && error.name === 'TimeoutError')
@@ -159,6 +169,7 @@ export interface ChatGptWebAdapterOptions {
   native?: {
     readonly coordinator: NativeRoundCoordinator
     readonly ready: Promise<void>
+    readonly assertConnection: (connection: ChatGptWebConnectionOptions) => void
   }
 }
 
@@ -417,7 +428,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
       throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
     }
 
-    const browser = this.browserFor(connection)
+    let browser: ChatGptBrowser | undefined
     let page: Page | undefined
     let iterator: AsyncIterator<TextTurnEvent, TextTurnResult> | undefined
     let lease: NativeStepLease | undefined
@@ -446,7 +457,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         }
         if (page !== undefined) {
           await page.close().catch(() => {})
-          await browser.persistSession().catch(() => {})
+          await browser?.persistSession().catch(() => {})
         }
       })()
       return cleanupPromise
@@ -455,6 +466,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
     try {
       if (nativeMode) {
         const nativeRuntime = this.config.native!
+        nativeRuntime.assertConnection(connection)
         await nativeRuntime.ready
         lease = await nativeRuntime.coordinator.beginStep({
           sessionId: String(options.sessionId),
@@ -466,6 +478,8 @@ export class ChatGptWebAdapter extends LlmAdapter {
         })
         lease.bindCleanup(cleanup)
       }
+      const activeBrowser = this.browserFor(connection)
+      browser = activeBrowser
       const prompt = compilePrompt(
         options,
         COMPOSER_CHAR_BUDGET,
@@ -475,16 +489,16 @@ export class ChatGptWebAdapter extends LlmAdapter {
           connectorName: connection.connectorName,
         } : undefined,
       )
-      await browser.ensureReady(options.signal)
+      await activeBrowser.ensureReady(options.signal)
       // Fresh page per turn (upstream pageForNewTurn): a reused SPA page
       // retains the previous transcript and autocomplete DOM.
-      page = await browser.newTurnPage()
+      page = await activeBrowser.newTurnPage()
       if (cleanupRequested !== undefined) {
         await cleanup(cleanupRequested)
         throw new LlmError('ChatGPT Web turn stopped at a turn boundary.', 'ABORTED')
       }
       await prepareTemporaryChatSurface(page, connection.profileDir)
-      if (!this.capabilities || !browser.probed) {
+      if (!this.capabilities || !activeBrowser.probed) {
         try {
           this.capabilities = await detectChatGptAccountCapabilities(page)
         } catch (error) {
@@ -495,7 +509,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
             { cause: error },
           )
         }
-        browser.markProbed()
+        activeBrowser.markProbed()
       }
       const capabilities = this.capabilities
       const turn = streamTextTurn(page, {

@@ -1,3 +1,6 @@
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const fixtures = vi.hoisted(() => {
@@ -46,6 +49,7 @@ vi.mock('../src/chatgpt/turn.ts', () => ({
 
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import { ChatGptWebAdapter } from '../src/adapter.ts'
+import { ManagedRuntimeTransportError } from '../src/native/tunnel-runtime.ts'
 import { NativeRoundCoordinator } from '../src/native/coordinator.ts'
 import { NativeToolBroker } from '../src/native/broker.ts'
 import { resolveAdapterOptions } from '../src/index.ts'
@@ -69,6 +73,12 @@ function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
   return { promise, resolve }
 }
 
+async function collect(stream: AsyncIterable<StreamChunk>): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of stream) chunks.push(chunk)
+  return chunks
+}
+
 function input(sessionId: string, tools: readonly ToolSchema[] = [tool]): Parameters<ChatGptWebAdapter['stream']>[0] {
   return {
     provider: 'chatgpt-web',
@@ -82,6 +92,31 @@ function input(sessionId: string, tools: readonly ToolSchema[] = [tool]): Parame
 describe('native adapter lifecycle', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  it('does not allocate a browser page when managed readiness fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-adapter-ready-'))
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'managed',
+      profileDir: root,
+      brokerSocketPath: join(root, 'broker.sock'),
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: {
+        coordinator,
+        ready: Promise.reject(new ManagedRuntimeTransportError('tunnel not ready')),
+        assertConnection: () => {},
+      },
+    })
+
+    await expect(collect(adapter.stream(input('s1')))).rejects.toMatchObject({ code: 'TRANSPORT' })
+    expect(fixtures.browser.ensureReady).not.toHaveBeenCalled()
+    expect(fixtures.browser.newTurnPage).not.toHaveBeenCalled()
+    await adapter.dispose()
   })
 
   it('reserves the browser for MCP no-tool turns without attaching a connector', async () => {
@@ -101,7 +136,7 @@ describe('native adapter lifecycle', () => {
     })
     const adapter = new ChatGptWebAdapter({
       options: () => options,
-      native: { coordinator, ready: Promise.resolve() },
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
     })
 
     const iterator = adapter.stream(input('s1', []))[Symbol.asyncIterator]()
@@ -144,7 +179,7 @@ describe('native adapter lifecycle', () => {
     })
     const adapter = new ChatGptWebAdapter({
       options: () => options,
-      native: { coordinator, ready: Promise.resolve() },
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
     })
 
     const chunks: StreamChunk[] = []
@@ -169,7 +204,7 @@ describe('native adapter lifecycle', () => {
     })
     const adapter = new ChatGptWebAdapter({
       options: () => options,
-      native: { coordinator, ready: Promise.resolve() },
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
     })
 
     const iterator = adapter.stream(input('s1'))[Symbol.asyncIterator]()

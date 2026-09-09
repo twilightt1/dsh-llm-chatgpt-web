@@ -29,11 +29,12 @@ import {
 } from './adapter.ts'
 import type { ChatGptWebCatalogModel, ChatGptWebConnectionOptions } from './adapter.ts'
 import { defaultProfileDir, resolveChromeExecutable } from './chatgpt/launch.ts'
-import { NativeToolBroker } from './native/broker.ts'
-import { NativeBrokerSocketServer } from './native/broker-socket.ts'
-import { NativeRoundCoordinator } from './native/coordinator.ts'
 import type { ConnectorRuntime } from './native/types.ts'
 import { defaultNativeRuntimeConfigPath } from './native/runtime-config.ts'
+import {
+  createNativePluginRuntime,
+} from './native/plugin-runtime.ts'
+import type { NativePluginRuntime } from './native/plugin-runtime.ts'
 
 export { ChatGptWebAdapter } from './adapter.ts'
 export type {
@@ -262,21 +263,9 @@ export function resolveAdapterOptions(
 export function apply(ctx: Context, config: Config): void {
   const options = (): ChatGptWebConnectionOptions => resolveAdapterOptions(config)
   const resolved = options()
-  let native: {
-    readonly broker: NativeToolBroker
-    readonly socket: NativeBrokerSocketServer
-    readonly coordinator: NativeRoundCoordinator
-    readonly ready: Promise<void>
-  } | undefined
+  let native: NativePluginRuntime | undefined
   if (resolved.connectorTransport === 'mcp') {
-    const broker = new NativeToolBroker()
-    const socket = new NativeBrokerSocketServer(resolved.brokerSocketPath, broker)
-    const coordinator = new NativeRoundCoordinator(broker)
-    const ready = socket.listen()
-    // Keep the rejection attached until an adapter request awaits it; plugin
-    // startup must not produce an unhandled-rejection process failure.
-    void ready.catch(() => {})
-    native = { broker, socket, coordinator, ready }
+    native = createNativePluginRuntime(resolved)
   }
 
   const adapter = new ChatGptWebAdapter({
@@ -297,10 +286,9 @@ export function apply(ctx: Context, config: Config): void {
   // Revoke native rounds first: their cleanup callbacks own active pages and
   // iterators, so browser/endpoint disposal must not race them.
   ctx.effect(() => async () => {
-    if (native !== undefined) await native.coordinator.dispose().catch(() => {})
+    if (native !== undefined) await native.quiesce().catch(() => {})
     await adapter.dispose().catch(() => {})
     if (native === undefined) return
-    await native.socket.close().catch(() => {})
-    native.broker.close()
+    await native.close().catch(() => {})
   })
 }

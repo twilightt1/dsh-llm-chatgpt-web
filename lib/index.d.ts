@@ -198,6 +198,7 @@ interface ChatGptWebAdapterOptions {
   native?: {
     readonly coordinator: NativeRoundCoordinator;
     readonly ready: Promise<void>;
+    readonly assertConnection: (connection: ChatGptWebConnectionOptions) => void;
   };
 }
 /**
