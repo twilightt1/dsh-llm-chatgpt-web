@@ -62,7 +62,6 @@ function fakes(log: string[], options: {
       },
       stop: async () => { log.push('tunnel.stop') },
     })),
-    mcpEntrypoint: '/tmp/package/lib/mcp-main.js',
     nodeExecutable: '/usr/local/bin/node',
   }
   return { dependencies, broker }
@@ -151,6 +150,20 @@ describe('native plugin runtime composition', () => {
     await stack.close()
     expect(log.filter(entry => entry === 'tunnel.start')).toHaveLength(1)
     expect(log.filter(entry => entry === 'tunnel.stop')).toHaveLength(1)
+  })
+
+  it('rejects an injected MCP entrypoint that escapes the package root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-plugin-'))
+    const log: string[] = []
+    const { dependencies: baseDependencies } = fakes(log, { managed: true })
+    const dependencies: NativePluginRuntimeDependencies = {
+      ...baseDependencies,
+      mcpEntrypoint: '/etc/hosts',
+    }
+    const initial = await connection(root)
+    const stack = createNativePluginRuntime(initial, dependencies)
+    await expect(stack.ready).rejects.toThrow(/outside the package root/i)
+    await stack.close()
   })
 
   it('rejects connection identity changes after the stack is created', async () => {

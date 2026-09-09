@@ -65,17 +65,16 @@ function identity(connection: ChatGptWebConnectionOptions): NativeRuntimeIdentit
 }
 
 function resolveMcpEntrypoint(explicit: string | undefined): string {
-  if (explicit !== undefined) {
-    if (!isAbsolute(explicit) || /[\r\n\u0000]/.test(explicit)) {
-      throw new ManagedRuntimeConfigurationError('MCP entrypoint must be an absolute path without newlines')
-    }
-    return explicit
+  if (explicit !== undefined && (!isAbsolute(explicit) || /[\r\n\u0000]/.test(explicit))) {
+    throw new ManagedRuntimeConfigurationError('MCP entrypoint must be an absolute path without newlines')
   }
   const current = dirname(fileURLToPath(import.meta.url))
   const packageRoot = current.endsWith('/lib')
     ? resolve(current, '..')
     : resolve(current, '../..')
-  const candidates = [join(current, 'mcp-main.js'), join(current, '../../lib/mcp-main.js')]
+  const candidates = explicit === undefined
+    ? [join(current, 'mcp-main.js'), join(current, '../../lib/mcp-main.js')]
+    : [explicit]
   const candidate = candidates.find(path => {
     try { return statSync(path).isFile() } catch { return false }
   })
@@ -89,7 +88,7 @@ function resolveMcpEntrypoint(explicit: string | undefined): string {
     throw new ManagedRuntimeConfigurationError('built lib/mcp-main.js could not be resolved')
   }
   if (realCandidate !== realRoot && !realCandidate.startsWith(`${realRoot}/`)) {
-    throw new ManagedRuntimeConfigurationError('built lib/mcp-main.js resolves outside the package root')
+    throw new ManagedRuntimeConfigurationError('MCP entrypoint resolves outside the package root')
   }
   return realCandidate
 }
