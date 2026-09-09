@@ -432,7 +432,8 @@ export class ChatGptWebAdapter extends LlmAdapter {
     // but are not DSH agent rounds. They must not enter the native coordinator:
     // a title request queued while an agent round is parked has no durable
     // tool_result to resume and would otherwise steal the parked reservation.
-    const nativeRound = nativeMode && options.purpose === undefined
+    const auxiliaryModelCall = options.purpose === 'session-title' || options.purpose === 'compaction'
+    const nativeRound = nativeMode && !auxiliaryModelCall
     const nativeTools = nativeRound && hasTools
     if (nativeRound && options.sessionId === undefined) {
       throw new LlmError('Native MCP transport requires a sessionId for round ownership.', 'INVALID_REQUEST')

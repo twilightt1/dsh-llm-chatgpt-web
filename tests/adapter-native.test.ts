@@ -262,7 +262,7 @@ describe('native adapter lifecycle', () => {
     await adapter.dispose()
   })
 
-  it('does not reserve a native round for auxiliary model calls', async () => {
+  it.each(['session-title', 'compaction'] as const)('does not reserve a native round for %s model calls', async (purpose) => {
     const broker = new NativeToolBroker()
     const coordinator = new NativeRoundCoordinator(broker)
     const beginStep = vi.spyOn(coordinator, 'beginStep')
@@ -278,7 +278,7 @@ describe('native adapter lifecycle', () => {
       native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
     })
 
-    await collect(adapter.stream(input('title', [], 'session-title')))
+    await collect(adapter.stream(input(purpose, [], purpose)))
     expect(beginStep).not.toHaveBeenCalled()
     expect(fixtures.prepare).toHaveBeenCalledWith(expect.anything(), 'temporary', options.profileDir)
     await adapter.dispose()
