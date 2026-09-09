@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process'
 
+const MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
+
 export interface CommandResult {
   readonly status: number
   readonly stdout: string
@@ -29,6 +31,7 @@ export function runCommand(
     encoding: 'utf8',
     stdio: 'pipe',
     timeout: timeoutMs,
+    maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
   })
   if (result.error !== undefined) throw result.error
   return {
