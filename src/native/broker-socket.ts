@@ -150,6 +150,9 @@ export class NativeBrokerSocketServer {
     if (!parent.isDirectory() || (parent.mode & 0o077) !== 0) {
       throw new Error('unsafe broker directory permissions: expected a private directory')
     }
+    if (typeof process.getuid === 'function' && parent.uid !== process.getuid()) {
+      throw new Error('unsafe broker directory ownership: expected the current user')
+    }
     let existing: ReturnType<typeof lstatSync> | undefined
     try {
       existing = lstatSync(this.socketPath)

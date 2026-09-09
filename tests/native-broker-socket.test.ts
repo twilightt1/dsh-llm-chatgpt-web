@@ -108,6 +108,29 @@ describe('NativeBrokerSocketServer', () => {
     await rm(root, { recursive: true, force: true })
   })
 
+  it('rejects a private-looking broker directory owned by another user', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-socket-'))
+    chmodSync(root, 0o700)
+    const socketPath = join(root, 'broker.sock')
+    const broker = new NativeToolBroker()
+    const currentUid = process.getuid?.()
+    if (currentUid === undefined) {
+      broker.close()
+      await rm(root, { recursive: true, force: true })
+      return
+    }
+    const originalGetuid = process.getuid
+    Object.defineProperty(process, 'getuid', { configurable: true, value: () => currentUid + 1 })
+    try {
+      await expect(new NativeBrokerSocketServer(socketPath, broker).listen())
+        .rejects.toThrow(/owner|ownership|permissions/i)
+    } finally {
+      Object.defineProperty(process, 'getuid', { configurable: true, value: originalGetuid })
+      broker.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('does not replace or unlink a live endpoint owned by another server', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-native-socket-'))
     chmodSync(root, 0o700)
