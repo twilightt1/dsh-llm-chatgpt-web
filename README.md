@@ -117,8 +117,18 @@ the profile directory and run again.
     profileDir: ~/.dsh-chatgpt-web
     headed: true
     # connectorTransport: text       # default; use mcp for native tools (Unix only)
+    # Existing externally owned MCP runtime:
+    # connectorTransport: mcp
+    # connectorRuntime: external
     # connectorName: DSH Native      # exact Personalized connector title
     # brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
+    # mcpInvocationTimeoutMs: 90000
+    # Managed tunnel-client runtime (replace the block above):
+    # connectorTransport: mcp
+    # connectorRuntime: managed
+    # connectorName: DSH Native
+    # brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
+    # nativeRuntimeConfigPath: ~/.dsh-chatgpt-web/native-runtime.json
     # mcpInvocationTimeoutMs: 90000
     # chromeExecutablePath: /usr/bin/google-chrome
 
@@ -141,49 +151,169 @@ Auto-detect order for the browser binary: explicit config →
 bundled Chromium. Call `adapter.dispose()` on host unload to release the
 owned browser (the dev `scripts/live-turn.ts` shows the pattern).
 
-### Native MCP setup (opt-in)
+### Native MCP setup (opt-in, Unix only)
 
-Use the native path only on Unix systems. Configure the plugin with:
+Native MCP has two ownership modes. `connectorRuntime: external` keeps the
+existing contract: an operator owns the tunnel process and launches the
+package's stdio MCP child. `connectorRuntime: managed` makes this plugin own
+the pinned tunnel-client lifecycle. Text transport remains the default.
+
+#### 1. Account prerequisites
+
+Create or select an OpenAI Secure MCP Tunnel and create a restricted runtime
+API key with Tunnels **Read** and **Use** permissions. Keep the tunnel ID and
+runtime key separate: the ID is metadata, while the key authenticates the
+local tunnel client. Use the official [Secure MCP Tunnel
+guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels),
+[Platform Tunnels settings](https://platform.openai.com/settings/organization/tunnels),
+and [Runtime API keys](https://platform.openai.com/settings/organization/api-keys).
+
+This package does **not** create the account tunnel, runtime key, or ChatGPT
+connector. It only installs a verified local client and configures the local
+runtime after you supply those account-level values.
+
+#### 2. Managed setup
+
+Run setup on Darwin/Linux arm64 or x64. The client is pinned to
+`openai/tunnel-client` `0.0.12`; setup verifies the release checksum, binary
+version, private permissions, and a real connect/status/stop cycle before
+writing the final runtime configuration:
+
+```sh
+dsh-chatgpt-web-native setup \
+  --profile-dir "$HOME/.dsh-chatgpt-web" \
+  --connector-name "DSH Native" \
+  --tunnel-id "$TUNNEL_ID"
+```
+
+Without `--runtime-key-file`, setup asks for the runtime key through a hidden
+TTY prompt. To read an existing private key file instead:
+
+```sh
+dsh-chatgpt-web-native setup \
+  --profile-dir "$HOME/.dsh-chatgpt-web" \
+  --connector-name "DSH Native" \
+  --tunnel-id "$TUNNEL_ID" \
+  --runtime-key-file /private/path/to/runtime-key
+```
+
+Setup copies the key to
+`~/.dsh-chatgpt-web/secrets/tunnel-runtime.key` (`0600`) and stores only that
+path in `native-runtime.json` (`0600`). It does not edit Cordis YAML or
+account settings. A source key passed with `--runtime-key-file` is retained;
+remove or rotate that source yourself after confirming the managed copy.
+
+#### 3. Exact ChatGPT connector
+
+In [ChatGPT connector settings](https://chatgpt.com/#settings/Connectors),
+create or select the **Personalized** connector with the exact name
+`DSH Native` (or the configured `connectorName`). Use the tunnel connection,
+select the same tunnel ID, and set **Authentication: None**. The account
+connector must point at this tunnel; a healthy local process alone does not
+prove ChatGPT can discover or call it.
+
+#### 4. Managed Cordis configuration
+
+After setup succeeds, mount the provider with the matching local paths:
 
 ```yaml
 config:
   connectorTransport: mcp
+  connectorRuntime: managed
   connectorName: DSH Native
   brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
+  nativeRuntimeConfigPath: ~/.dsh-chatgpt-web/native-runtime.json
   mcpInvocationTimeoutMs: 90000
 ```
 
-The package executable below is a **stdio MCP server**, not a network tunnel:
+The plugin listens on the private broker socket before starting the tunnel,
+then requires `process_running=true`, `healthy=true`, and `ready=true` before
+it opens a ChatGPT turn. In managed mode, do **not** separately launch
+`dsh-chatgpt-web-mcp`; the managed runtime launches the built stdio MCP
+command itself.
+
+#### 5. Doctor and stop
+
+`doctor` is read-only and never prints the runtime-key value. Use `--json`
+for a stable, redacted report suitable for an operator check:
+
+```sh
+dsh-chatgpt-web-native doctor \
+  --profile-dir "$HOME/.dsh-chatgpt-web" \
+  --connector-name "DSH Native" \
+  --json
+
+dsh-chatgpt-web-native stop \
+  --profile-dir "$HOME/.dsh-chatgpt-web" \
+  --connector-name "DSH Native"
+```
+
+`stop` stops only the configured local tunnel alias; it does not delete the
+runtime key, config, tunnel, or ChatGPT connector.
+
+#### 6. Existing external runtime
+
+For an externally owned tunnel, keep the plugin opt-in but select the external
+owner explicitly:
+
+```yaml
+config:
+  connectorTransport: mcp
+  connectorRuntime: external
+  connectorName: DSH Native
+  brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
+```
+
+Launch the stdio MCP child from the external tunnel runtime:
 
 ```sh
 dsh-chatgpt-web-mcp --broker-socket "$HOME/.dsh-chatgpt-web/native-broker.sock"
 ```
 
-Run that command as the MCP child of a separately provisioned, verified
-ChatGPT connector/tunnel runtime. The Personalized connector must be named
-exactly `DSH Native` (or the configured `connectorName`) and must reach that
-runtime; configuring the command alone does not make a local stdio process
-reachable from ChatGPT. This package does not provision or authenticate the
-external tunnel. The socket is created with a private directory and `0600`
-endpoint. Native mode exposes only the three fixed DSH broker tools, returns
-text results, and keeps execution in the normal DSH agent loop. Do not put
-credentials, bearer tokens, or profile secrets in this repository or in the
-command above.
+The package does not authenticate or supervise that external tunnel. Existing
+external MCP deployments remain supported; no managed config or account setup
+is required for them.
 
-Before a live native E2E run, align the profile without printing secrets:
+#### 7. Fail-closed and evidence semantics
 
-```sh
-DSH_PROFILE="$HOME/.dsh/profiles/web"
-pnpm --dir "$DSH_PROFILE" add @deepseek-ai/dsh-mcp-client@0.1.2-rc.1
-pnpm --dir "$DSH_PROFILE" add /absolute/path/to/dsh-llm-chatgpt-web
-sha256sum /absolute/path/to/dsh-llm-chatgpt-web/lib/index.js \
-  "$DSH_PROFILE/node_modules/dsh-llm-chatgpt-web/lib/index.js"
-```
+Native mode exposes only `dsh_round_start`, `dsh_tool_inventory`, and
+`dsh_tool_call`. The broker snapshots the current DSH tool schemas, and all
+invocations return to the ordinary DSH `ToolRuntime`/agent loop as standard
+`tool/call` and matching `tool/result` events. No nested agent loop,
+`ctx.tools.execute()`, fenced-text fallback, or prose-to-call inference exists.
 
-Confirm the checksums match, remove/rotate any plaintext profile credentials,
-and prove that the external connector/tunnel is reachable before sending a
-real request. These profile and credential operations are deployment steps,
-not performed by this package's tests.
+Before Send, invalid private files, checksum/version drift, tunnel
+unreadiness, connector-name mismatch, or an incorrectly selected connector
+fail closed. After Send, the adapter never switches transport. A sentence
+claiming that a command ran is not evidence; only the DSH call/result events
+count.
+
+#### 8. Live E2E gate
+
+Do not call native E2E live or successful unless all of these are verified:
+
+1. the exact built candidate is installed in the DSH `web` profile;
+2. DSH MCP/core versions and package checksums are aligned;
+3. `doctor --json` is successful;
+4. the `DSH Native` Personalized connector uses the same tunnel and has
+   Authentication set to None;
+5. visible Chrome is running with `ChatGPT Web High` selected;
+6. a request requiring `bash` proves `pwd` and
+   `git rev-parse --show-toplevel` through actual DSH calls;
+7. the session contains matching `tool/call` and `tool/result` events and at
+   least two agent steps; and
+8. the returned root is the real checkout, not `/` or model-authored prose.
+
+If the account connector, tunnel, aligned artifacts, or session evidence
+cannot be verified, report that blocker and do not claim live native E2E.
+
+#### 9. Credential cleanup
+
+Runtime keys must stay outside this repository, Cordis YAML, prompts, logs,
+screenshots, and session history. Remove temporary source key files and
+rotate any credential that was previously stored in plaintext profile config
+before a live run. The `stop` command does not remove credentials; clean up
+or retain the managed key intentionally and document the remaining risk.
 
 ## V1 scope and limits
 
@@ -267,6 +397,8 @@ Proven against a real Plus-class account (Sep 2026, after the JSON-envelope
 | `src/native/broker-socket.ts` | Private Unix JSON-line RPC transport |
 | `src/native/mcp-server.ts` | Fixed MCP façade and handshake |
 | `src/native/coordinator.ts` | Parked-page/session ownership transitions |
+| `src/native/plugin-runtime.ts` | Broker, tunnel readiness, and unload lifecycle |
 | `src/native/mcp-main.ts` | Stdio MCP executable entry point |
+| `src/native/setup-main.ts` | Managed runtime setup, doctor, and stop executable |
 | `src/adapter.ts` | `ChatGptWebAdapter` (seam, queue, chunk protocol) |
 | `src/index.ts` | Cordis plugin (`registerAdapter(['chatgpt-web'])`) |

@@ -11,7 +11,16 @@
       name: dsh-llm-chatgpt-web
       config:
         headed: true
+        # Existing externally owned MCP runtime:
         # connectorTransport: mcp
+        # connectorRuntime: external
         # connectorName: DSH Native
         # brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
+        # mcpInvocationTimeoutMs: 90000
+        # Managed tunnel-client runtime (replace the block above):
+        # connectorTransport: mcp
+        # connectorRuntime: managed
+        # connectorName: DSH Native
+        # brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
+        # nativeRuntimeConfigPath: ~/.dsh-chatgpt-web/native-runtime.json
         # mcpInvocationTimeoutMs: 90000

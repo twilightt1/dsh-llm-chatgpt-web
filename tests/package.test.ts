@@ -38,10 +38,12 @@ describe('package manifest', () => {
     }
   })
 
-  it('does not require a version-specific runtime call-id brand export', () => {
+  it('does not require a version-specific runtime call-id brand export or ship key-shaped literals', () => {
     const built = readFileSync(join(root, 'lib/index.js'), 'utf8')
     expect(built).not.toMatch(/import \{[^}]*\b(?:CallId|ToolCallId)\b[^}]*\} from ["']@deepseek-ai\/dsh-llm["']/)
-    expect(built).not.toMatch(/sk-[A-Za-z0-9_-]{12,}/)
+    for (const file of ['lib/index.js', 'lib/native-setup-main.js', 'lib/mcp-main.js']) {
+      expect(readFileSync(join(root, file), 'utf8')).not.toMatch(/sk-[A-Za-z0-9_-]{12,}/)
+    }
   })
 
   it('targets a supported node runtime', () => {
