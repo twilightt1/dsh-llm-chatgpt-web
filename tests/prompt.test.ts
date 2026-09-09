@@ -147,6 +147,9 @@ describe('compilePrompt (JSON envelope transport)', () => {
       connectorName: 'DSH Native',
     })
     expect(continuationPrompt).toContain('[Native continuation] The DSH tool call(s) in the JSON context have already been executed.')
+    expect(continuationPrompt).not.toContain('If the task asks about a local repository, files, commands, environment, or any other tool-backed fact, you MUST use the connector before answering.')
+    expect(continuationPrompt).not.toContain('First call dsh_round_start with request_id request_abcdefghijklmnopqrstuvwxyz.')
+    expect(continuationPrompt).toContain('If the original task still needs a tool-backed fact not present in those results')
   })
 
   it('fails loud on unsupported fields instead of dropping them', () => {
