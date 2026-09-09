@@ -56,6 +56,7 @@ describe('managed tunnel command and diagnostics', () => {
   it('redacts tunnel and key-shaped diagnostics', () => {
     const raw = 'tunnel_0123456789abcdef0123456789abcdef sk-exampleSecretValue123456789'
     expect(redactTunnelDetail(raw)).toBe('[tunnel-id] [redacted-key]')
+    expect(redactTunnelDetail('request_abcdefghijklmnopqrstuvwxyz')).toBe('[redacted-request]')
     expect(redactTunnelDetail('x'.repeat(3_000))).toHaveLength(2_000)
   })
 
@@ -124,6 +125,34 @@ describe('ManagedTunnelRuntime', () => {
     ])
     await Promise.all([runtime.stop(), runtime.stop()])
     expect(calls.filter(call => call.args[1] === 'stop')).toHaveLength(1)
+  })
+
+  it('waits for pending startup before issuing stop', async () => {
+    const calls: string[] = []
+    let statusCalls = 0
+    const runtime = new ManagedTunnelRuntime({
+      config: config(),
+      nodeExecutable: '/tmp/node',
+      mcpEntrypoint: '/tmp/mcp.js',
+      brokerSocketPath: '/tmp/broker.sock',
+      run: (_command, args) => {
+        calls.push(args[1] ?? '')
+        if (args[1] === 'connect') return result(JSON.stringify({ running: true, healthy: true, ready: true }))
+        if (args[1] === 'status') {
+          statusCalls += 1
+          return result(JSON.stringify({ process_running: true, healthy: true, ready: statusCalls > 1 }))
+        }
+        return result(JSON.stringify({ stopped: true }))
+      },
+      readyTimeoutMs: 100,
+      pollIntervalMs: 10,
+    })
+
+    const starting = runtime.start()
+    await new Promise(resolve => setImmediate(resolve))
+    const stopping = runtime.stop()
+    await Promise.all([starting, stopping])
+    expect(calls).toEqual(['connect', 'status', 'status', 'stop'])
   })
 
   it('surfaces a redacted transport failure when connect or readiness fails', async () => {

@@ -42,6 +42,7 @@ function textValue(value: unknown): string {
 export function redactTunnelDetail(value: unknown): string {
   return textValue(value)
     .replace(/tunnel_[a-f0-9]{32}/gi, '[tunnel-id]')
+    .replace(/request_[A-Za-z0-9_-]{12,}/g, '[redacted-request]')
     .replace(/sk-[A-Za-z0-9_-]{12,}/g, '[redacted-key]')
     .replace(/Bearer\s+[A-Za-z0-9._~-]{12,}/gi, 'Bearer [redacted-token]')
     .slice(0, MAX_DETAIL_CHARS)
@@ -245,7 +246,11 @@ export class ManagedTunnelRuntime {
   stop(): Promise<void> {
     if (this.stopPromise !== undefined) return this.stopPromise
     if (this.stopIssued && !this.started) return Promise.resolve()
-    const promise = this.stopInternal()
+    const pendingStart = this.startPromise
+    const promise = (async () => {
+      if (pendingStart !== undefined) await pendingStart.catch(() => {})
+      await this.stopInternal()
+    })()
     this.stopPromise = promise
     void promise.then(
       () => { if (this.stopPromise === promise) this.stopPromise = undefined },
