@@ -3,4 +3,5 @@ node_modules/
 *.log
 *.tgz
 lib-cordis.yml
-docs/superpowers/*
+# Internal design/research notes are kept out of the public repository.
+docs/
