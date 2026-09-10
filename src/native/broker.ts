@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import type {
   BrokerCallId,
+  BrokerCompletedTool,
   BrokerRoundSnapshot,
   BrokerToolRequest,
   BrokerToolResult,
@@ -276,6 +277,51 @@ export class NativeToolBroker {
     channel.completed.set(callId, canonical)
     channel.activityRevision += 1
     invocation.resolve(cloneResult(result))
+    this.settleQuiescence(channel)
+  }
+
+  /**
+   * Deliver exactly one visible batch while keeping the broker round running.
+   * Every ID is validated before the first invocation is resolved, so a bad
+   * multi-result handoff cannot leave a partially resumed MCP response.
+   */
+  completeBatch(requestId: string, completed: readonly BrokerCompletedTool[]): void {
+    const channel = this.requireRound(requestId)
+    if (channel.state !== 'running') throw new Error(`native broker round is ${channel.state}`)
+    if (channel.completionRevision !== undefined) throw new Error('native broker round is already complete')
+    const expected = new Set(channel.delivered)
+    if (completed.length !== expected.size) {
+      throw new Error('native broker result batch is missing or contains extra tool calls')
+    }
+    const seen = new Set<BrokerCallId>()
+    const validated: Array<{ item: BrokerCompletedTool; canonical: string; invocation: PendingInvocation }> = []
+    for (const item of completed) {
+      if (seen.has(item.callId)) throw new Error(`duplicate native broker result for ${String(item.callId)}`)
+      seen.add(item.callId)
+      if (!expected.has(item.callId)) throw new Error(`native broker result is not in the delivered batch: ${String(item.callId)}`)
+      const canonical = canonicalResult(item.result)
+      const previous = channel.completed.get(item.callId)
+      if (previous !== undefined) {
+        if (previous !== canonical) throw new Error(`native broker result conflict for ${String(item.callId)}`)
+        throw new Error(`native broker result was already completed: ${String(item.callId)}`)
+      }
+      const invocation = channel.invocations.get(item.callId)
+      if (invocation === undefined) throw new Error(`native broker tool call is not pending: ${String(item.callId)}`)
+      validated.push({ item, canonical, invocation })
+    }
+    for (const callId of expected) {
+      if (!seen.has(callId)) throw new Error(`missing native broker result for ${String(callId)}`)
+    }
+    for (const { item, canonical, invocation } of validated) {
+      channel.invocations.delete(item.callId)
+      const deliveredIndex = channel.delivered.indexOf(item.callId)
+      if (deliveredIndex >= 0) channel.delivered.splice(deliveredIndex, 1)
+      const queuedIndex = channel.queued.indexOf(item.callId)
+      if (queuedIndex >= 0) channel.queued.splice(queuedIndex, 1)
+      channel.completed.set(item.callId, canonical)
+      channel.activityRevision += 1
+      invocation.resolve(cloneResult(item.result))
+    }
     this.settleQuiescence(channel)
   }
 

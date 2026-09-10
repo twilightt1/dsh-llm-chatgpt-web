@@ -55,6 +55,7 @@ interface ParkedHarness {
   coordinator: NativeRoundCoordinator
   parkedRequestId: string
   call: BrokerToolRequest
+  invocation: Promise<unknown>
   cleanup: (mode: 'stop' | 'close') => Promise<void>
   cleanupModes: Array<'stop' | 'close'>
   finishMcpActivity(): void
@@ -81,6 +82,7 @@ async function parkedCoordinatorHarness(sessionId: string, options: { ttlMs?: nu
     coordinator,
     parkedRequestId: first.requestId,
     call,
+    invocation,
     cleanup,
     cleanupModes,
     finishMcpActivity(): void {
@@ -182,6 +184,60 @@ describe('NativeRoundCoordinator', () => {
     expect(second.requestId).not.toBe(first.requestId)
     await second.complete(async mode => { cleanup.push(mode) })
     expect(cleanup).toEqual(['stop', 'close'])
+  })
+
+  it('continues the parked owner on the same broker request without cleanup', async () => {
+    const harness = await parkedCoordinatorHarness('s1')
+    const resumed = harness.coordinator.beginStep({
+      ...stepInput('s1'),
+      continuation: { kind: 'continue' },
+      messages: [toolResultMessage(harness.call.callId, 'done')],
+    })
+    await expect(harness.invocation).resolves.toEqual({
+      content: [{ type: 'text', text: 'done' }], isError: false,
+    })
+    const lease = await resumed
+    expect(lease.requestId).toBe(harness.parkedRequestId)
+    expect(harness.cleanupModes).toEqual([])
+    harness.finishMcpActivity()
+    await lease.complete(harness.cleanup)
+    expect(harness.cleanupModes).toEqual(['close'])
+    await harness.coordinator.dispose()
+  })
+
+  it('keeps a second serial batch on the same broker request', async () => {
+    const harness = await parkedCoordinatorHarness('s1')
+    const firstResumed = harness.coordinator.beginStep({
+      ...stepInput('s1'),
+      continuation: { kind: 'continue' },
+      messages: [toolResultMessage(harness.call.callId, 'first')],
+    })
+    await expect(harness.invocation).resolves.toEqual({
+      content: [{ type: 'text', text: 'first' }], isError: false,
+    })
+    const lease = await firstResumed
+    harness.finishMcpActivity()
+
+    const secondActivity = 'activity_second_abcdefghijklmnop'
+    harness.broker.claimActivity(lease.requestId, secondActivity)
+    const secondInvocation = harness.broker.invoke(lease.requestId, secondActivity, 'write', { path: 'y' })
+    const secondBatch = lease.takeToolBatch(Date.now() + 20)
+    expect(secondBatch).toHaveLength(1)
+    await lease.park(harness.cleanup)
+    const secondResumed = harness.coordinator.beginStep({
+      ...stepInput('s1'),
+      continuation: { kind: 'continue' },
+      messages: [toolResultMessage(secondBatch![0]!.callId, 'second')],
+    })
+    await expect(secondInvocation).resolves.toEqual({
+      content: [{ type: 'text', text: 'second' }], isError: false,
+    })
+    const finalLease = await secondResumed
+    expect(finalLease.requestId).toBe(harness.parkedRequestId)
+    harness.broker.completeActivity(lease.requestId, secondActivity)
+    await finalLease.complete(harness.cleanup)
+    expect(harness.cleanupModes).toEqual(['close'])
+    await harness.coordinator.dispose()
   })
 
   it('owner resume bypasses a queued unrelated session', async () => {

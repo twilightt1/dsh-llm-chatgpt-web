@@ -15,6 +15,12 @@ export interface BrokerToolResult {
   readonly isError: boolean
 }
 
+/** One durable result delivered for a non-terminal broker batch. */
+export interface BrokerCompletedTool {
+  readonly callId: BrokerCallId
+  readonly result: BrokerToolResult
+}
+
 /** Versioned, opaque adapter state carried by a native assistant finish. */
 export interface NativeReplayStateV1 {
   readonly kind: 'chatgpt-web-native'

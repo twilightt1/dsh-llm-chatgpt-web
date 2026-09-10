@@ -42,6 +42,7 @@ interface BeginStepInput {
   readonly ttlMs: number
   readonly invocationTimeoutMs: number
   readonly signal?: AbortSignal
+  readonly continuation?: { readonly kind: 'continue' | 'fresh-replay' }
 }
 
 interface BeginWaiter {
@@ -333,8 +334,18 @@ export class NativeRoundCoordinator {
         throw new Error('native parked round has no pending tool batch to resume')
       }
       const results = correlateToolResults(waiter.input.messages, calls)
-      // Change state before resolving any broker invocation promises. A late
-      // MCP call must observe settlement rather than opening another batch.
+      if (waiter.input.continuation?.kind === 'continue') {
+        this.broker.completeBatch(record.requestId, calls.map((call, index) => ({
+          callId: call.callId,
+          result: results[index]!,
+        })))
+        record.state = 'open'
+        this.resolveWaiter(waiter, record.lease)
+        return
+      }
+      // Fresh replay is terminal for the old physical response. Change state
+      // before resolving any broker invocation promises so a late MCP call
+      // observes settlement rather than opening another batch.
       this.broker.beginSettlement(record.requestId)
       for (const [index, call] of calls.entries()) {
         this.broker.completeTool(record.requestId, call.callId, results[index]!)

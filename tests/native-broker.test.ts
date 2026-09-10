@@ -181,4 +181,52 @@ describe('NativeToolBroker', () => {
     expect(broker.progressRevision(requestId)).toBeGreaterThan(previous)
     broker.close()
   })
+
+  it('delivers a complete batch without terminally settling the round', async () => {
+    const broker = new NativeToolBroker()
+    const requestId = broker.register({
+      sessionId: 's1', tools: [tool], invocationTimeoutMs: 90_000, ttlMs: 1_000,
+    })
+    broker.start(requestId)
+    broker.claimActivity(requestId, activityId)
+    const invocation = broker.invoke(requestId, activityId, 'write', { path: 'x' })
+    const batch = broker.takeToolBatch(requestId, Date.now() + 100)!
+    broker.completeBatch(requestId, [{ callId: batch[0]!.callId, result: ok }])
+    await expect(invocation).resolves.toEqual(ok)
+    expect(broker.start(requestId)).toEqual({ started: true, duplicate: true })
+
+    const nextInvocation = broker.invoke(requestId, activityId, 'write', { path: 'y' })
+    const nextBatch = broker.takeToolBatch(requestId, Date.now() + 100)!
+    expect(nextBatch[0]?.arguments.path).toBe('y')
+    broker.completeBatch(requestId, [{ callId: nextBatch[0]!.callId, result: ok }])
+    await expect(nextInvocation).resolves.toEqual(ok)
+    broker.completeActivity(requestId, activityId)
+    broker.beginSettlement(requestId)
+    broker.close()
+  })
+
+  it('validates every batch result before resolving any invocation', async () => {
+    const broker = new NativeToolBroker()
+    const requestId = broker.register({
+      sessionId: 's1', tools: [tool], invocationTimeoutMs: 90_000, ttlMs: 1_000,
+    })
+    broker.start(requestId)
+    broker.claimActivity(requestId, activityId)
+    const first = broker.invoke(requestId, activityId, 'write', { path: 'a' })
+    const second = broker.invoke(requestId, activityId, 'write', { path: 'b' })
+    const batch = broker.takeToolBatch(requestId, Date.now() + 100)!
+    expect(() => broker.completeBatch(requestId, [
+      { callId: batch[0]!.callId, result: ok },
+      { callId: batch[0]!.callId, result: ok },
+    ])).toThrow(/duplicate/i)
+    const firstState = Promise.race([
+      first.then(() => 'resolved' as const),
+      new Promise<'pending'>(resolve => setTimeout(() => resolve('pending'), 0)),
+    ])
+    expect(await firstState).toBe('pending')
+    broker.revoke(requestId, new Error('test cleanup'))
+    await expect(second).rejects.toThrow(/test cleanup/)
+    await expect(first).rejects.toThrow(/test cleanup/)
+    broker.close()
+  })
 })

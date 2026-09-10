@@ -16,6 +16,11 @@ interface BrokerToolResult {
   readonly content: ContentBlock[];
   readonly isError: boolean;
 }
+/** One durable result delivered for a non-terminal broker batch. */
+interface BrokerCompletedTool {
+  readonly callId: BrokerCallId;
+  readonly result: BrokerToolResult;
+}
 /** Immutable facts captured when one provider round is registered. */
 interface BrokerRoundSnapshot {
   readonly sessionId: string;
@@ -64,6 +69,12 @@ declare class NativeToolBroker {
   takeToolBatch(requestId: string, now?: number): readonly BrokerToolRequest[] | undefined;
   beginSettlement(requestId: string): void;
   completeTool(requestId: string, callId: BrokerCallId, result: BrokerToolResult): void;
+  /**
+   * Deliver exactly one visible batch while keeping the broker round running.
+   * Every ID is validated before the first invocation is resolved, so a bad
+   * multi-result handoff cannot leave a partially resumed MCP response.
+   */
+  completeBatch(requestId: string, completed: readonly BrokerCompletedTool[]): void;
   waitForQuiescence(requestId: string, signal?: AbortSignal): Promise<void>;
   beginCompletionFence(requestId: string): number | undefined;
   commitCompletionFence(requestId: string, revision: number): boolean;
@@ -102,6 +113,9 @@ interface BeginStepInput {
   readonly ttlMs: number;
   readonly invocationTimeoutMs: number;
   readonly signal?: AbortSignal;
+  readonly continuation?: {
+    readonly kind: 'continue' | 'fresh-replay';
+  };
 }
 /**
  * Correlate the durable tool results for one broker batch.
