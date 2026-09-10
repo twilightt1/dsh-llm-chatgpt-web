@@ -10,6 +10,11 @@ export interface BrokerToolRequest {
   readonly arguments: Record<string, unknown>
 }
 
+/** A broker request authorized by the immutable policy round. */
+export interface BrokerAuthorizedToolRequest extends BrokerToolRequest {
+  readonly binding: NativeCallPolicyBinding
+}
+
 /** A DSH tool result held until the model-facing result is available. */
 export interface BrokerToolResult {
   readonly content: ContentBlock[]
@@ -92,10 +97,12 @@ export interface ResolvedNativeSecurityConfig {
 
 export interface NativePolicyRuntimeIdentity {
   readonly adapterVersion: string
+  readonly connectorTransport?: ConnectorTransport
   readonly connectorRuntime: ConnectorRuntime
   readonly connectorName: string
   readonly brokerSocketPath: string
   readonly nativeRuntimeConfigPath: string
+  readonly mcpInvocationTimeoutMs?: number
   readonly managedTunnelClient?: { readonly version: string; readonly sha256: string }
 }
 
@@ -164,6 +171,8 @@ export interface PreparedNativeRound {
 
 export interface PreparedNativeRequest {
   readonly providerOptions: GenerateOptions
+  /** Project newly emitted assistant history into the provider-safe view. */
+  readonly projectProviderMessages: (messages: readonly Message[]) => readonly Message[]
   readonly policyHash: string
   readonly inventoryHash: string
   readonly approvalHash: string
@@ -183,12 +192,16 @@ export interface CompiledNativeSecurityPolicy {
 }
 
 /** JSON-RPC request/response values used by the private broker socket. */
+export type BrokerRpcErrorCode = 'NATIVE_POLICY_DENIED' | 'BROKER_FAILURE'
+
 export interface BrokerRpcError {
+  readonly code: BrokerRpcErrorCode
   readonly message: string
+  readonly releaseRound: boolean
 }
 
 export interface BrokerRpcResponse<T = unknown> {
   readonly id: string
   readonly result?: T
-  readonly error?: string
+  readonly error?: BrokerRpcError
 }

@@ -125,7 +125,8 @@ describe('CompiledNativeSecurityPolicy', () => {
     expect(Object.isFrozen(prepared.providerOptions)).toBe(true)
     expect(Object.isFrozen(prepared.providerOptions.messages)).toBe(true)
     expect(Object.isFrozen(prepared.providerOptions.tools)).toBe(true)
-    expect(prepared.nativeRound).toBeUndefined()
+    expect(prepared.nativeRound?.coordinatorSnapshot.broker.tools).toEqual(original.tools)
+    expect(prepared.nativeRound?.coordinatorSnapshot.canonicalMessages).toEqual(original.messages)
   })
 
   it('filters secure tools in original inventory order and handles empty effective inventory', () => {
@@ -141,6 +142,13 @@ describe('CompiledNativeSecurityPolicy', () => {
     const prepared = compiled.prepareRequest(request(), runtime)
     expect(prepared.providerOptions.tools?.map(tool => tool.name)).toEqual(['read_file', 'search'])
     expect(prepared.summary.tools.map(tool => tool.tool)).toEqual(['read_file', 'search'])
+    expect(prepared.nativeRound?.coordinatorSnapshot.broker.tools).toEqual(prepared.providerOptions.tools)
+    const authorized = prepared.nativeRound?.openRound().authorizeInvocation('read_file', { path: 'README.md' }, 1)
+    expect(authorized).toMatchObject({
+      allowed: true,
+      arguments: { path: expect.stringMatching(/README\.md$/) },
+      binding: { toolName: 'read_file', capability: 'workspace.read', resultPolicy: 'text', callOrdinal: 1 },
+    })
     expect(prepared.inventoryHash).toMatch(/^[a-f0-9]{64}$/)
     expect(prepared.approvalHash).toMatch(/^[a-f0-9]{64}$/)
 
@@ -150,6 +158,42 @@ describe('CompiledNativeSecurityPolicy', () => {
     }, existingWorkspace), []).prepareRequest(request(), runtime)
     expect(empty.providerOptions.tools).toEqual([])
     expect(empty.summary.tools).toEqual([])
+  })
+
+  it('projects secure history while retaining raw coordinator messages', () => {
+    const config = resolveNativeSecurityConfig({
+      toolPolicy: 'evidence-only',
+      rules: [{ tool: 'read_file', capability: 'workspace.read', pathArguments: ['/path'] }],
+    }, existingWorkspace)
+    const compiled = compileNativeSecurityPolicy(config, [])
+    const callId = 'history-call' as never
+    const assistant: Message = {
+      id: MessageId('history-assistant'),
+      role: 'assistant',
+      content: [{ type: 'tool-call', id: callId, name: 'read_file', arguments: JSON.stringify({ path: `${existingWorkspace}/README.md` }) }],
+      source: { kind: 'model', provider: 'chatgpt-web', model: 'chatgpt-web/high' },
+    }
+    const result: Message = {
+      id: MessageId('history-result'),
+      role: 'user',
+      content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: 'evidence' }], isError: false }],
+      source: { kind: 'tool', callId },
+    }
+    const prepared = compiled.prepareRequest(request({
+      tools: [readTool],
+      messages: [user, assistant, result],
+    }), runtime)
+    const providerAssistant = prepared.providerOptions.messages[1]
+    expect(providerAssistant?.content[0]).toMatchObject({ type: 'tool-call', arguments: JSON.stringify({ path: 'README.md' }) })
+    expect(prepared.nativeRound?.coordinatorSnapshot.canonicalMessages[1]?.content[0])
+      .toMatchObject({ type: 'tool-call', arguments: JSON.stringify({ path: `${existingWorkspace}/README.md` }) })
+    expect(prepared.providerOptions.messages[2]).toMatchObject({
+      content: [{ type: 'tool-result', content: [{ type: 'text', text: 'evidence' }], isError: false }],
+    })
+    expect(() => compiled.prepareRequest(request({
+      tools: [readTool],
+      messages: [user, { ...result, id: MessageId('orphan') }],
+    }), runtime)).toThrow(/safely|orphan|history/i)
   })
 
   it('rejects duplicate actual schemas and keeps auxiliary secure requests tool-free', () => {

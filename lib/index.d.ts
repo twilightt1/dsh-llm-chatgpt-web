@@ -84,10 +84,12 @@ interface ResolvedNativeSecurityConfig {
 }
 interface NativePolicyRuntimeIdentity {
   readonly adapterVersion: string;
+  readonly connectorTransport?: ConnectorTransport;
   readonly connectorRuntime: ConnectorRuntime;
   readonly connectorName: string;
   readonly brokerSocketPath: string;
   readonly nativeRuntimeConfigPath: string;
+  readonly mcpInvocationTimeoutMs?: number;
   readonly managedTunnelClient?: {
     readonly version: string;
     readonly sha256: string;
@@ -152,6 +154,8 @@ interface PreparedNativeRound {
 }
 interface PreparedNativeRequest {
   readonly providerOptions: GenerateOptions;
+  /** Project newly emitted assistant history into the provider-safe view. */
+  readonly projectProviderMessages: (messages: readonly Message[]) => readonly Message[];
   readonly policyHash: string;
   readonly inventoryHash: string;
   readonly approvalHash: string;
@@ -159,13 +163,16 @@ interface PreparedNativeRequest {
   readonly nativeRound?: PreparedNativeRound;
 }
 /** JSON-RPC request/response values used by the private broker socket. */
+type BrokerRpcErrorCode = 'NATIVE_POLICY_DENIED' | 'BROKER_FAILURE';
 interface BrokerRpcError {
+  readonly code: BrokerRpcErrorCode;
   readonly message: string;
+  readonly releaseRound: boolean;
 }
 interface BrokerRpcResponse<T = unknown> {
   readonly id: string;
   readonly result?: T;
-  readonly error?: string;
+  readonly error?: BrokerRpcError;
 }
 //#endregion
 //#region src/native/broker.d.ts
@@ -181,6 +188,7 @@ declare class NativeToolBroker {
   private closed;
   register(input: BrokerRoundSnapshot & {
     readonly ttlMs: number;
+    readonly policyRound?: NativePolicyRound;
   }): string;
   /** Renew the inactivity lease while the owning browser round is polling. */
   touch(requestId: string): void;
@@ -234,11 +242,13 @@ interface NativeStepLease {
   fail(cleanup: NativeRoundCleanup, cause: Error): Promise<void>;
 }
 interface BeginStepInput {
-  readonly sessionId: string;
-  readonly messages: readonly Message[];
-  readonly tools: readonly ToolSchema[];
+  readonly snapshot?: NativeCoordinatorSnapshot;
+  readonly openPolicyRound?: () => NativePolicyRound;
+  readonly sessionId?: string;
+  readonly messages?: readonly Message[];
+  readonly tools?: readonly ToolSchema[];
   readonly ttlMs: number;
-  readonly invocationTimeoutMs: number;
+  readonly invocationTimeoutMs?: number;
   readonly signal?: AbortSignal;
   readonly continuation?: {
     readonly kind: 'continue' | 'fresh-replay';
@@ -347,6 +357,7 @@ interface ChatGptWebAdapterOptions {
     readonly coordinator: NativeRoundCoordinator;
     readonly ready: Promise<void>;
     readonly assertConnection: (connection: ChatGptWebConnectionOptions) => void;
+    readonly prepareRequest?: (options: GenerateOptions, connection: ChatGptWebConnectionOptions) => PreparedNativeRequest;
   };
 }
 /**

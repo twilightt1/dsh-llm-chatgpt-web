@@ -5,6 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import * as z from 'zod/v4'
 import type { ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { BrokerRpcClient } from './broker-socket.ts'
+import { NativePolicyDeniedError } from './errors.ts'
 import type { BrokerRoundSnapshot, BrokerToolResult } from './types.ts'
 import { createBrokerRpcClient } from './broker-socket.ts'
 
@@ -35,12 +36,13 @@ function logRequest(operation: string, requestId: string, extra = ''): void {
 }
 
 function errorText(error: unknown): string {
+  if (error instanceof NativePolicyDeniedError) return `${error.code}: ${error.message}`
   return error instanceof Error ? error.message : String(error)
 }
 
 function errorResult(error: unknown): { content: [{ type: 'text'; text: string }]; isError: true } {
   return {
-    content: [{ type: 'text', text: errorText(error) }],
+    content: [{ type: 'text', text: errorText(error).slice(0, 2_000) }],
     isError: true,
   }
 }
@@ -197,6 +199,7 @@ export function createDshNativeMcpServer(client: BrokerRpcClient): McpServer {
           )
           return mcpContent(result)
         } catch (error) {
+          if (error instanceof NativePolicyDeniedError) return errorResult(error)
           await client.release(request_id).catch(() => {})
           startedRequests.delete(request_id)
           throw error

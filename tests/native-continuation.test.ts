@@ -3,6 +3,7 @@ import { MessageId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import {
   decideNativeContinuation,
+  hasExactNativeToolResults,
   nativeExecutionKey,
   nativeReplayState,
   parseNativeReplayState,
@@ -101,6 +102,46 @@ describe('native execution identity', () => {
     expect(nativeExecutionKey(request({ temperature: 0.8 }))).not.toBe(first)
     expect(nativeExecutionKey(request({ maxTokens: 513 }))).not.toBe(first)
     expect(nativeExecutionKey(request({ stop: ['different'] }))).not.toBe(first)
+  })
+
+  it('binds provider and canonical continuation views to policy identity', () => {
+    const identity = { policyHash: 'a'.repeat(64), inventoryHash: 'b'.repeat(64), approvalHash: 'c'.repeat(64) }
+    const canonicalCall: BrokerToolRequest = { ...call, arguments: { path: '/workspace/x' } }
+    const canonicalAssistant: Message = {
+      ...assistant,
+      content: [{ type: 'tool-call', id: canonicalCall.callId, name: canonicalCall.name, arguments: JSON.stringify(canonicalCall.arguments) }],
+    }
+    const providerAssistant: Message = {
+      ...canonicalAssistant,
+      content: [{ type: 'tool-call', id: canonicalCall.callId, name: canonicalCall.name, arguments: JSON.stringify({ path: 'x' }) }],
+    }
+    const canonical = request({ messages: [user] })
+    const provider = request({ messages: [user] })
+    const parked: ParkedContinuationClaim = {
+      sessionId: 'session-1',
+      executionKey: nativeExecutionKey(provider, identity),
+      requestKey: nativeExecutionKey(provider, identity),
+      policyHash: identity.policyHash,
+      inventoryHash: identity.inventoryHash,
+      approvalHash: identity.approvalHash,
+      request: provider,
+      canonicalRequest: canonical,
+      assistantMessage: providerAssistant,
+      canonicalAssistantMessage: canonicalAssistant,
+      providerPendingCalls: [{ ...canonicalCall, arguments: { path: 'x' } }],
+      pendingCalls: [canonicalCall],
+      physicalAvailable: true,
+      durableResults: false,
+      uncertainOutcome: false,
+    }
+    const providerResult = resultMessage()
+    const canonicalResult = resultMessage()
+    expect(decideNativeContinuation(parked, provider, identity)).toMatchObject({ kind: 'fail' })
+    expect(decideNativeContinuation(parked, { ...provider, messages: [user, providerAssistant, providerResult] }, identity))
+      .toEqual({ kind: 'continue', results: [{ content: [{ type: 'text', text: 'done' }], isError: false }] })
+    expect(hasExactNativeToolResults(parked, { ...canonical, messages: [user, canonicalAssistant, canonicalResult] })).toBe(true)
+    expect(decideNativeContinuation(parked, { ...provider, messages: [user, providerAssistant, providerResult] }, { ...identity, approvalHash: 'd'.repeat(64) }))
+      .toMatchObject({ kind: 'fail', code: 'POLICY_MISMATCH' })
   })
 
   it('round-trips only the versioned replay envelope', () => {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import type { ToolSchema } from '@deepseek-ai/dsh-llm'
+import { NativePolicyDeniedError } from '../src/native/errors.ts'
 import { createDshNativeMcpServer } from '../src/native/mcp-server.ts'
 import type { BrokerRpcClient } from '../src/native/broker-socket.ts'
 import type { BrokerRoundSnapshot, BrokerToolResult } from '../src/native/types.ts'
@@ -45,6 +46,7 @@ class FakeBrokerRpcClient implements BrokerRpcClient {
   readonly released: string[] = []
   pending = deferred<BrokerToolResult>()
   rejectInvocations = false
+  denyInvocations = false
 
   async start(): Promise<{ started: true; duplicate: boolean }> {
     const duplicate = this.started
@@ -64,6 +66,7 @@ class FakeBrokerRpcClient implements BrokerRpcClient {
 
   async invoke(_requestId: string, _activityId: string, name: string, args: Record<string, unknown>): Promise<BrokerToolResult> {
     this.invocations.push({ name, args })
+    if (this.denyInvocations) throw new NativePolicyDeniedError('native policy denied')
     if (this.rejectInvocations) throw new Error('timeout')
     return await this.pending.promise
   }
@@ -160,6 +163,34 @@ describe('DSH native MCP façade', () => {
         arguments: { request_id: requestId, wire_name: 'write', arguments: 'not an object' },
       })).resolves.toMatchObject({ isError: true })
       expect(fake.invocations).toHaveLength(0)
+    } finally {
+      await client.close()
+      await server.close()
+    }
+  })
+
+  it('returns policy denials without releasing the handshake or queueing a DSH batch', async () => {
+    const fake = new FakeBrokerRpcClient()
+    fake.denyInvocations = true
+    const { client, server } = await connectedServer(fake)
+    try {
+      await client.callTool({ name: 'dsh_round_start', arguments: { request_id: requestId } })
+      await expect(client.callTool({
+        name: 'dsh_tool_call',
+        arguments: { request_id: requestId, wire_name: 'write', arguments: { path: '../escape' } },
+      })).resolves.toMatchObject({ isError: true, content: [{ text: expect.stringContaining('NATIVE_POLICY_DENIED') }] })
+      expect(fake.released).toEqual([])
+      expect(fake.activities.size).toBe(0)
+
+      fake.denyInvocations = false
+      const pending = client.callTool({
+        name: 'dsh_tool_call',
+        arguments: { request_id: requestId, wire_name: 'write', arguments: { path: 'ok' } },
+      })
+      await vi.waitFor(() => expect(fake.invocations).toHaveLength(2))
+      fake.pending.resolve({ content: [{ type: 'text', text: 'ok' }], isError: false })
+      await expect(pending).resolves.toMatchObject({ content: [{ type: 'text', text: 'ok' }] })
+      expect(fake.released).toEqual([])
     } finally {
       await client.close()
       await server.close()

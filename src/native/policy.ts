@@ -1,7 +1,9 @@
-import { homedir } from 'node:os'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
-import type { GenerateOptions, ToolSchema } from '@deepseek-ai/dsh-llm'
-import { hashCanonical } from './canonical.ts'
+import { homedir } from 'node:os'
+import type { ContentBlock, GenerateOptions, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
+import { canonicalJson, hashCanonical } from './canonical.ts'
+import { NativeSafetyError } from './errors.ts'
+import { projectNativeToolResult } from './result-sanitizer.ts'
 import { createWorkspaceBoundary } from './workspace-boundary.ts'
 import type {
   CompiledNativeSecurityPolicy,
@@ -9,6 +11,10 @@ import type {
   NativeCapability,
   NativeEffectiveCapability,
   NativeEffectiveResultPolicy,
+  NativeCallPolicyBinding,
+  NativeCoordinatorSnapshot,
+  NativeInvocationDecision,
+  NativePolicyRound,
   NativePolicyRuntimeIdentity,
   NativePolicySummary,
   NativeResultPolicy,
@@ -16,7 +22,9 @@ import type {
   NativeToolPolicy,
   NativeToolRuleConfig,
   PreparedNativeRequest,
+  PreparedNativeRound,
   ResolvedNativeSecurityConfig,
+  BrokerToolResult,
   ResolvedNativeToolRule,
 } from './types.ts'
 
@@ -209,6 +217,10 @@ function assertRuntime(runtime: NativePolicyRuntimeIdentity): void {
     throw new Error('native security runtime adapterVersion must be non-empty')
   }
   if (CONTROL_BYTES.test(runtime.adapterVersion)) throw new Error('native security runtime adapterVersion contains a control byte')
+  if (runtime.connectorTransport !== undefined
+    && runtime.connectorTransport !== 'text' && runtime.connectorTransport !== 'mcp') {
+    throw new Error('native security runtime connectorTransport is invalid')
+  }
   if (runtime.connectorRuntime !== 'external' && runtime.connectorRuntime !== 'managed') {
     throw new Error('native security runtime connectorRuntime is invalid')
   }
@@ -217,6 +229,9 @@ function assertRuntime(runtime: NativePolicyRuntimeIdentity): void {
   }
   assertSafePath(runtime.brokerSocketPath, 'runtime brokerSocketPath')
   assertSafePath(runtime.nativeRuntimeConfigPath, 'runtime nativeRuntimeConfigPath')
+  if (runtime.mcpInvocationTimeoutMs !== undefined) {
+    assertBoundedInteger(runtime.mcpInvocationTimeoutMs, 'runtime mcpInvocationTimeoutMs', 1, 2_147_483_647)
+  }
   if (!isAbsolute(runtime.brokerSocketPath) || !isAbsolute(runtime.nativeRuntimeConfigPath)) {
     throw new Error('native security runtime paths must be absolute')
   }
@@ -263,6 +278,167 @@ function effectiveTools(
   if (config.toolPolicy === 'full') return tools
   const allowed = new Set(config.rules.map(rule => rule.tool))
   return tools.filter(tool => allowed.has(tool.name))
+}
+
+function detachedArguments(args: Record<string, unknown>): Readonly<Record<string, unknown>> {
+  if (!isRecord(args)) throw new Error('native tool arguments must be an object')
+  return deepFreeze(structuredClone(args)) as Readonly<Record<string, unknown>>
+}
+
+function policyDenial(message: string): NativeInvocationDecision {
+  return { allowed: false, code: 'NATIVE_POLICY_DENIED', message }
+}
+
+function policyRoundFor(
+  config: ResolvedNativeSecurityConfig,
+  boundary: ReturnType<typeof createWorkspaceBoundary> | undefined,
+  tools: readonly ToolSchema[],
+): NativePolicyRound {
+  const toolSnapshot = deepFreeze(structuredClone(tools)) as readonly ToolSchema[]
+  const schemas = new Map(toolSnapshot.map(tool => [tool.name, tool]))
+  const schemaHashes = new Map(toolSnapshot.map(tool => [
+    tool.name,
+    hashCanonical('native-tool-schema', NATIVE_POLICY_FORMAT_VERSION, tool),
+  ]))
+  const rules = new Map(config.rules.map(rule => [rule.tool, rule]))
+
+  const authorizeInvocation = (
+    tool: string,
+    args: Record<string, unknown>,
+    callOrdinal: number,
+  ): NativeInvocationDecision => {
+    if (typeof tool !== 'string' || schemas.has(tool) === false) {
+      return policyDenial('native policy denied this tool invocation')
+    }
+    if (!Number.isSafeInteger(callOrdinal) || callOrdinal < 1) {
+      return policyDenial('native policy denied an invalid call ordinal')
+    }
+    const schemaHash = schemas.get(tool) === undefined ? undefined : schemaHashes.get(tool)
+    if (schemaHash === undefined) return policyDenial('native policy denied this tool invocation')
+    try {
+      if (config.toolPolicy === 'full') {
+        const argumentsValue = detachedArguments(args)
+        return {
+          allowed: true,
+          arguments: argumentsValue,
+          binding: deepFreeze({
+            toolName: tool,
+            capability: 'full-unrestricted' as const,
+            resultPolicy: 'raw-unbounded' as const,
+            schemaHash,
+            argumentsHash: hashCanonical('native-tool-arguments', 1, argumentsValue),
+            callOrdinal,
+            pathArguments: Object.freeze([]),
+          }),
+        }
+      }
+      const rule = rules.get(tool)
+      if (rule === undefined || boundary === undefined) {
+        return policyDenial('native policy denied this tool invocation')
+      }
+      const rewritten = rule.pathArguments.length === 0
+        ? { arguments: detachedArguments(args), argumentsHash: hashCanonical('native-tool-arguments', 1, args) }
+        : boundary.rewriteArguments(args, rule.pathArguments)
+      return {
+        allowed: true,
+        arguments: rewritten.arguments,
+        binding: deepFreeze({
+          toolName: tool,
+          capability: rule.capability,
+          resultPolicy: rule.result,
+          schemaHash,
+          argumentsHash: rewritten.argumentsHash,
+          callOrdinal,
+          pathArguments: Object.freeze([...rule.pathArguments]),
+        }),
+      }
+    } catch {
+      // Do not return a path, argument, or filesystem detail to the provider.
+      return policyDenial('native policy denied this tool invocation')
+    }
+  }
+
+  const projectResult = (binding: NativeCallPolicyBinding, result: BrokerToolResult): BrokerToolResult => {
+    const schemaHash = schemaHashes.get(binding.toolName)
+    if (schemaHash === undefined || schemaHash !== binding.schemaHash) {
+      throw new Error('native policy binding schema is not part of this round')
+    }
+    if (config.toolPolicy === 'full') {
+      if (binding.capability !== 'full-unrestricted' || binding.resultPolicy !== 'raw-unbounded') {
+        throw new Error('native policy full binding is invalid')
+      }
+      return structuredClone(result)
+    }
+    const rule = rules.get(binding.toolName)
+    if (rule === undefined || binding.capability !== rule.capability || binding.resultPolicy !== rule.result) {
+      throw new Error('native policy binding is no longer valid')
+    }
+    return projectNativeToolResult(result, {
+      resultPolicy: rule.result,
+      maxBytes: config.evidenceLimits.maxBytes,
+      maxLines: config.evidenceLimits.maxLines,
+      homeDirectory: homedir(),
+    })
+  }
+
+  return Object.freeze({ authorizeInvocation, projectResult })
+}
+
+function projectSecureMessages(
+  messages: readonly Message[],
+  round: NativePolicyRound,
+  boundary: ReturnType<typeof createWorkspaceBoundary>,
+): readonly Message[] {
+  const projected = structuredClone(messages) as Message[]
+  const bindings = new Map<string, NativeCallPolicyBinding>()
+  const seenCallIds = new Set<string>()
+  let callOrdinal = 1
+  try {
+    for (const message of projected) {
+      for (const block of message.content) {
+        if (block.type === 'tool-call') {
+          if (message.role !== 'assistant') throw new Error('tool call is not in an assistant message')
+          const callId = String(block.id)
+          if (seenCallIds.has(callId)) throw new Error('tool call id is duplicated')
+          let parsed: unknown
+          try { parsed = JSON.parse(block.arguments) } catch { throw new Error('tool call arguments are not JSON') }
+          if (!isRecord(parsed)) throw new Error('tool call arguments are not an object')
+          const decision = round.authorizeInvocation(block.name, parsed, callOrdinal)
+          if (!decision.allowed) throw new Error('historical tool call is not authorized')
+          const providerArguments = decision.binding.pathArguments.length === 0
+            ? decision.arguments
+            : boundary.rebaseProviderArguments(decision.arguments, decision.binding.pathArguments)
+          block.arguments = canonicalJson(providerArguments)
+          bindings.set(callId, decision.binding)
+          seenCallIds.add(callId)
+          callOrdinal += 1
+        }
+      }
+      const resultBlocks = message.content.filter(block => block.type === 'tool-result')
+      if (resultBlocks.length > 0) {
+        if (message.source.kind !== 'tool' || message.content.length !== 1 || resultBlocks.length !== 1) {
+          throw new Error('historical tool result identity is malformed')
+        }
+        const block = resultBlocks[0]!
+        if (block.type !== 'tool-result' || String(block.toolCallId) !== String(message.source.callId)) {
+          throw new Error('historical tool result identity is malformed')
+        }
+        const binding = bindings.get(String(block.toolCallId))
+        if (binding === undefined) throw new Error('historical tool result is orphaned')
+        const projectedResult = round.projectResult(binding, {
+          content: structuredClone(block.content),
+          isError: block.isError === true,
+        })
+        block.content = structuredClone(projectedResult.content) as ContentBlock[]
+        block.isError = projectedResult.isError
+        bindings.delete(String(block.toolCallId))
+      }
+    }
+  } catch (error) {
+    if (error instanceof NativeSafetyError) throw error
+    throw new NativeSafetyError('native provider history could not be safely projected', error, 'NATIVE_HISTORY_PROJECTION')
+  }
+  return deepFreeze(projected)
 }
 
 function summaryFor(
@@ -349,16 +525,51 @@ export function compileNativeSecurityPolicy(
         policyHash,
         inventoryHash,
         adapterVersion: runtime.adapterVersion,
+        connectorTransport: runtime.connectorTransport,
         connectorRuntime: runtime.connectorRuntime,
         connectorName: runtime.connectorName,
         managedTunnelClient: runtime.managedTunnelClient,
       })
+      const projectProviderMessages = configSnapshot.toolPolicy === 'full'
+        ? (messages: readonly Message[]): readonly Message[] => deepFreeze(structuredClone(messages))
+        : (messages: readonly Message[]): readonly Message[] => projectSecureMessages(
+          messages,
+          policyRoundFor(configSnapshot, workspaceBoundary, inventoryTools),
+          workspaceBoundary!,
+        )
+      const projectedMessages = projectProviderMessages(options.messages)
+      const providerInput = { ...options, messages: [...projectedMessages] }
+      const nativeRound: PreparedNativeRound | undefined = !secureAuxiliary
+        && (configSnapshot.toolPolicy === 'full' || inventoryTools.length > 0)
+        && options.sessionId !== undefined
+        ? (() => {
+            const sessionId = String(options.sessionId)
+            const coordinatorSnapshot: NativeCoordinatorSnapshot = deepFreeze({
+              sessionId,
+              canonicalMessages: structuredClone(options.messages),
+              broker: {
+                sessionId,
+                tools: structuredClone(inventoryTools),
+                invocationTimeoutMs: runtime.mcpInvocationTimeoutMs ?? 90_000,
+              },
+              policyHash,
+              inventoryHash,
+              approvalHash,
+            })
+            return Object.freeze({
+              coordinatorSnapshot,
+              openRound: () => policyRoundFor(configSnapshot, workspaceBoundary, inventoryTools),
+            })
+          })()
+        : undefined
       return deepFreeze({
-        providerOptions: cloneGenerateOptions(options, providerTools),
+        providerOptions: cloneGenerateOptions(providerInput, providerTools),
+        projectProviderMessages,
         policyHash,
         inventoryHash,
         approvalHash,
         summary: summaryFor(configSnapshot, runtime, inventoryTools, workspaceBoundary?.canonicalRoot),
+        ...(nativeRound === undefined ? {} : { nativeRound }),
       })
     },
   }

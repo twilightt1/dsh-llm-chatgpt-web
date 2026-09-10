@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url'
 import { realpathSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import type { ChatGptWebConnectionOptions } from '../adapter.ts'
+import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { NativeBrokerSocketServer } from './broker-socket.ts'
 import { NativeToolBroker } from './broker.ts'
 import { NativeRoundCoordinator } from './coordinator.ts'
@@ -15,6 +16,8 @@ import {
   ManagedTunnelRuntime,
 } from './tunnel-runtime.ts'
 import type { CommandRunner } from './process.ts'
+import { compileNativeSecurityPolicy } from './policy.ts'
+import type { PreparedNativeRequest, NativePolicyRuntimeIdentity } from './types.ts'
 
 export interface NativeRuntimeIdentity {
   readonly connectorTransport: ChatGptWebConnectionOptions['connectorTransport']
@@ -25,12 +28,15 @@ export interface NativeRuntimeIdentity {
   readonly mcpInvocationTimeoutMs: number
 }
 
+const NATIVE_POLICY_ADAPTER_VERSION = '0.7.0'
+
 export interface NativePluginRuntime {
   readonly broker: NativeToolBroker
   readonly socket: NativeBrokerSocketServer
   readonly coordinator: NativeRoundCoordinator
   readonly ready: Promise<void>
   assertConnection(connection: ChatGptWebConnectionOptions): void
+  prepareRequest(options: GenerateOptions, connection: ChatGptWebConnectionOptions): PreparedNativeRequest
   quiesce(): Promise<void>
   close(): Promise<void>
 }
@@ -128,10 +134,12 @@ export function createNativePluginRuntime(
   const runtimeIdentity = identity(connection)
   const loadConfig = dependencies.loadConfig ?? loadManagedNativeRuntimeConfig
   let managed: TunnelRuntimeLike | undefined
+  let managedConfig: ManagedNativeRuntimeConfig | undefined
   let configurationError: ManagedRuntimeConfigurationError | undefined
   if (connection.connectorRuntime === 'managed') {
     try {
       const config = loadConfig(connection.nativeRuntimeConfigPath, { connectorName: connection.connectorName })
+      managedConfig = config
       managed = makeRuntime(dependencies, config, connection)
     } catch (error) {
       configurationError = configurationFailure(error)
@@ -151,6 +159,7 @@ export function createNativePluginRuntime(
   const assertConnection = (current: ChatGptWebConnectionOptions): void => {
     const next = identity(current)
     const changes: string[] = []
+    if (next.connectorTransport !== runtimeIdentity.connectorTransport) changes.push('connector transport')
     if (next.connectorRuntime !== runtimeIdentity.connectorRuntime) changes.push('connector runtime')
     if (next.connectorName !== runtimeIdentity.connectorName) changes.push('connector name')
     if (next.brokerSocketPath !== runtimeIdentity.brokerSocketPath) changes.push('broker socket')
@@ -159,6 +168,35 @@ export function createNativePluginRuntime(
     if (changes.length > 0) {
       throw new ManagedRuntimeConfigurationError(`native runtime identity changed: ${changes.join(', ')}`)
     }
+  }
+  const prepareRequest = (options: GenerateOptions, current: ChatGptWebConnectionOptions): PreparedNativeRequest => {
+    assertConnection(current)
+    const policyRuntime: NativePolicyRuntimeIdentity = {
+      adapterVersion: NATIVE_POLICY_ADAPTER_VERSION,
+      connectorTransport: current.connectorTransport,
+      connectorRuntime: current.connectorRuntime,
+      connectorName: current.connectorName,
+      brokerSocketPath: current.brokerSocketPath,
+      nativeRuntimeConfigPath: current.nativeRuntimeConfigPath,
+      mcpInvocationTimeoutMs: current.mcpInvocationTimeoutMs,
+      ...(managedConfig === undefined ? {} : {
+        managedTunnelClient: {
+          version: managedConfig.tunnelClient.version,
+          sha256: managedConfig.tunnelClient.sha256,
+        },
+      }),
+    }
+    const privatePaths = [
+      current.profileDir,
+      current.nativeRuntimeConfigPath,
+      current.brokerSocketPath,
+      ...(managedConfig === undefined ? [] : [
+        managedConfig.tunnelClient.path,
+        managedConfig.tunnel.runtimeKeyFile,
+        managedConfig.tunnel.profileDir,
+      ]),
+    ]
+    return compileNativeSecurityPolicy(current.nativeSecurity, privatePaths).prepareRequest(options, policyRuntime)
   }
   const quiesce = (): Promise<void> => {
     if (quiescePromise !== undefined) return quiescePromise
@@ -189,6 +227,7 @@ export function createNativePluginRuntime(
     coordinator,
     ready,
     assertConnection,
+    prepareRequest,
     quiesce,
     close,
   }

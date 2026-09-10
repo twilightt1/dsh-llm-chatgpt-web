@@ -9,7 +9,11 @@ import { tmpdir } from 'node:os'
 import type { ToolSchema } from '@deepseek-ai/dsh-llm'
 import { NativeToolBroker } from '../src/native/broker.ts'
 import { createBrokerRpcClient, NativeBrokerSocketServer } from '../src/native/broker-socket.ts'
-import type { BrokerToolResult } from '../src/native/types.ts'
+import type {
+  BrokerToolResult,
+  NativeInvocationDecision,
+  NativePolicyRound,
+} from '../src/native/types.ts'
 
 const tool: ToolSchema = {
   name: 'write',
@@ -85,6 +89,59 @@ describe('NativeBrokerSocketServer', () => {
       broker.completeTool(requestId, call!.callId, ok)
       await expect(result).resolves.toEqual(ok)
       await rpc.completeActivity(requestId, activityId)
+    } finally {
+      await server.close()
+      broker.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('returns non-releasing policy denials and keeps the same request usable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-socket-'))
+    chmodSync(root, 0o700)
+    const socketPath = join(root, 'broker.sock')
+    const broker = new NativeToolBroker()
+    let deny = true
+    const policy: NativePolicyRound = {
+      authorizeInvocation(name, _args, ordinal): NativeInvocationDecision {
+        if (deny) return { allowed: false, code: 'NATIVE_POLICY_DENIED', message: 'native policy denied' }
+        return {
+          allowed: true,
+          arguments: {},
+          binding: Object.freeze({
+            toolName: name,
+            capability: 'workspace.read',
+            resultPolicy: 'text',
+            schemaHash: 'a'.repeat(64),
+            argumentsHash: 'b'.repeat(64),
+            callOrdinal: ordinal,
+            pathArguments: Object.freeze([]),
+          }),
+        }
+      },
+      projectResult(_binding, result) { return result },
+    }
+    const server = new NativeBrokerSocketServer(socketPath, broker)
+    await server.listen()
+    try {
+      const client = createBrokerRpcClient(socketPath)
+      const requestId = broker.register({
+        sessionId: 's1', tools: [tool], invocationTimeoutMs: 1_000, ttlMs: 1_000, policyRound: policy,
+      })
+      await client.start(requestId)
+      await client.claim(requestId, activityId)
+      await expect(client.invoke(requestId, activityId, 'write', { path: '../escape' }, 1_000))
+        .rejects.toMatchObject({ code: 'NATIVE_POLICY_DENIED', releaseRound: false })
+      expect(broker.takeToolBatch(requestId, Date.now() + 100)).toBeUndefined()
+      deny = false
+      const pending = client.invoke(requestId, activityId, 'write', { path: 'ok' }, 1_000)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      const call = broker.takeToolBatch(requestId, Date.now() + 100)?.[0]
+      expect(call).toBeDefined()
+      broker.completeTool(requestId, call!.callId, ok)
+      await expect(pending).resolves.toEqual(ok)
+      await client.completeActivity(requestId, activityId)
+      await client.release(requestId)
     } finally {
       await server.close()
       broker.close()
@@ -194,7 +251,11 @@ describe('NativeBrokerSocketServer', () => {
     const socket = createConnection(socketPath)
     socket.write(`${'x'.repeat(33)}\n`)
     const [data] = await once(socket, 'data') as [Buffer]
-    expect(JSON.parse(data.toString()).error).toMatch(/too large|json/i)
+    expect(JSON.parse(data.toString()).error).toMatchObject({
+      code: 'BROKER_FAILURE',
+      releaseRound: true,
+      message: expect.stringMatching(/too large|json/i),
+    })
     socket.destroy()
     await server.close()
     broker.close()

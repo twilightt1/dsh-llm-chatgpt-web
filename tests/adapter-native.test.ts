@@ -98,7 +98,8 @@ import { ManagedRuntimeTransportError } from '../src/native/tunnel-runtime.ts'
 import { NativeRoundCoordinator } from '../src/native/coordinator.ts'
 import { NativeToolBroker } from '../src/native/broker.ts'
 import { resolveAdapterOptions } from '../src/index.ts'
-import type { Message, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, Message, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { PreparedNativeRequest } from '../src/native/types.ts'
 
 const tool: ToolSchema = {
   name: 'write',
@@ -318,6 +319,50 @@ describe('native adapter lifecycle', () => {
     expect(fixtures.browser.ensureReady).not.toHaveBeenCalled()
     expect(fixtures.browser.newTurnPage).not.toHaveBeenCalled()
     await adapter.dispose()
+  })
+
+  it('prepares secure auxiliary calls once and compiles only the tool-free provider view', async () => {
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'external',
+      profileDir: '/tmp/dsh-native-adapter-title-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-title-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const prepareRequest = vi.fn((request: GenerateOptions): PreparedNativeRequest => ({
+      providerOptions: { ...request, tools: [] },
+      projectProviderMessages: messages => structuredClone(messages),
+      policyHash: 'a'.repeat(64),
+      inventoryHash: 'b'.repeat(64),
+      approvalHash: 'c'.repeat(64),
+      summary: {
+        toolPolicy: 'allowlist',
+        workspaceRoot: '/tmp/workspace',
+        workspaceRootSource: 'explicit',
+        connectorName: 'DSH Native',
+        connectorRuntime: 'external',
+        approval: 'none',
+        tools: [],
+        evidenceLimits: { maxBytes: 65_536, maxLines: 200 },
+      },
+    }))
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {}, prepareRequest },
+    })
+
+    await collect(adapter.stream(input('title-prepared', [tool], 'session-title')))
+    expect(prepareRequest).toHaveBeenCalledTimes(1)
+    const compileCalls = fixtures.compile.mock.calls as unknown as Array<[GenerateOptions, number, string | undefined, unknown]>
+    const compileOptions = compileCalls[0]?.[0]
+    expect(compileOptions?.tools).toEqual([])
+    expect(compileCalls[0]?.[3]).toBeUndefined()
+    const streamCall = (fixtures.stream.mock.calls as unknown as Array<[unknown, { surface?: unknown }]>)[0]
+    expect(streamCall?.[1]).toMatchObject({ surface: 'temporary' })
+    await adapter.dispose()
+    broker.close()
   })
 
   it.each(['session-title', 'compaction'] as const)('does not reserve a native round for %s model calls', async (purpose) => {

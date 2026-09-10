@@ -1,10 +1,13 @@
 import { createHash, randomBytes } from 'node:crypto'
+import { NativePolicyDeniedError } from './errors.ts'
 import type {
   BrokerCallId,
   BrokerCompletedTool,
   BrokerRoundSnapshot,
   BrokerToolRequest,
   BrokerToolResult,
+  NativeCallPolicyBinding,
+  NativePolicyRound,
 } from './types.ts'
 
 const BATCH_WINDOW_MS = 15
@@ -31,7 +34,7 @@ function makeDeferred<T>(): Deferred<T> {
 type RoundState = 'awaiting_start' | 'running' | 'settling'
 
 interface PendingInvocation {
-  readonly request: BrokerToolRequest
+  readonly request: BrokerToolRequest & { readonly binding?: NativeCallPolicyBinding }
   readonly resolve: (result: BrokerToolResult) => void
   readonly reject: (error: Error) => void
 }
@@ -45,6 +48,7 @@ interface Waiter<T> {
 interface RoundChannel {
   state: RoundState
   readonly snapshot: BrokerRoundSnapshot
+  readonly policyRound: NativePolicyRound | undefined
   readonly queued: BrokerCallId[]
   readonly delivered: BrokerCallId[]
   readonly invocations: Map<BrokerCallId, PendingInvocation>
@@ -58,6 +62,7 @@ interface RoundChannel {
   expires: ReturnType<typeof setTimeout>
   readonly ttlMs: number
   batchReadyAt: number | undefined
+  authorizedCallOrdinal: number
 }
 
 function opaqueId(prefix: 'request' | 'call'): string {
@@ -105,7 +110,7 @@ export class NativeToolBroker {
   private readonly retired = new Map<string, true>()
   private closed = false
 
-  register(input: BrokerRoundSnapshot & { readonly ttlMs: number }): string {
+  register(input: BrokerRoundSnapshot & { readonly ttlMs: number; readonly policyRound?: NativePolicyRound }): string {
     if (this.closed) throw new Error('native tool broker is closed')
     if (!Number.isSafeInteger(input.ttlMs) || input.ttlMs <= 0 || input.ttlMs > MAX_TIMER_MS) {
       throw new Error(`native broker TTL must be a positive safe integer no greater than ${MAX_TIMER_MS}`)
@@ -129,6 +134,7 @@ export class NativeToolBroker {
     const channel: RoundChannel = {
       state: 'awaiting_start',
       snapshot,
+      policyRound: input.policyRound,
       queued: [],
       delivered: [],
       invocations: new Map(),
@@ -142,6 +148,7 @@ export class NativeToolBroker {
       expires,
       ttlMs: input.ttlMs,
       batchReadyAt: undefined,
+      authorizedCallOrdinal: 1,
     }
     this.rounds.set(requestId, channel)
     return requestId
@@ -212,20 +219,39 @@ export class NativeToolBroker {
     if (channel.completionRevision !== undefined) return Promise.reject(new Error('native broker round is complete'))
     if (!channel.activities.has(activityId)) return Promise.reject(new Error('native broker activity is not claimed'))
     if (!channel.snapshot.tools.some(tool => tool.name === name)) {
-      return Promise.reject(new Error(`native broker tool is not advertised: ${name}`))
+      return Promise.reject(channel.policyRound === undefined
+        ? new Error(`native broker tool is not advertised: ${name}`)
+        : new NativePolicyDeniedError(`native broker tool is not advertised: ${name}`))
     }
     if (args === null || typeof args !== 'object' || Array.isArray(args)) {
       return Promise.reject(new Error('native broker tool arguments must be an object'))
     }
+
+    let authorizedArguments: Readonly<Record<string, unknown>> = args
+    let binding: NativeCallPolicyBinding | undefined
+    if (channel.policyRound !== undefined) {
+      let decision
+      try {
+        decision = channel.policyRound.authorizeInvocation(name, args, channel.authorizedCallOrdinal)
+      } catch (error) {
+        return Promise.reject(error)
+      }
+      if (!decision.allowed) return Promise.reject(new NativePolicyDeniedError(decision.message))
+      authorizedArguments = decision.arguments
+      binding = decision.binding
+    }
+
     const callId = opaqueId('call') as BrokerCallId
-    const request: BrokerToolRequest = deepFreeze({
+    const request = deepFreeze({
       callId,
       name,
-      arguments: structuredClone(args),
-    })
+      arguments: structuredClone(authorizedArguments),
+      ...(binding === undefined ? {} : { binding }),
+    }) as BrokerToolRequest & { readonly binding?: NativeCallPolicyBinding }
     return new Promise<BrokerToolResult>((resolve, reject) => {
       channel.invocations.set(callId, { request, resolve, reject })
       channel.queued.push(callId)
+      channel.authorizedCallOrdinal += 1
       channel.activityRevision += 1
       channel.batchReadyAt ??= Date.now() + BATCH_WINDOW_MS
     })
@@ -269,6 +295,9 @@ export class NativeToolBroker {
     }
     const invocation = channel.invocations.get(callId)
     if (invocation === undefined) throw new Error(`native broker tool call is not pending: ${String(callId)}`)
+    const projected = channel.policyRound === undefined || invocation.request.binding === undefined
+      ? cloneResult(result)
+      : channel.policyRound.projectResult(invocation.request.binding, result)
     channel.invocations.delete(callId)
     const deliveredIndex = channel.delivered.indexOf(callId)
     if (deliveredIndex >= 0) channel.delivered.splice(deliveredIndex, 1)
@@ -276,7 +305,7 @@ export class NativeToolBroker {
     if (queuedIndex >= 0) channel.queued.splice(queuedIndex, 1)
     channel.completed.set(callId, canonical)
     channel.activityRevision += 1
-    invocation.resolve(cloneResult(result))
+    invocation.resolve(cloneResult(projected))
     this.settleQuiescence(channel)
   }
 
@@ -294,7 +323,7 @@ export class NativeToolBroker {
       throw new Error('native broker result batch is missing or contains extra tool calls')
     }
     const seen = new Set<BrokerCallId>()
-    const validated: Array<{ item: BrokerCompletedTool; canonical: string; invocation: PendingInvocation }> = []
+    const validated: Array<{ item: BrokerCompletedTool; canonical: string; projected: BrokerToolResult; invocation: PendingInvocation }> = []
     for (const item of completed) {
       if (seen.has(item.callId)) throw new Error(`duplicate native broker result for ${String(item.callId)}`)
       seen.add(item.callId)
@@ -307,12 +336,15 @@ export class NativeToolBroker {
       }
       const invocation = channel.invocations.get(item.callId)
       if (invocation === undefined) throw new Error(`native broker tool call is not pending: ${String(item.callId)}`)
-      validated.push({ item, canonical, invocation })
+      const projected = channel.policyRound === undefined || invocation.request.binding === undefined
+        ? cloneResult(item.result)
+        : channel.policyRound.projectResult(invocation.request.binding, item.result)
+      validated.push({ item, canonical, projected, invocation })
     }
     for (const callId of expected) {
       if (!seen.has(callId)) throw new Error(`missing native broker result for ${String(callId)}`)
     }
-    for (const { item, canonical, invocation } of validated) {
+    for (const { item, canonical, projected, invocation } of validated) {
       channel.invocations.delete(item.callId)
       const deliveredIndex = channel.delivered.indexOf(item.callId)
       if (deliveredIndex >= 0) channel.delivered.splice(deliveredIndex, 1)
@@ -320,7 +352,7 @@ export class NativeToolBroker {
       if (queuedIndex >= 0) channel.queued.splice(queuedIndex, 1)
       channel.completed.set(item.callId, canonical)
       channel.activityRevision += 1
-      invocation.resolve(cloneResult(item.result))
+      invocation.resolve(cloneResult(projected))
     }
     this.settleQuiescence(channel)
   }

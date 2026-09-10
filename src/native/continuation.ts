@@ -7,6 +7,12 @@ import type {
 } from './types.ts'
 
 /** Reasons for which a complete canonical fresh request is safe to submit. */
+export interface NativeContinuationIdentity {
+  readonly policyHash: string
+  readonly inventoryHash: string
+  readonly approvalHash: string
+}
+
 export type NativeFreshReplayReason =
   | 'context-added'
   | 'steering'
@@ -22,8 +28,17 @@ export interface ParkedContinuationClaim {
   readonly executionKey: string
   /** Fingerprint of the logical request prefix represented by `request`. */
   readonly requestKey?: string
+  readonly policyHash?: string
+  readonly inventoryHash?: string
+  readonly approvalHash?: string
   readonly request: GenerateOptions
+  /** Raw canonical DSH request retained only for durable-result equality proof. */
+  readonly canonicalRequest?: GenerateOptions
+  /** Canonical DSH assistant calls used for durable-result correlation. */
+  readonly canonicalAssistantMessage?: Message
+  /** Provider-visible assistant calls used for sanitized continuation matching. */
   readonly assistantMessage: Message
+  readonly providerPendingCalls?: readonly BrokerToolRequest[]
   readonly pendingCalls: readonly BrokerToolRequest[]
   readonly physicalAvailable: boolean
   readonly durableResults: boolean
@@ -90,8 +105,21 @@ function toolProjection(options: GenerateOptions): unknown {
  * IDs, abort signals, and adapter-private replay metadata are deliberately
  * excluded; the hash is safe to carry as opaque routing state.
  */
-export function nativeExecutionKey(options: GenerateOptions): string {
-  return hashCanonical('native-execution', 1, requestProjection(options))
+function assertContinuationIdentity(identity: NativeContinuationIdentity): void {
+  for (const [name, value] of Object.entries(identity)) {
+    if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+      throw new Error(`native continuation ${name} identity is invalid`)
+    }
+  }
+}
+
+export function nativeExecutionKey(options: GenerateOptions, identity?: NativeContinuationIdentity): string {
+  if (identity === undefined) return hashCanonical('native-execution', 1, requestProjection(options))
+  assertContinuationIdentity(identity)
+  return hashCanonical('native-execution', 1, {
+    request: requestProjection(options),
+    identity,
+  })
 }
 
 function assertReplayArguments(executionKey: string, boundary: number, callIds: readonly string[]): void {
@@ -191,11 +219,12 @@ export function hasExactNativeToolResults(
   claim: ParkedContinuationClaim,
   options: GenerateOptions,
 ): boolean {
-  const baseLength = claim.request.messages.length
+  const canonicalRequest = claim.canonicalRequest ?? claim.request
+  const baseLength = canonicalRequest.messages.length
   const incomingAssistant = options.messages[baseLength]
   if (incomingAssistant === undefined
-    || !sameMessages(options.messages.slice(0, baseLength), claim.request.messages)
-    || !sameMessages([incomingAssistant], [claim.assistantMessage])
+    || !sameMessages(options.messages.slice(0, baseLength), canonicalRequest.messages)
+    || !sameMessages([incomingAssistant], [claim.canonicalAssistantMessage ?? claim.assistantMessage])
     || !assistantCallsMatch(incomingAssistant, claim.pendingCalls)) return false
   const resultMessages = options.messages.slice(baseLength + 1)
   if (resultMessages.length < claim.pendingCalls.length) return false
@@ -221,12 +250,37 @@ function extraTailReason(messages: readonly Message[]): NativeFreshReplayReason 
 export function decideNativeContinuation(
   claim: ParkedContinuationClaim,
   options: GenerateOptions,
+  identity?: NativeContinuationIdentity,
 ): NativeContinuationDecision {
   if (!/^[a-f0-9]{64}$/.test(claim.executionKey)) {
     return failure('INVALID_REPLAY_STATE', 'native parked response has an invalid execution identity')
   }
-  const requestKey = claim.requestKey ?? nativeExecutionKey(claim.request)
-  if (requestKey !== nativeExecutionKey(claim.request)) {
+  const claimIdentityFields = [claim.policyHash, claim.inventoryHash, claim.approvalHash]
+  const claimIdentityCount = claimIdentityFields.filter(value => value !== undefined).length
+  if (claimIdentityCount !== 0 && claimIdentityCount !== claimIdentityFields.length) {
+    return failure('INVALID_REPLAY_STATE', 'native parked response has an incomplete policy identity')
+  }
+  const claimIdentity = claimIdentityCount === 0
+    ? undefined
+    : {
+        policyHash: claim.policyHash!,
+        inventoryHash: claim.inventoryHash!,
+        approvalHash: claim.approvalHash!,
+      }
+  if (identity !== undefined && claimIdentity === undefined) {
+    return failure('POLICY_MISMATCH', 'native parked response has no matching policy identity')
+  }
+  if (claimIdentity !== undefined && identity === undefined) {
+    return failure('POLICY_MISMATCH', 'native parked response has no matching policy identity')
+  }
+  if (claimIdentity !== undefined && identity !== undefined
+    && (claimIdentity.policyHash !== identity.policyHash
+      || claimIdentity.inventoryHash !== identity.inventoryHash
+      || claimIdentity.approvalHash !== identity.approvalHash)) {
+    return failure('POLICY_MISMATCH', 'native parked response belongs to a different native policy round')
+  }
+  const requestKey = claim.requestKey ?? nativeExecutionKey(claim.request, claimIdentity)
+  if (requestKey !== nativeExecutionKey(claim.request, claimIdentity)) {
     return failure('INVALID_REPLAY_STATE', 'native parked response has an invalid logical request identity')
   }
   if (String(options.sessionId ?? '') !== claim.sessionId) {
@@ -263,7 +317,7 @@ export function decideNativeContinuation(
     }
     return failure('HISTORY_MISMATCH', 'native continuation history does not contain the emitted assistant tool-call message')
   }
-  if (!assistantCallsMatch(incomingAssistant, claim.pendingCalls)) {
+  if (!assistantCallsMatch(incomingAssistant, claim.providerPendingCalls ?? claim.pendingCalls)) {
     return failure('CALL_MISMATCH', 'native continuation assistant tool calls do not match the parked broker calls')
   }
 

@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { resolveAdapterOptions } from '../src/index.ts'
 import { NativeToolBroker } from '../src/native/broker.ts'
+import type { GenerateOptions, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { NativeBrokerSocketServer } from '../src/native/broker-socket.ts'
 import type { NativeRoundCoordinator } from '../src/native/coordinator.ts'
 import type { ManagedNativeRuntimeConfig } from '../src/native/runtime-config.ts'
@@ -97,6 +98,33 @@ describe('native plugin runtime composition', () => {
     expect(dependencies.loadConfig).toHaveBeenCalledTimes(1)
     expect(dependencies.createTunnel).toHaveBeenCalledTimes(1)
     void broker
+  })
+
+  it('prepares detached native requests with an immutable coordinator round', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-plugin-'))
+    const log: string[] = []
+    const { dependencies } = fakes(log)
+    const initial = await connection(root, false)
+    const stack = createNativePluginRuntime(initial, dependencies)
+    const tool: ToolSchema = { name: 'read', description: 'read', parameters: { type: 'object' } }
+    const request: GenerateOptions = {
+      provider: 'chatgpt-web',
+      model: 'chatgpt-web/high',
+      messages: [],
+      tools: [tool],
+      sessionId: 's1' as never,
+    }
+    const prepared = stack.prepareRequest(request, initial)
+    expect(prepared.providerOptions).not.toBe(request)
+    expect(prepared.providerOptions.tools).not.toBe(request.tools)
+    expect(prepared.nativeRound?.coordinatorSnapshot.broker.tools).toEqual([tool])
+    expect(prepared.nativeRound?.coordinatorSnapshot).toMatchObject({
+      sessionId: 's1',
+      policyHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      inventoryHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      approvalHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    })
+    await stack.close()
   })
 
   it('does not create a tunnel for externally owned MCP mode', async () => {

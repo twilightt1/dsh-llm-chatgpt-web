@@ -3,8 +3,10 @@ import { existsSync, chmodSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs
 import { createConnection, createServer } from 'node:net'
 import type { Server, Socket } from 'node:net'
 import { dirname, isAbsolute } from 'node:path'
+import { NativePolicyDeniedError } from './errors.ts'
 import type {
   BrokerRoundSnapshot,
+  BrokerRpcError,
   BrokerRpcResponse,
   BrokerToolResult,
 } from './types.ts'
@@ -32,6 +34,18 @@ function rpcId(): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function boundedErrorMessage(error: unknown): string {
+  const normalized = errorMessage(error).replace(/[\u0000-\u001f\u007f]/g, '�')
+  return normalized.length <= 2_000 ? normalized : `${normalized.slice(0, 1_997)}...`
+}
+
+function rpcError(error: unknown): BrokerRpcError {
+  if (error instanceof NativePolicyDeniedError) {
+    return { code: 'NATIVE_POLICY_DENIED', message: boundedErrorMessage(error), releaseRound: false }
+  }
+  return { code: 'BROKER_FAILURE', message: boundedErrorMessage(error), releaseRound: true }
 }
 
 function abortError(message: string): DOMException {
@@ -263,14 +277,14 @@ export class NativeBrokerSocketServer {
       if (newline < 0) {
         if (buffered.length > this.maxLineBytes) {
           settled = true
-          this.writeResponse(socket, { id: 'unknown', error: 'native broker request line is too large' })
+          this.writeResponse(socket, { id: 'unknown', error: rpcError(new Error('native broker request line is too large')) })
         }
         return
       }
       settled = true
       const line = buffered.subarray(0, newline)
       if (line.length > this.maxLineBytes) {
-        this.writeResponse(socket, { id: 'unknown', error: 'native broker request line is too large' })
+        this.writeResponse(socket, { id: 'unknown', error: rpcError(new Error('native broker request line is too large')) })
         return
       }
       let request: BrokerRpcRequest
@@ -279,12 +293,12 @@ export class NativeBrokerSocketServer {
         this.validateRequest(parsed)
         request = parsed
       } catch (error) {
-        this.writeResponse(socket, { id: 'unknown', error: errorMessage(error) })
+        this.writeResponse(socket, { id: 'unknown', error: rpcError(error) })
         return
       }
       void this.dispatch(request, disconnected.signal).then(
         result => this.writeResponse(socket, { id: request.id, result }),
-        error => this.writeResponse(socket, { id: request.id, error: errorMessage(error) }),
+        error => this.writeResponse(socket, { id: request.id, error: rpcError(error) }),
       )
     })
   }
@@ -293,7 +307,7 @@ export class NativeBrokerSocketServer {
     if (socket.destroyed) return
     const line = `${JSON.stringify(response)}\n`
     if (Buffer.byteLength(line) > this.maxLineBytes) {
-      socket.end(`${JSON.stringify({ id: response.id, error: 'native broker response is too large' })}\n`)
+      socket.end(`${JSON.stringify({ id: response.id, error: rpcError(new Error('native broker response is too large')) })}\n`)
       return
     }
     socket.end(line)
@@ -451,14 +465,30 @@ export function createBrokerRpcClient(socketPath: string): BrokerRpcClient {
           const hasResult = Object.hasOwn(parsed, 'result')
           const hasError = Object.hasOwn(parsed, 'error')
           if (hasResult === hasError) throw new Error('native broker RPC response must contain exactly one result or error')
+          if (hasError) {
+            const rpc = parsed.error
+            if (!isRecord(rpc) || (rpc.code !== 'NATIVE_POLICY_DENIED' && rpc.code !== 'BROKER_FAILURE')
+              || typeof rpc.message !== 'string' || typeof rpc.releaseRound !== 'boolean'
+              || (rpc.code === 'NATIVE_POLICY_DENIED' && rpc.releaseRound !== false)
+              || (rpc.code === 'BROKER_FAILURE' && rpc.releaseRound !== true)) {
+              throw new Error('native broker RPC error payload is invalid')
+            }
+          }
           response = parsed as unknown as BrokerRpcResponse<T>
         } catch (error) {
           finishReject(new Error(errorMessage(error)))
           socket.destroy()
           return
         }
-        if (response.error !== undefined) finishReject(new Error(response.error))
-        else finishResolve(response.result as T)
+        if (response.error !== undefined) {
+          if (response.error.code === 'NATIVE_POLICY_DENIED') {
+            finishReject(new NativePolicyDeniedError(response.error.message))
+          } else {
+            const failure = new Error(response.error.message)
+            Object.assign(failure, { code: response.error.code, releaseRound: response.error.releaseRound })
+            finishReject(failure)
+          }
+        } else finishResolve(response.result as T)
         socket.destroy()
       })
       socket.once('error', error => {
@@ -511,7 +541,7 @@ export function createBrokerRpcClient(socketPath: string): BrokerRpcClient {
         }
         return result as unknown as BrokerToolResult
       } catch (error) {
-        await release(requestId).catch(() => {})
+        if (!(error instanceof NativePolicyDeniedError)) await release(requestId).catch(() => {})
         throw error
       }
     },

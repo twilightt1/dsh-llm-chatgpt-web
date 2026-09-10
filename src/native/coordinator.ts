@@ -1,7 +1,13 @@
 import { contentHasImage } from '@deepseek-ai/dsh-llm'
 import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
+import { canonicalJson } from './canonical.ts'
 import { NativeToolBroker } from './broker.ts'
-import type { BrokerToolRequest, BrokerToolResult } from './types.ts'
+import type {
+  BrokerToolRequest,
+  BrokerToolResult,
+  NativeCoordinatorSnapshot,
+  NativePolicyRound,
+} from './types.ts'
 
 /** Cleanup owned by one browser turn; stop preserves the page until close follows. */
 export type NativeRoundCleanup = (mode: 'stop' | 'close') => Promise<void>
@@ -36,17 +42,27 @@ function makeDeferred<T>(): Deferred<T> {
 }
 
 interface BeginStepInput {
-  readonly sessionId: string
-  readonly messages: readonly Message[]
-  readonly tools: readonly ToolSchema[]
+  readonly snapshot?: NativeCoordinatorSnapshot
+  readonly openPolicyRound?: () => NativePolicyRound
+  readonly sessionId?: string
+  readonly messages?: readonly Message[]
+  readonly tools?: readonly ToolSchema[]
   readonly ttlMs: number
-  readonly invocationTimeoutMs: number
+  readonly invocationTimeoutMs?: number
+  readonly signal?: AbortSignal
+  readonly continuation?: { readonly kind: 'continue' | 'fresh-replay' }
+}
+
+interface NormalizedBeginStepInput {
+  readonly snapshot: NativeCoordinatorSnapshot
+  readonly openPolicyRound?: () => NativePolicyRound
+  readonly ttlMs: number
   readonly signal?: AbortSignal
   readonly continuation?: { readonly kind: 'continue' | 'fresh-replay' }
 }
 
 interface BeginWaiter {
-  readonly input: BeginStepInput
+  readonly input: NormalizedBeginStepInput
   readonly deferred: Deferred<NativeStepLease>
   onAbort?: () => void
 }
@@ -73,6 +89,7 @@ class RoundRecord {
   constructor(
     readonly sessionId: string,
     readonly requestId: string,
+    readonly snapshot: NativeCoordinatorSnapshot,
     hooks: NativeLeaseHooks,
   ) {
     this.lease = new NativeLease(this, hooks)
@@ -126,6 +143,58 @@ export function correlateToolResults(
     if (result === undefined) throw new Error(`missing tool result for ${key}`)
     return result
   })
+}
+
+function normalizeBeginStepInput(input: BeginStepInput): NormalizedBeginStepInput {
+  if (input.snapshot !== undefined) {
+    if (input.snapshot.sessionId.length === 0 || input.snapshot.broker.sessionId !== input.snapshot.sessionId) {
+      throw new Error('native coordinator snapshot session identity is invalid')
+    }
+    if (input.openPolicyRound !== undefined && typeof input.openPolicyRound !== 'function') {
+      throw new Error('native coordinator policy-round factory is invalid')
+    }
+    return {
+      snapshot: input.snapshot,
+      ...(input.openPolicyRound === undefined ? {} : { openPolicyRound: input.openPolicyRound }),
+      ttlMs: input.ttlMs,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      ...(input.continuation === undefined ? {} : { continuation: input.continuation }),
+    }
+  }
+  if (input.sessionId === undefined || input.messages === undefined || input.tools === undefined
+    || input.invocationTimeoutMs === undefined) {
+    throw new Error('native coordinator requires a prepared snapshot')
+  }
+  if (input.sessionId.length === 0) throw new Error('native coordinator sessionId must be non-empty')
+  const sessionId = input.sessionId
+  const snapshot: NativeCoordinatorSnapshot = Object.freeze({
+    sessionId,
+    canonicalMessages: Object.freeze(structuredClone(input.messages)),
+    broker: Object.freeze({
+      sessionId,
+      tools: Object.freeze(structuredClone(input.tools)),
+      invocationTimeoutMs: input.invocationTimeoutMs,
+    }),
+    policyHash: '',
+    inventoryHash: '',
+    approvalHash: '',
+  })
+  return {
+    snapshot,
+    ttlMs: input.ttlMs,
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    ...(input.continuation === undefined ? {} : { continuation: input.continuation }),
+  }
+}
+
+function sameRoundSnapshot(left: NativeCoordinatorSnapshot, right: NativeCoordinatorSnapshot): boolean {
+  return left.sessionId === right.sessionId
+    && left.broker.sessionId === right.broker.sessionId
+    && left.broker.invocationTimeoutMs === right.broker.invocationTimeoutMs
+    && left.policyHash === right.policyHash
+    && left.inventoryHash === right.inventoryHash
+    && left.approvalHash === right.approvalHash
+    && canonicalJson(left.broker.tools) === canonicalJson(right.broker.tools)
 }
 
 class NativeLease implements NativeStepLease {
@@ -213,9 +282,15 @@ export class NativeRoundCoordinator {
 
   beginStep(input: BeginStepInput): Promise<NativeStepLease> {
     if (this.disposed) return Promise.reject(new Error('native round coordinator is disposed'))
-    if (input.signal?.aborted) return Promise.reject(new DOMException('native step wait aborted', 'AbortError'))
+    let normalized: NormalizedBeginStepInput
+    try {
+      normalized = normalizeBeginStepInput(input)
+    } catch (error) {
+      return Promise.reject(error)
+    }
+    if (normalized.signal?.aborted) return Promise.reject(new DOMException('native step wait aborted', 'AbortError'))
     const deferred = makeDeferred<NativeStepLease>()
-    const waiter: BeginWaiter = { input, deferred }
+    const waiter: BeginWaiter = { input: normalized, deferred }
     if (input.signal !== undefined) {
       const onAbort = (): void => {
         const index = this.waiters.indexOf(waiter)
@@ -266,7 +341,7 @@ export class NativeRoundCoordinator {
           continue
         }
         if (current.state === 'parked') {
-          const index = this.waiters.findIndex(waiter => waiter.input.sessionId === current.sessionId)
+          const index = this.waiters.findIndex(waiter => waiter.input.snapshot.sessionId === current.sessionId)
           if (index < 0) return
           const [waiter] = this.waiters.splice(index, 1)
           if (waiter === undefined) return
@@ -288,7 +363,7 @@ export class NativeRoundCoordinator {
     return waiter
   }
 
-  private createRecord(sessionId: string, requestId: string): RoundRecord {
+  private createRecord(sessionId: string, requestId: string, snapshot: NativeCoordinatorSnapshot): RoundRecord {
     let record!: RoundRecord
     const hooks: NativeLeaseHooks = {
       broker: this.broker,
@@ -304,19 +379,18 @@ export class NativeRoundCoordinator {
       complete: cleanup => this.finish(record, 'close', cleanup),
       fail: (cleanup, cause) => this.finish(record, 'stop', cleanup, cause),
     }
-    record = new RoundRecord(sessionId, requestId, hooks)
+    record = new RoundRecord(sessionId, requestId, snapshot, hooks)
     return record
   }
 
   private async grant(waiter: BeginWaiter): Promise<void> {
     try {
       const requestId = this.broker.register({
-        sessionId: waiter.input.sessionId,
-        tools: waiter.input.tools,
+        ...waiter.input.snapshot.broker,
         ttlMs: waiter.input.ttlMs,
-        invocationTimeoutMs: waiter.input.invocationTimeoutMs,
+        ...(waiter.input.openPolicyRound === undefined ? {} : { policyRound: waiter.input.openPolicyRound() }),
       })
-      const record = this.createRecord(waiter.input.sessionId, requestId)
+      const record = this.createRecord(waiter.input.snapshot.sessionId, requestId, waiter.input.snapshot)
       this.reservation = record
       this.watchRetirement(record)
       this.resolveWaiter(waiter, record.lease)
@@ -329,11 +403,14 @@ export class NativeRoundCoordinator {
     record.state = 'transitioning'
     record.resumeWaiter = waiter
     try {
+      if (!sameRoundSnapshot(record.snapshot, waiter.input.snapshot)) {
+        throw new Error('native parked round policy snapshot changed before continuation')
+      }
       const calls = record.lease.takeToolBatch()
       if (calls === undefined || calls.length === 0) {
         throw new Error('native parked round has no pending tool batch to resume')
       }
-      const results = correlateToolResults(waiter.input.messages, calls)
+      const results = correlateToolResults(waiter.input.snapshot.canonicalMessages, calls)
       if (waiter.input.continuation?.kind === 'continue') {
         this.broker.completeBatch(record.requestId, calls.map((call, index) => ({
           callId: call.callId,
@@ -362,15 +439,14 @@ export class NativeRoundCoordinator {
     }
   }
 
-  private async registerFresh(input: BeginStepInput): Promise<NativeStepLease> {
+  private async registerFresh(input: NormalizedBeginStepInput): Promise<NativeStepLease> {
     if (this.disposed) throw new Error('native round coordinator is disposed')
     const requestId = this.broker.register({
-      sessionId: input.sessionId,
-      tools: input.tools,
+      ...input.snapshot.broker,
       ttlMs: input.ttlMs,
-      invocationTimeoutMs: input.invocationTimeoutMs,
+      ...(input.openPolicyRound === undefined ? {} : { policyRound: input.openPolicyRound() }),
     })
-    const record = this.createRecord(input.sessionId, requestId)
+    const record = this.createRecord(input.snapshot.sessionId, requestId, input.snapshot)
     this.reservation = record
     this.watchRetirement(record)
     return record.lease
@@ -443,7 +519,7 @@ export class NativeRoundCoordinator {
   private rejectQueuedSession(sessionId: string, error: Error): void {
     for (let index = this.waiters.length - 1; index >= 0; index -= 1) {
       const waiter = this.waiters[index]
-      if (waiter?.input.sessionId !== sessionId) continue
+      if (waiter?.input.snapshot.sessionId !== sessionId) continue
       this.waiters.splice(index, 1)
       this.rejectWaiter(waiter, error)
     }

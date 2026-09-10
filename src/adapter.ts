@@ -31,6 +31,7 @@ import type {
   BrokerToolRequest,
   ConnectorRuntime,
   ConnectorTransport,
+  PreparedNativeRequest,
   ResolvedNativeSecurityConfig,
 } from './native/types.ts'
 export type { ConnectorRuntime, ConnectorTransport } from './native/types.ts'
@@ -62,7 +63,7 @@ import {
   nativeExecutionKey,
   parseNativeReplayState,
 } from './native/continuation.ts'
-import type { ParkedContinuationClaim } from './native/continuation.ts'
+import type { NativeContinuationIdentity, ParkedContinuationClaim } from './native/continuation.ts'
 import { createNativePhysicalResponse } from './native/physical-response.ts'
 import type {
   NativePhysicalResponse,
@@ -199,6 +200,7 @@ export interface ChatGptWebAdapterOptions {
     readonly coordinator: NativeRoundCoordinator
     readonly ready: Promise<void>
     readonly assertConnection: (connection: ChatGptWebConnectionOptions) => void
+    readonly prepareRequest?: (options: GenerateOptions, connection: ChatGptWebConnectionOptions) => PreparedNativeRequest
   }
 }
 
@@ -287,10 +289,33 @@ function nativeToolFinish(chunks: readonly StreamChunk[]): boolean {
   return chunks.some(chunk => chunk.type === 'finish' && chunk.reason.kind === 'tool-calls')
 }
 
+function nativeMessageCalls(message: Message): BrokerToolRequest[] {
+  const calls: BrokerToolRequest[] = []
+  for (const block of message.content) {
+    if (block.type !== 'tool-call') continue
+    let parsed: unknown
+    try { parsed = JSON.parse(block.arguments) } catch (error) {
+      throw new LlmError('Native projected assistant tool-call arguments are not valid JSON.', 'PROVIDER_ERROR', { cause: error })
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new LlmError('Native projected assistant tool-call arguments are not an object.', 'PROVIDER_ERROR')
+    }
+    calls.push({
+      callId: block.id,
+      name: block.name,
+      arguments: structuredClone(parsed) as Record<string, unknown>,
+    })
+  }
+  return calls
+}
+
 function nativeClaim(
   options: GenerateOptions,
   response: NativePhysicalResponse,
   chunks: readonly StreamChunk[],
+  canonicalOptions: GenerateOptions = options,
+  projectProviderMessages?: (messages: readonly Message[]) => readonly Message[],
+  identity?: NativeContinuationIdentity,
 ): ParkedContinuationClaim {
   const finish = [...chunks].reverse().find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')
   const replay = finish?.replayState === undefined ? undefined : parseNativeReplayState(finish.replayState)
@@ -301,18 +326,29 @@ function nativeClaim(
     throw new LlmError('Native tool boundary replay state does not match its call batch.', 'PROVIDER_ERROR')
   }
   const request = requestSnapshot(options)
-  const assistantMessage: Message = {
+  const canonicalAssistantMessage: Message = {
     id: MessageId(`native-${response.executionKey.slice(0, 16)}-${replay.boundary}`),
     role: 'assistant',
     content: nativeBoundaryBlocks(chunks),
     source: { kind: 'model', provider: options.provider, model: options.model },
   }
+  const assistantMessage = projectProviderMessages?.([canonicalAssistantMessage])[0] ?? canonicalAssistantMessage
+  if (assistantMessage === undefined) throw new LlmError('Native tool boundary history projection was empty.', 'PROVIDER_ERROR')
+  const providerPendingCalls = nativeMessageCalls(assistantMessage)
   return {
     sessionId: String(options.sessionId ?? ''),
     executionKey: response.executionKey,
-    requestKey: nativeExecutionKey(request),
+    requestKey: nativeExecutionKey(request, identity),
+    ...(identity === undefined ? {} : {
+      policyHash: identity.policyHash,
+      inventoryHash: identity.inventoryHash,
+      approvalHash: identity.approvalHash,
+    }),
     request,
+    canonicalRequest: requestSnapshot(canonicalOptions),
+    canonicalAssistantMessage,
     assistantMessage,
+    providerPendingCalls,
     pendingCalls,
     physicalAvailable: true,
     durableResults: false,
@@ -601,12 +637,22 @@ export class ChatGptWebAdapter extends LlmAdapter {
   private async * runPersistentNativeTurn(
     options: GenerateOptions,
     connection: ChatGptWebConnectionOptions,
+    prepared: PreparedNativeRequest | undefined,
   ): AsyncIterable<StreamChunk> {
     const nativeRuntime = this.config.native
     if (nativeRuntime === undefined) {
       throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
     }
     const sessionId = String(options.sessionId ?? '')
+    const providerOptions = prepared?.providerOptions ?? options
+    const preparedRound = prepared?.nativeRound
+    const continuationIdentity: NativeContinuationIdentity | undefined = prepared === undefined
+      ? undefined
+      : {
+          policyHash: prepared.policyHash,
+          inventoryHash: prepared.inventoryHash,
+          approvalHash: prepared.approvalHash,
+        }
     let active = this.nativeResponses.get(sessionId)
     let lease: NativeStepLease | undefined = active?.lease
     let activeCleanup: NativeRoundCleanup | undefined = active?.cleanup
@@ -627,7 +673,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
           uncertainOutcome,
           ...(physicalAvailable ? {} : { unavailableReason: 'page-lost' as const }),
         }
-        const decision = decideNativeContinuation(decisionClaim, options)
+        const decision = decideNativeContinuation(decisionClaim, providerOptions, continuationIdentity)
         if (decision.kind === 'fail') {
           if (!physicalAvailable && !uncertainOutcome
             && ['MISSING_TOOL_RESULT', 'TOOL_RESULT_MISMATCH', 'HISTORY_MISMATCH', 'CALL_MISMATCH', 'UNCERTAIN_OUTCOME'].includes(decision.code)) {
@@ -649,15 +695,25 @@ export class ChatGptWebAdapter extends LlmAdapter {
           active = undefined
           lease = undefined
         } else {
-          const resumed = await nativeRuntime.coordinator.beginStep({
-            sessionId,
-            messages: options.messages,
-            tools: options.tools ?? [],
-            ttlMs: connection.mcpInvocationTimeoutMs,
-            invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
-            continuation: { kind: 'continue' },
-            ...(options.signal !== undefined ? { signal: options.signal } : {}),
-          })
+          const resumed = await nativeRuntime.coordinator.beginStep(
+            preparedRound === undefined
+              ? {
+                  sessionId,
+                  messages: options.messages,
+                  tools: options.tools ?? [],
+                  ttlMs: connection.mcpInvocationTimeoutMs,
+                  invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+                  continuation: { kind: 'continue' },
+                  ...(options.signal !== undefined ? { signal: options.signal } : {}),
+                }
+              : {
+                  snapshot: preparedRound.coordinatorSnapshot,
+                  openPolicyRound: preparedRound.openRound,
+                  ttlMs: connection.mcpInvocationTimeoutMs,
+                  continuation: { kind: 'continue' },
+                  ...(options.signal !== undefined ? { signal: options.signal } : {}),
+                },
+          )
           if (resumed.requestId !== active.response.requestId) {
             throw new LlmError('Native continuation changed the broker request unexpectedly.', 'TRANSPORT')
           }
@@ -668,7 +724,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
             const boundary = yield* forwardNativeBoundary(active.response)
             boundaryDelivered = true
             if (nativeToolFinish(boundary)) {
-              active.claim = nativeClaim(options, active.response, boundary)
+              active.claim = nativeClaim(providerOptions, active.response, boundary, options, prepared?.projectProviderMessages, continuationIdentity)
               await resumed.park(active.cleanup)
             } else {
               await resumed.complete(active.cleanup)
@@ -772,16 +828,25 @@ export class ChatGptWebAdapter extends LlmAdapter {
         browser.markProbed()
       }
       const capabilities = this.capabilities
-      lease = await nativeRuntime.coordinator.beginStep({
-        sessionId,
-        messages: options.messages,
-        tools: options.tools ?? [],
-        ttlMs: connection.mcpInvocationTimeoutMs,
-        invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
-        ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      })
+      lease = await nativeRuntime.coordinator.beginStep(
+        preparedRound === undefined
+          ? {
+              sessionId,
+              messages: options.messages,
+              tools: options.tools ?? [],
+              ttlMs: connection.mcpInvocationTimeoutMs,
+              invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+              ...(options.signal !== undefined ? { signal: options.signal } : {}),
+            }
+          : {
+              snapshot: preparedRound.coordinatorSnapshot,
+              openPolicyRound: preparedRound.openRound,
+              ttlMs: connection.mcpInvocationTimeoutMs,
+              ...(options.signal !== undefined ? { signal: options.signal } : {}),
+            },
+      )
       lease.bindCleanup(cleanup)
-      const prompt = compilePrompt(options, COMPOSER_CHAR_BUDGET, this.takeNotice(options), {
+      const prompt = compilePrompt(providerOptions, COMPOSER_CHAR_BUDGET, this.takeNotice(options), {
         requestId: lease.requestId,
         connectorName: connection.connectorName,
       })
@@ -812,7 +877,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
       }
       const response = createNativePhysicalResponse({
         sessionId,
-        executionKey: nativeExecutionKey(options),
+        executionKey: nativeExecutionKey(providerOptions, continuationIdentity),
         requestId: lease.requestId,
         promptChars: prompt.length,
         driver,
@@ -839,7 +904,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         const boundary = yield* forwardNativeBoundary(response)
         boundaryDelivered = true
         if (nativeToolFinish(boundary)) {
-          current.claim = nativeClaim(options, response, boundary)
+          current.claim = nativeClaim(providerOptions, response, boundary, options, prepared?.projectProviderMessages, continuationIdentity)
           await lease.park(cleanup)
         } else {
           await lease.complete(cleanup)
@@ -883,23 +948,31 @@ export class ChatGptWebAdapter extends LlmAdapter {
         )
       }
     }
-    const hasTools = (options.tools?.length ?? 0) > 0
     const nativeMode = connection.connectorTransport === 'mcp'
+    const prepared = nativeMode
+      ? this.config.native === undefined
+        ? undefined
+        : this.config.native.prepareRequest?.(options, connection)
+      : undefined
+    const providerOptions = prepared?.providerOptions ?? options
+    const effectiveHasTools = (providerOptions.tools?.length ?? 0) > 0
     // Auxiliary model calls (session titles and compaction) share the adapter
     // but are not DSH agent rounds. They must not enter the native coordinator:
     // a title request queued while an agent round is parked has no durable
     // tool_result to resume and would otherwise steal the parked reservation.
     const auxiliaryModelCall = options.purpose === 'session-title' || options.purpose === 'compaction'
+    if (nativeMode && this.config.native === undefined) {
+      throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
+    }
     const nativeRound = nativeMode && !auxiliaryModelCall
-    const nativeTools = nativeRound && hasTools
+      && (prepared?.nativeRound !== undefined
+        || (prepared === undefined && this.config.native?.prepareRequest === undefined))
+    const nativeTools = nativeRound && effectiveHasTools
     if (nativeRound && options.sessionId === undefined) {
       throw new LlmError('Native MCP transport requires a sessionId for round ownership.', 'INVALID_REQUEST')
     }
-    if (nativeRound && this.config.native === undefined) {
-      throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
-    }
     if (nativeTools) {
-      yield* this.runPersistentNativeTurn(options, connection)
+      yield* this.runPersistentNativeTurn(options, connection, prepared)
       return
     }
 
@@ -1021,7 +1094,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         lease.bindCleanup(cleanup)
       }
       const prompt = compilePrompt(
-        options,
+        providerOptions,
         COMPOSER_CHAR_BUDGET,
         this.takeNotice(options),
         nativeTools && lease !== undefined ? {
