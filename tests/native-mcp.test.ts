@@ -36,17 +36,21 @@ function deferred<T>(): Deferred<T> {
 
 class FakeBrokerRpcClient implements BrokerRpcClient {
   started = false
-  readonly snapshot: BrokerRoundSnapshot = {
-    sessionId: 's1',
-    tools: [tool],
-    invocationTimeoutMs: 90_000,
-  }
+  readonly snapshot: BrokerRoundSnapshot
   readonly invocations: Array<{ name: string; args: Record<string, unknown> }> = []
   readonly activities = new Set<string>()
   readonly released: string[] = []
   pending = deferred<BrokerToolResult>()
   rejectInvocations = false
   denyInvocations = false
+
+  constructor(tools: readonly ToolSchema[] = [tool]) {
+    this.snapshot = {
+      sessionId: 's1',
+      tools: [...tools],
+      invocationTimeoutMs: 90_000,
+    }
+  }
 
   async start(): Promise<{ started: true; duplicate: boolean }> {
     const duplicate = this.started
@@ -83,6 +87,16 @@ async function connectedServer(fake: FakeBrokerRpcClient) {
   await server.connect(serverTransport)
   await client.connect(clientTransport)
   return { client, server }
+}
+
+function resultText(result: unknown): string {
+  const content = (result as { content?: unknown }).content
+  if (!Array.isArray(content)) throw new Error('MCP result has no content array')
+  const first = content[0]
+  if (typeof first !== 'object' || first === null || !('text' in first) || typeof first.text !== 'string') {
+    throw new Error('MCP result has no text content')
+  }
+  return first.text
 }
 
 afterEach(() => {
@@ -122,6 +136,107 @@ describe('DSH native MCP façade', () => {
       expect(JSON.stringify(inventory)).toContain('write')
       expect(JSON.stringify(inventory)).toContain('path')
       expect(fake.activities.size).toBe(0)
+    } finally {
+      await client.close()
+      await server.close()
+    }
+  })
+
+  it('advertises a bounded complete catalog even when a relevant namespace is past page one', async () => {
+    const overloadedTools: ToolSchema[] = [
+      ...Array.from({ length: 21 }, (_, index) => ({
+        name: `core_${String(index).padStart(2, '0')}`,
+        description: `core tool ${index}`,
+        parameters: { type: 'object' },
+      })),
+      {
+        name: 'mcp__chrome-devtools__take_screenshot',
+        description: 'Take a screenshot of the current browser page',
+        parameters: { type: 'object', properties: { fullPage: { type: 'boolean' } } },
+      },
+      ...Array.from({ length: 96 }, (_, index) => ({
+        name: `mcp__misc__tool_${String(index).padStart(2, '0')}`,
+        description: `miscellaneous tool ${index}`,
+        parameters: { type: 'object' },
+      })),
+    ]
+    const fake = new FakeBrokerRpcClient(overloadedTools)
+    const { client, server } = await connectedServer(fake)
+    try {
+      await client.callTool({ name: 'dsh_round_start', arguments: { request_id: requestId } })
+      const firstPage = await client.callTool({
+        name: 'dsh_tool_inventory',
+        arguments: { request_id: requestId },
+      })
+      const payload = JSON.parse(resultText(firstPage)) as {
+        tools: Array<{ wire_name: string }>
+        total: number
+        next_offset: number | null
+        discovery: {
+          version: number
+          query_matches: string
+          namespaces: Array<{ prefix: string; count: number; names: string[] }>
+          namespace_count: number
+          unnamespaced: string[]
+          unnamespaced_count: number
+          truncated: boolean
+        }
+      }
+      expect(payload.tools).toHaveLength(20)
+      expect(payload.tools.some(entry => entry.wire_name.includes('chrome-devtools'))).toBe(false)
+      expect(payload.total).toBe(118)
+      expect(payload.next_offset).toBe(20)
+      expect(payload.discovery).toMatchObject({
+        version: 1,
+        query_matches: 'case-insensitive substring of tool name or description',
+        namespace_count: 2,
+        unnamespaced_count: 21,
+        truncated: false,
+      })
+      expect(payload.discovery.namespaces).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          prefix: 'mcp__chrome-devtools__',
+          count: 1,
+          names: ['mcp__chrome-devtools__take_screenshot'],
+        }),
+      ]))
+      expect(payload.discovery.unnamespaced).toContain('core_20')
+      expect(Buffer.byteLength(JSON.stringify(payload.discovery))).toBeLessThanOrEqual(8_192)
+
+      const screenshot = await client.callTool({
+        name: 'dsh_tool_inventory',
+        arguments: { request_id: requestId, query: 'screenshot', include_schema: true },
+      })
+      expect(JSON.stringify(screenshot)).toContain('mcp__chrome-devtools__take_screenshot')
+      expect(JSON.stringify(screenshot)).toContain('fullPage')
+    } finally {
+      await client.close()
+      await server.close()
+    }
+  })
+
+  it('bounds the discovery catalog without changing the complete match count', async () => {
+    const oversizedTools: ToolSchema[] = Array.from({ length: 30 }, (_, index) => ({
+      name: `${'tool_'.repeat(180)}${String(index).padStart(2, '0')}`,
+      description: 'oversized tool name fixture',
+      parameters: { type: 'object' },
+    }))
+    const fake = new FakeBrokerRpcClient(oversizedTools)
+    const { client, server } = await connectedServer(fake)
+    try {
+      await client.callTool({ name: 'dsh_round_start', arguments: { request_id: requestId } })
+      const result = await client.callTool({
+        name: 'dsh_tool_inventory',
+        arguments: { request_id: requestId, include_schema: false },
+      })
+      const payload = JSON.parse(resultText(result)) as {
+        total: number
+        discovery: { unnamespaced_count: number; truncated: boolean }
+      }
+      expect(payload.total).toBe(30)
+      expect(payload.discovery.unnamespaced_count).toBe(30)
+      expect(payload.discovery.truncated).toBe(true)
+      expect(Buffer.byteLength(JSON.stringify(payload.discovery))).toBeLessThanOrEqual(8_192)
     } finally {
       await client.close()
       await server.close()

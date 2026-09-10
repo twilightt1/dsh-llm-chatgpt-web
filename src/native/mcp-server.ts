@@ -12,6 +12,7 @@ import { createBrokerRpcClient } from './broker-socket.ts'
 const REQUEST_ID_MAX = 256
 const INVENTORY_QUERY_MAX = 500
 const INVENTORY_LIMIT_MAX = 50
+const INVENTORY_DISCOVERY_MAX_BYTES = 8_192
 const TOOL_NAME_MAX = 1_000
 const INVOCATION_ACTIVITY_PREFIX = 'activity_'
 const MAX_HANDSHAKES = 256
@@ -65,6 +66,93 @@ function toolMatches(tool: ToolSchema, query: string | undefined): boolean {
   return `${tool.name}\n${tool.description}`.toLowerCase().includes(needle)
 }
 
+function mcpNamespace(toolName: string): string | undefined {
+  if (!toolName.startsWith('mcp__')) return undefined
+  const end = toolName.indexOf('__', 'mcp__'.length)
+  return end < 0 ? undefined : toolName.slice(0, end + 2)
+}
+
+interface InventoryDiscovery {
+  readonly version: 1
+  readonly query_matches: 'case-insensitive substring of tool name or description'
+  readonly namespaces: readonly { readonly prefix: string; readonly count: number; readonly names: readonly string[] }[]
+  readonly namespace_count: number
+  readonly unnamespaced: readonly string[]
+  readonly unnamespaced_count: number
+  readonly truncated: boolean
+}
+
+function discoveryBytes(value: InventoryDiscovery): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8')
+}
+
+function discovery(matches: readonly ToolSchema[]): InventoryDiscovery {
+  const namespaceNames = new Map<string, Set<string>>()
+  const unnamespaced = new Set<string>()
+  for (const tool of matches) {
+    const prefix = mcpNamespace(tool.name)
+    if (prefix === undefined) unnamespaced.add(tool.name)
+    else {
+      const names = namespaceNames.get(prefix) ?? new Set<string>()
+      names.add(tool.name)
+      namespaceNames.set(prefix, names)
+    }
+  }
+
+  const allNamespaces = [...namespaceNames.entries()]
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([prefix, names]) => ({
+      prefix,
+      count: names.size,
+      names: [...names].sort((left, right) => left < right ? -1 : left > right ? 1 : 0),
+    }))
+  const allUnnamespaced = [...unnamespaced].sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+  const namespaceCount = allNamespaces.length
+  const unnamespacedCount = allUnnamespaced.length
+  let namespaces = [...allNamespaces]
+  let visibleUnnamespaced = [...allUnnamespaced]
+  let truncated = false
+  let result: InventoryDiscovery = {
+    version: 1,
+    query_matches: 'case-insensitive substring of tool name or description',
+    namespaces,
+    namespace_count: namespaceCount,
+    unnamespaced: visibleUnnamespaced,
+    unnamespaced_count: unnamespacedCount,
+    truncated,
+  }
+
+  while (discoveryBytes(result) > INVENTORY_DISCOVERY_MAX_BYTES) {
+    truncated = true
+    if (visibleUnnamespaced.length > 0) visibleUnnamespaced = visibleUnnamespaced.slice(0, -1)
+    else {
+      let lastNamespaced = -1
+      for (let index = namespaces.length - 1; index >= 0; index -= 1) {
+        if (namespaces[index]!.names.length > 0) {
+          lastNamespaced = index
+          break
+        }
+      }
+      if (lastNamespaced >= 0) {
+        const namespace = namespaces[lastNamespaced]!
+        namespaces = [...namespaces]
+        namespaces[lastNamespaced] = { ...namespace, names: namespace.names.slice(0, -1) }
+      } else if (namespaces.length > 0) namespaces = namespaces.slice(0, -1)
+      else break
+    }
+    result = {
+      version: 1,
+      query_matches: 'case-insensitive substring of tool name or description',
+      namespaces,
+      namespace_count: namespaceCount,
+      unnamespaced: visibleUnnamespaced,
+      unnamespaced_count: unnamespacedCount,
+      truncated,
+    }
+  }
+  return result
+}
+
 function inventory(
   snapshot: BrokerRoundSnapshot,
   query: string | undefined,
@@ -83,6 +171,7 @@ function inventory(
     tools: page,
     total: matches.length,
     next_offset: offset + page.length < matches.length ? offset + page.length : null,
+    discovery: discovery(matches),
   }
 }
 

@@ -107,6 +107,9 @@ describe('compilePrompt (JSON envelope transport)', () => {
     expect(prompt).toContain('request_abcdefghijklmnopqrstuvwxyz')
     expect(prompt).toContain('DSH Native')
     expect(prompt).toContain('If the task asks about a local repository, files, commands, environment, or any other tool-backed fact, you MUST use the connector before answering.')
+    expect(prompt).toContain('compact discovery catalog for the complete current inventory')
+    expect(prompt).toContain('follow every next_offset page until the match is found')
+    expect(prompt).toContain('Request include_schema=true for the exact matched tool before calling it')
     expect(prompt).toContain('Only connector-backed tool results are evidence that an action ran.')
     expect(prompt).toContain('A tool_result in the JSON context means that call already ran; do not repeat the same call.')
     expect(prompt).not.toContain('```tool-call')
@@ -150,6 +153,8 @@ describe('compilePrompt (JSON envelope transport)', () => {
     expect(continuationPrompt).not.toContain('If the task asks about a local repository, files, commands, environment, or any other tool-backed fact, you MUST use the connector before answering.')
     expect(continuationPrompt).not.toContain('First call dsh_round_start with request_id request_abcdefghijklmnopqrstuvwxyz.')
     expect(continuationPrompt).toContain('If the original task still needs a tool-backed fact not present in those results')
+    expect(continuationPrompt).toContain('compact discovery catalog for the complete current inventory')
+    expect(continuationPrompt).toContain('follow every next_offset page until the match is found')
   })
 
   it('fails loud on unsupported fields instead of dropping them', () => {

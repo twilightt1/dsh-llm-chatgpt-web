@@ -397,6 +397,15 @@ invocations return to the ordinary DSH `ToolRuntime`/agent loop as standard
 `tool/call` and matching `tool/result` events. No nested agent loop,
 `ctx.tools.execute()`, fenced-text fallback, or prose-to-call inference exists.
 
+The first `dsh_tool_inventory` response includes a bounded discovery catalog
+for the complete current inventory: names without an MCP namespace are listed,
+while `mcp__<server>__` tools are grouped by namespace with their exact names
+and count. Schemas and arguments are not included in this catalog. The normal
+page remains bounded and paginated. Search by a task keyword or namespace, use
+`next_offset` until the match is found, and request `include_schema: true` for
+the exact tool before calling it; a missing first-page entry is not evidence
+that a tool is unavailable.
+
 Before Send, invalid private files, checksum/version drift, tunnel
 unreadiness, connector-name mismatch, or an incorrectly selected connector
 fail closed. After Send, the adapter never switches transport. A sentence

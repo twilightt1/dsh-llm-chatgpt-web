@@ -121,15 +121,22 @@ export function compilePrompt(
   ]
   if (native !== undefined) {
     contract.push(`Use the attached ${JSON.stringify(native.connectorName)} connector.`)
+    const inventoryGuidance = [
+      'The first inventory response includes a compact discovery catalog for the complete current inventory plus one paginated tool page.',
+      'Use the catalog to choose a namespace or task capability. If the needed tool is not on the current page, query by its namespace or name/description and follow every next_offset page until the match is found.',
+      'Request include_schema=true for the exact matched tool before calling it; never conclude that a tool is unavailable from page one alone.',
+    ]
     if (hasPriorNativeResults) {
       contract.push(
         'Prior tool_result messages are already completed. Do not call the connector merely to repeat them.',
         `If the original task still needs a tool-backed fact not present in those results, first call dsh_round_start with request_id ${native.requestId}, then use dsh_tool_inventory and dsh_tool_call with that same request_id.`,
+        ...inventoryGuidance,
       )
     } else {
       contract.push(
         `First call dsh_round_start with request_id ${native.requestId}.`,
         'Then use dsh_tool_inventory and dsh_tool_call with that same request_id.',
+        ...inventoryGuidance,
         'If the task asks about a local repository, files, commands, environment, or any other tool-backed fact, you MUST use the connector before answering.',
       )
     }
