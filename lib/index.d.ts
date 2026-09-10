@@ -232,6 +232,7 @@ declare class ChatGptWebAdapter extends LlmAdapter {
   private queue;
   /** Parked physical native responses keyed by their DSH session owner. */
   private readonly nativeResponses;
+  private rateLimitedUntil;
   /** One-shot retry notices keyed by session (consumed on next turn). */
   private pendingNotices;
   constructor(config: ChatGptWebAdapterOptions);
@@ -240,6 +241,8 @@ declare class ChatGptWebAdapter extends LlmAdapter {
   listModels(provider: string): Promise<readonly LlmModelInfo[]>;
   resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+  private assertRateLimitOpen;
+  private noteRateLimit;
   /** Stop a parked native round at a durable agent turn boundary. */
   stopNativeRound(sessionId: string): Promise<void>;
   /** Release the owned browser. Hosts should call this on plugin unload. */

@@ -224,6 +224,13 @@ describe('decideNativeContinuation', () => {
     )).toMatchObject({ kind: 'fail' })
   })
 
+  it('rejects a continuation with an invalid physical execution identity', () => {
+    expect(decideNativeContinuation(
+      claim({ executionKey: 'not-a-key' }),
+      request({ messages: [user, assistant, resultMessage()] }),
+    )).toMatchObject({ kind: 'fail', code: 'INVALID_REPLAY_STATE' })
+  })
+
   it('rejects a continuation from another session', () => {
     expect(decideNativeContinuation(
       claim(),

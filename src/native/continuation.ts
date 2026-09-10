@@ -219,6 +219,28 @@ function assistantCallsMatch(message: Message, calls: readonly BrokerToolRequest
   })
 }
 
+/** Prove that the incoming history contains this boundary's exact results. */
+export function hasExactNativeToolResults(
+  claim: ParkedContinuationClaim,
+  options: GenerateOptions,
+): boolean {
+  const baseLength = claim.request.messages.length
+  const incomingAssistant = options.messages[baseLength]
+  if (incomingAssistant === undefined
+    || !sameMessages(options.messages.slice(0, baseLength), claim.request.messages)
+    || !sameMessages([incomingAssistant], [claim.assistantMessage])
+    || !assistantCallsMatch(incomingAssistant, claim.pendingCalls)) return false
+  const resultMessages = options.messages.slice(baseLength + 1)
+  if (resultMessages.length < claim.pendingCalls.length) return false
+  for (const [index, call] of claim.pendingCalls.entries()) {
+    const message = resultMessages[index]
+    if (message === undefined || onlyTextResult(message, call) === undefined) return false
+  }
+  const extra = resultMessages.slice(claim.pendingCalls.length)
+  return !extra.some(message => message.source.kind === 'tool'
+    || message.content.some(block => block.type === 'tool-result'))
+}
+
 function extraTailReason(messages: readonly Message[]): NativeFreshReplayReason | undefined {
   if (messages.some(message => message.source.kind === 'user')) return 'steering'
   return messages.length > 0 ? 'context-added' : undefined
@@ -233,6 +255,9 @@ export function decideNativeContinuation(
   claim: ParkedContinuationClaim,
   options: GenerateOptions,
 ): NativeContinuationDecision {
+  if (!/^[a-f0-9]{64}$/.test(claim.executionKey)) {
+    return failure('INVALID_REPLAY_STATE', 'native parked response has an invalid execution identity')
+  }
   const requestKey = claim.requestKey ?? nativeExecutionKey(claim.request)
   if (requestKey !== nativeExecutionKey(claim.request)) {
     return failure('INVALID_REPLAY_STATE', 'native parked response has an invalid logical request identity')

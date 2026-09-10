@@ -16,6 +16,8 @@ export type NativePhysicalResponseState =
   | 'failed'
   | 'revoked'
 
+export type NativeUncertainStage = 'post-submit' | 'tool-dispatch' | 'result-handoff'
+
 /** Browser/session seam used by the physical-response owner. */
 export interface NativePhysicalResponseDriver {
   nextBoundary(): AsyncGenerator<TextTurnEvent, TextTurnResult>
@@ -41,6 +43,8 @@ export interface NativePhysicalResponse {
   readonly state: NativePhysicalResponseState
   streamBoundary(boundary?: number): AsyncIterable<StreamChunk>
   deliverResults(results: readonly BrokerToolResult[], revision?: number): Promise<void>
+  markUncertain(stage: NativeUncertainStage, cause: Error): void
+  hasUncertainOutcome(): boolean
   stop(cause: Error): Promise<void>
 }
 
@@ -61,6 +65,8 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
   private readonly journals: StreamChunk[][] = []
   private activeBoundary = false
   private cleanupDone = false
+  private uncertainOutcome = false
+  private uncertaintyCause: Error | undefined
 
   constructor(private readonly options: NativePhysicalResponseOptions) {
     this.sessionId = options.sessionId
@@ -80,14 +86,37 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
     if (this.currentState !== 'parked') {
       throw new Error(`native physical response cannot deliver results while ${this.currentState}`)
     }
+    if (this.uncertainOutcome) {
+      throw new LlmError('native physical response has an uncertain side-effect outcome; refusing result handoff', 'PROVIDER_ERROR', {
+        cause: this.uncertaintyCause,
+      })
+    }
     this.currentState = 'running'
     try {
       await this.options.driver.deliverResults(structuredClone(results))
       if (revision !== undefined) this.options.driver.markToolResultDelivered(revision)
     } catch (error) {
-      await this.fail(errorFrom(error)).catch(() => {})
+      const failure = errorFrom(error)
+      this.markUncertain('result-handoff', failure)
+      await this.fail(failure).catch(() => {})
       throw error
     }
+  }
+
+  markUncertain(stage: NativeUncertainStage, cause: Error): void {
+    if (this.currentState === 'completed' || this.currentState === 'revoked') return
+    if (!this.uncertainOutcome) {
+      this.uncertainOutcome = true
+      this.uncertaintyCause = new LlmError(
+        `native physical response outcome became uncertain during ${stage}`,
+        'TRANSPORT',
+        { cause },
+      )
+    }
+  }
+
+  hasUncertainOutcome(): boolean {
+    return this.uncertainOutcome
   }
 
   async stop(cause: Error): Promise<void> {
@@ -138,7 +167,9 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
       this.journals.push(cloneChunks(chunks))
       for (const chunk of cloneChunks(chunks)) yield chunk
     } catch (error) {
-      await this.fail(errorFrom(error)).catch(() => {})
+      const failure = errorFrom(error)
+      this.markUncertain('post-submit', failure)
+      await this.fail(failure).catch(() => {})
       throw error
     } finally {
       this.activeBoundary = false

@@ -92,7 +92,7 @@ vi.mock('../src/chatgpt/turn.ts', () => ({
   streamTextTurn: fixtures.stream,
 }))
 
-import { createToolResultMessage, MessageId } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, LlmError, MessageId } from '@deepseek-ai/dsh-llm'
 import { ChatGptWebAdapter } from '../src/adapter.ts'
 import { ManagedRuntimeTransportError } from '../src/native/tunnel-runtime.ts'
 import { NativeRoundCoordinator } from '../src/native/coordinator.ts'
@@ -264,6 +264,35 @@ describe('native adapter lifecycle', () => {
     expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
     await adapter.dispose()
     broker.close()
+  })
+
+  it('opens a fixed rate-limit cooldown without allocating another page', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    fixtures.detect.mockRejectedValueOnce(new LlmError('too many requests', 'RATE_LIMIT'))
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      profileDir: '/tmp/dsh-native-adapter-rate-limit-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-rate-limit-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    await expect(collect(adapter.stream(input('rate-1')))).rejects.toMatchObject({ code: 'RATE_LIMIT' })
+    expect(fixtures.browser.newTurnPage).toHaveBeenCalledTimes(1)
+    clock.mockReturnValue(1_001)
+    await expect(collect(adapter.stream(input('rate-2')))).rejects.toMatchObject({ code: 'RATE_LIMIT' })
+    expect(fixtures.browser.newTurnPage).toHaveBeenCalledTimes(1)
+    clock.mockReturnValue(301_001)
+    await collect(adapter.stream(input('rate-3')))
+    expect(fixtures.browser.newTurnPage).toHaveBeenCalledTimes(2)
+    await adapter.dispose()
+    broker.close()
+    clock.mockRestore()
   })
 
   it('does not allocate a browser page when managed readiness fails', async () => {
@@ -470,6 +499,263 @@ describe('native adapter lifecycle', () => {
     expect(fixtures.start).toHaveBeenCalledTimes(1)
     expect(fixtures.prepare).toHaveBeenCalledTimes(1)
     expect(fixtures.compile).toHaveBeenCalledTimes(1)
+    await adapter.dispose()
+    broker.close()
+  })
+
+  it('stops the old page before one safe fresh replay after page loss', async () => {
+    const events: string[] = []
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    let oldRequestId: string | undefined
+    vi.spyOn(broker, 'revoke').mockImplementation((requestId, cause) => {
+      events.push(requestId === oldRequestId ? 'old:revoked' : 'new:revoked')
+      NativeToolBroker.prototype.revoke.call(broker, requestId, cause)
+    })
+    const activityId = 'activity_adapter_fallback_abcdefghijkl'
+    fixtures.browser.newTurnPage.mockImplementationOnce(async () => {
+      events.push('old:page')
+      return fixtures.page as never
+    }).mockImplementationOnce(async () => {
+      events.push('new:page')
+      fixtures.page.isClosed.mockReturnValue(false)
+      return fixtures.page as never
+    })
+    fixtures.page.close.mockImplementationOnce(async () => { events.push('old:closed') })
+      .mockImplementationOnce(async () => { events.push('new:closed') })
+    fixtures.start.mockImplementationOnce(async (...args: unknown[]) => {
+      events.push('old:send')
+      const turnOptions = args[1] as {
+        onPromptSubmitted?: () => void
+        native?: {
+          requestId: string
+          takeToolBatch: (now?: number) => readonly { callId: string; name: string; arguments: Record<string, unknown> }[] | undefined
+        }
+      }
+      turnOptions.onPromptSubmitted?.()
+      const native = turnOptions.native
+      if (native === undefined) throw new Error('native controls missing')
+      oldRequestId = native.requestId
+      let boundary = 0
+      return {
+        nextBoundary: async function* () {
+          if (boundary++ === 0) {
+            broker.start(native.requestId)
+            broker.claimActivity(native.requestId, activityId)
+            const invocation = broker.invoke(native.requestId, activityId, 'write', { path: 'x' })
+            void invocation.catch(() => {})
+            const calls = native.takeToolBatch(Date.now() + 100)
+            if (calls === undefined) throw new Error('native call batch missing')
+            return { kind: 'tool-batch', text: '', calls, promptChars: 6 }
+          }
+          broker.completeActivity(native.requestId, activityId)
+          yield { type: 'delta', delta: 'unexpected' }
+          return { kind: 'completed', text: 'unexpected', promptChars: 6 }
+        },
+        deliverResults: vi.fn(async () => {}),
+        markToolResultDelivered: vi.fn(),
+        stop: vi.fn(async () => { events.push('old:stopped') }),
+      }
+    }).mockImplementationOnce(async (...args: unknown[]) => {
+      events.push('new:send')
+      const turnOptions = args[1] as { onPromptSubmitted?: () => void }
+      turnOptions.onPromptSubmitted?.()
+      return {
+        nextBoundary: async function* () {
+          yield { type: 'delta', delta: 'replayed' }
+          return { kind: 'completed', text: 'replayed', promptChars: 6 }
+        },
+        deliverResults: vi.fn(async () => {}),
+        markToolResultDelivered: vi.fn(),
+        stop: vi.fn(async () => {}),
+      }
+    })
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      profileDir: '/tmp/dsh-native-adapter-fallback-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-fallback-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    const first = await collect(adapter.stream(input('fallback')))
+    const callBlock = first.find((chunk): chunk is Extract<StreamChunk, { type: 'block-end' }> =>
+      chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    const finish = first.find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')
+    if (callBlock?.block.type !== 'tool-call' || finish?.reason.kind !== 'tool-calls') throw new Error('missing native boundary')
+    fixtures.page.isClosed.mockReturnValue(true)
+    const assistant: Message = {
+      id: MessageId('assistant-native-fallback'),
+      role: 'assistant',
+      content: [callBlock.block],
+      source: {
+        kind: 'model',
+        provider: 'chatgpt-web',
+        model: 'chatgpt-web/high',
+        replayState: finish.replayState,
+      },
+    }
+    const result = createToolResultMessage({
+      callId: callBlock.block.id,
+      content: [{ type: 'text', text: 'ok' }],
+      isError: false,
+    })
+    const replayed = await collect(adapter.stream({
+      ...input('fallback'),
+      messages: [userMessage, assistant, result],
+    }))
+    expect(replayed.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
+    expect(events).toEqual([
+      'old:page', 'old:send', 'old:stopped', 'old:closed', 'old:revoked',
+      'new:page', 'new:send', 'new:closed', 'new:revoked',
+    ])
+    expect(fixtures.start).toHaveBeenCalledTimes(2)
+    await adapter.dispose()
+    broker.close()
+  })
+
+  it('refuses fresh replay when stopping the old page cannot be proven clean', async () => {
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const activityId = 'activity_adapter_cleanup_abcdefghijkl'
+    fixtures.start.mockImplementationOnce(async (...args: unknown[]) => {
+      const turnOptions = args[1] as {
+        onPromptSubmitted?: () => void
+        native?: {
+          requestId: string
+          takeToolBatch: (now?: number) => readonly { callId: string; name: string; arguments: Record<string, unknown> }[] | undefined
+        }
+      }
+      turnOptions.onPromptSubmitted?.()
+      const native = turnOptions.native
+      if (native === undefined) throw new Error('native controls missing')
+      return {
+        nextBoundary: async function* () {
+          broker.start(native.requestId)
+          broker.claimActivity(native.requestId, activityId)
+          const invocation = broker.invoke(native.requestId, activityId, 'write', { path: 'x' })
+          void invocation.catch(() => {})
+          const calls = native.takeToolBatch(Date.now() + 100)
+          if (calls === undefined) throw new Error('native call batch missing')
+          return { kind: 'tool-batch', text: '', calls, promptChars: 6 }
+        },
+        deliverResults: vi.fn(async () => {}),
+        markToolResultDelivered: vi.fn(),
+        stop: vi.fn(async () => {}),
+      }
+    })
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      profileDir: '/tmp/dsh-native-adapter-cleanup-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-cleanup-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    const first = await collect(adapter.stream(input('cleanup')))
+    const callBlock = first.find((chunk): chunk is Extract<StreamChunk, { type: 'block-end' }> =>
+      chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    const finish = first.find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')
+    if (callBlock?.block.type !== 'tool-call' || finish?.reason.kind !== 'tool-calls') throw new Error('missing native boundary')
+    fixtures.page.isClosed.mockReturnValue(true)
+    cleanupFixtures.deleteOwnedConversation.mockRejectedValueOnce(new Error('old delete unavailable'))
+    const assistant: Message = {
+      id: MessageId('assistant-native-cleanup'),
+      role: 'assistant',
+      content: [callBlock.block],
+      source: {
+        kind: 'model',
+        provider: 'chatgpt-web',
+        model: 'chatgpt-web/high',
+        replayState: finish.replayState,
+      },
+    }
+    const result = createToolResultMessage({
+      callId: callBlock.block.id,
+      content: [{ type: 'text', text: 'ok' }],
+      isError: false,
+    })
+    await expect(collect(adapter.stream({
+      ...input('cleanup'),
+      messages: [userMessage, assistant, result],
+    }))).rejects.toThrow(/old delete unavailable/i)
+    expect(fixtures.start).toHaveBeenCalledTimes(1)
+    expect(fixtures.browser.newTurnPage).toHaveBeenCalledTimes(1)
+    expect(cleanupFixtures.ledger.forget).not.toHaveBeenCalled()
+    await adapter.dispose()
+    broker.close()
+  })
+
+  it('refuses page-loss replay before a durable tool result exists', async () => {
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const activityId = 'activity_adapter_uncertain_abcdefghijkl'
+    fixtures.start.mockImplementationOnce(async (...args: unknown[]) => {
+      const turnOptions = args[1] as {
+        onPromptSubmitted?: () => void
+        native?: {
+          requestId: string
+          takeToolBatch: (now?: number) => readonly { callId: string; name: string; arguments: Record<string, unknown> }[] | undefined
+        }
+      }
+      turnOptions.onPromptSubmitted?.()
+      const native = turnOptions.native
+      if (native === undefined) throw new Error('native controls missing')
+      return {
+        nextBoundary: async function* () {
+          broker.start(native.requestId)
+          broker.claimActivity(native.requestId, activityId)
+          const invocation = broker.invoke(native.requestId, activityId, 'write', { path: 'x' })
+          void invocation.catch(() => {})
+          const calls = native.takeToolBatch(Date.now() + 100)
+          if (calls === undefined) throw new Error('native call batch missing')
+          return { kind: 'tool-batch', text: '', calls, promptChars: 6 }
+        },
+        deliverResults: vi.fn(async () => {}),
+        markToolResultDelivered: vi.fn(),
+        stop: vi.fn(async () => {}),
+      }
+    })
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      profileDir: '/tmp/dsh-native-adapter-uncertain-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-uncertain-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    const first = await collect(adapter.stream(input('uncertain')))
+    const callBlock = first.find((chunk): chunk is Extract<StreamChunk, { type: 'block-end' }> =>
+      chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    const finish = first.find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')
+    if (callBlock?.block.type !== 'tool-call' || finish?.reason.kind !== 'tool-calls') throw new Error('missing native boundary')
+    fixtures.page.isClosed.mockReturnValue(true)
+    const assistant: Message = {
+      id: MessageId('assistant-native-uncertain'),
+      role: 'assistant',
+      content: [callBlock.block],
+      source: {
+        kind: 'model',
+        provider: 'chatgpt-web',
+        model: 'chatgpt-web/high',
+        replayState: finish.replayState,
+      },
+    }
+    await expect(collect(adapter.stream({
+      ...input('uncertain'),
+      messages: [userMessage, assistant],
+    }))).rejects.toMatchObject({ code: 'PROVIDER_ERROR' })
+    expect(fixtures.start).toHaveBeenCalledTimes(1)
+    expect(fixtures.browser.newTurnPage).toHaveBeenCalledTimes(1)
     await adapter.dispose()
     broker.close()
   })

@@ -139,6 +139,31 @@ describe('NativePhysicalResponse', () => {
     expect(response.state).toBe('completed')
   })
 
+  it('refuses result handoff after an uncertain side-effect stage', async () => {
+    const driver = fakeDriver([boundary([], {
+      kind: 'tool-batch', text: '', promptChars: 10, calls: [call],
+    })])
+    const response = createNativePhysicalResponse(fixture(driver))
+    await collect(response.streamBoundary())
+    response.markUncertain('tool-dispatch', new Error('socket lost after dispatch'))
+    expect(response.hasUncertainOutcome()).toBe(true)
+    await expect(response.deliverResults([result])).rejects.toThrow(/uncertain/i)
+    await response.stop(new Error('cleanup'))
+    expect(driver.stop).toHaveBeenCalledOnce()
+  })
+
+  it('marks a result-handoff transport failure as uncertain', async () => {
+    const driver = fakeDriver([boundary([], {
+      kind: 'tool-batch', text: '', promptChars: 10, calls: [call],
+    })])
+    vi.spyOn(driver, 'deliverResults').mockRejectedValueOnce(new Error('result socket closed'))
+    const response = createNativePhysicalResponse(fixture(driver))
+    await collect(response.streamBoundary())
+    await expect(response.deliverResults([result])).rejects.toThrow(/socket closed/i)
+    expect(response.hasUncertainOutcome()).toBe(true)
+    expect(driver.stop).toHaveBeenCalledOnce()
+  })
+
   it('stops a parked response once and refuses a second boundary', async () => {
     const driver = fakeDriver([boundary([], {
       kind: 'tool-batch', text: '', promptChars: 10, calls: [call],

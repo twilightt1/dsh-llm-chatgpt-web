@@ -57,6 +57,7 @@ import {
 } from './native/tunnel-runtime.ts'
 import {
   decideNativeContinuation,
+  hasExactNativeToolResults,
   nativeExecutionKey,
   parseNativeReplayState,
 } from './native/continuation.ts'
@@ -210,6 +211,9 @@ export const DEFAULT_DAEMON_IDLE_MS = 30 * 60 * 1_000
 export const DEFAULT_CONTEXT_WINDOW = 90_000
 /** Default per-request output-token cap. */
 export const DEFAULT_MAX_TOKENS = 16_384
+/** Fixed adapter-local cooldown after a provider-confirmed rate limit. */
+export const CHATGPT_RATE_LIMIT_COOLDOWN_MS = 300_000
+const localRateLimitFailures = new WeakSet<object>()
 function modelInfo(provider: string, model: ChatGptWebCatalogModel): LlmModelInfo {
   return {
     provider,
@@ -225,6 +229,7 @@ interface ActiveNativeResponse {
   readonly lease: NativeStepLease
   claim?: ParkedContinuationClaim
   readonly cleanup: NativeRoundCleanup
+  readonly isPhysicalAvailable: () => boolean
 }
 
 function requestSnapshot(options: GenerateOptions): GenerateOptions {
@@ -342,6 +347,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
   private queue: Promise<void> = Promise.resolve()
   /** Parked physical native responses keyed by their DSH session owner. */
   private readonly nativeResponses = new Map<string, ActiveNativeResponse>()
+  private rateLimitedUntil = 0
   /** One-shot retry notices keyed by session (consumed on next turn). */
   private pendingNotices = new Map<string, string>()
 
@@ -378,6 +384,25 @@ export class ChatGptWebAdapter extends LlmAdapter {
 
   override stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     return this.enqueue(() => this.runTurn(options))
+  }
+
+  private assertRateLimitOpen(): void {
+    const now = Date.now()
+    if (now < this.rateLimitedUntil) {
+      const failure = new LlmError(
+        'ChatGPT Web rate-limit cooldown is active; refusing another request.',
+        'RATE_LIMIT',
+      )
+      localRateLimitFailures.add(failure)
+      throw failure
+    }
+    if (this.rateLimitedUntil !== 0) this.rateLimitedUntil = 0
+  }
+
+  private noteRateLimit(error: unknown): void {
+    if (!(error instanceof LlmError) || error.code !== 'RATE_LIMIT' || localRateLimitFailures.has(error)) return
+    const now = Date.now()
+    if (now >= this.rateLimitedUntil) this.rateLimitedUntil = now + CHATGPT_RATE_LIMIT_COOLDOWN_MS
   }
 
   /** Stop a parked native round at a durable agent turn boundary. */
@@ -433,6 +458,9 @@ export class ChatGptWebAdapter extends LlmAdapter {
     await previous
     try {
       yield* run()
+    } catch (error) {
+      this.noteRateLimit(error)
+      throw error
     } finally {
       release()
     }
@@ -586,8 +614,26 @@ export class ChatGptWebAdapter extends LlmAdapter {
         if (active.claim === undefined) {
           throw new LlmError('Native response is still opening and cannot accept a continuation.', 'TRANSPORT')
         }
-        const decision = decideNativeContinuation(active.claim, options)
+        const physicalAvailable = active.isPhysicalAvailable()
+        const uncertainOutcome = active.claim.uncertainOutcome || active.response.hasUncertainOutcome()
+        const durableResults = !uncertainOutcome && hasExactNativeToolResults(active.claim, options)
+        const decisionClaim: ParkedContinuationClaim = {
+          ...active.claim,
+          physicalAvailable,
+          durableResults: active.claim.durableResults || durableResults,
+          uncertainOutcome,
+          ...(physicalAvailable ? {} : { unavailableReason: 'page-lost' as const }),
+        }
+        const decision = decideNativeContinuation(decisionClaim, options)
         if (decision.kind === 'fail') {
+          if (!physicalAvailable && !uncertainOutcome
+            && ['MISSING_TOOL_RESULT', 'TOOL_RESULT_MISMATCH', 'HISTORY_MISMATCH', 'CALL_MISMATCH', 'UNCERTAIN_OUTCOME'].includes(decision.code)) {
+            throw new LlmError(
+              `Native page was lost before durable tool results were proven: ${decision.message}`,
+              'PROVIDER_ERROR',
+              { cause: new Error(decision.message) },
+            )
+          }
           throw new LlmError(decision.message, decision.code)
         }
         if (decision.kind === 'fresh-replay') {
@@ -649,12 +695,18 @@ export class ChatGptWebAdapter extends LlmAdapter {
       let cleanupRequested: 'stop' | 'close' | undefined
       let ownedConversationId: string | undefined
       let promptSubmitted = false
+      let sessionStopped = false
+      const stopSession = async (): Promise<void> => {
+        if (sessionStopped || session === undefined) return
+        sessionStopped = true
+        await session.stop().catch(() => {})
+      }
       const cleanup: NativeRoundCleanup = (mode): Promise<void> => {
         if (cleanupRequested === undefined || mode === 'stop') cleanupRequested = mode
         if (cleanupPromise !== undefined) return cleanupPromise
         if (page === undefined && session === undefined) return Promise.resolve()
         cleanupPromise = (async () => {
-          if (mode === 'stop') await session?.stop().catch(() => {})
+          if (mode === 'stop') await stopSession()
           let cleanupError: unknown
           try {
             if (page !== undefined && promptSubmitted) {
@@ -706,6 +758,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         try {
           this.capabilities = await detectChatGptAccountCapabilities(page)
         } catch (error) {
+          if (error instanceof LlmError) throw error
           throw new LlmError(
             `ChatGPT account capability probe failed (${error instanceof Error ? error.message : String(error)}).`
             + ` page=${await describeProbePage(page)}`,
@@ -752,7 +805,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         nextBoundary: () => session!.nextBoundary(),
         deliverResults: async () => {},
         markToolResultDelivered: (revision: number) => session!.markToolResultDelivered(revision),
-        stop: () => session!.stop(),
+        stop: stopSession,
       }
       const response = createNativePhysicalResponse({
         sessionId,
@@ -762,7 +815,20 @@ export class ChatGptWebAdapter extends LlmAdapter {
         driver,
         cleanup,
       })
-      const current: ActiveNativeResponse = { response, lease, cleanup }
+      const current: ActiveNativeResponse = {
+        response,
+        lease,
+        cleanup,
+        isPhysicalAvailable: () => {
+          try {
+            return page !== undefined && !page.isClosed()
+              && response.state === 'parked'
+              && !response.hasUncertainOutcome()
+          } catch {
+            return false
+          }
+        },
+      }
       active = current
       this.nativeResponses.set(sessionId, current)
       let boundaryDelivered = false
@@ -796,6 +862,8 @@ export class ChatGptWebAdapter extends LlmAdapter {
       }
       if (lease !== undefined && !nativeReleased) {
         await lease.fail(activeCleanup ?? (async () => {}), failure).catch(() => {})
+      } else if (activeCleanup !== undefined && active === undefined) {
+        await activeCleanup(options.signal?.aborted ? 'stop' : 'close').catch(() => {})
       }
       throw failure
     }
@@ -803,6 +871,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
 
   private async * runTurn(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const connection = this.config.options()
+    this.assertRateLimitOpen()
     for (const message of options.messages) {
       if (contentHasImage(message.content)) {
         throw new LlmError(
@@ -925,6 +994,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         try {
           this.capabilities = await detectChatGptAccountCapabilities(page)
         } catch (error) {
+          if (error instanceof LlmError) throw error
           throw new LlmError(
             `ChatGPT account capability probe failed (${error instanceof Error ? error.message : String(error)}).`
             + ` page=${await describeProbePage(page)}`,
