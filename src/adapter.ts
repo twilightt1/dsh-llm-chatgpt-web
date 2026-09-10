@@ -31,6 +31,7 @@ import type {
   BrokerToolRequest,
   ConnectorRuntime,
   ConnectorTransport,
+  ResolvedNativeSecurityConfig,
 } from './native/types.ts'
 export type { ConnectorRuntime, ConnectorTransport } from './native/types.ts'
 import { CHATGPT_COMPOSER_SELECTOR, detectChatGptAccountCapabilities } from './chatgpt/session.ts'
@@ -175,6 +176,8 @@ export interface ChatGptWebConnectionOptions {
   retryPolicy: ResolvedRetryPolicy
   /** ChatGPT tool transport; text remains the default. */
   connectorTransport: ConnectorTransport
+  /** Fully resolved native security policy; text mode keeps it inert. */
+  nativeSecurity: ResolvedNativeSecurityConfig
   /** Owner of the MCP tunnel process; external preserves current behavior. */
   connectorRuntime: ConnectorRuntime
   /** Exact ChatGPT connector title used by the native MCP transport. */

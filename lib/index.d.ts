@@ -31,6 +31,120 @@ interface BrokerRoundSnapshot {
 type ConnectorTransport = 'text' | 'mcp';
 /** Owner of the native MCP tunnel process. */
 type ConnectorRuntime = 'external' | 'managed';
+type NativeToolPolicy = 'full' | 'evidence-only' | 'allowlist';
+type NativeApprovalMode = 'none' | 'workspace-policy';
+type NativeCapability = 'workspace.read' | 'workspace.search' | 'git.read' | 'execution.read' | 'side-effect';
+type NativeResultPolicy = 'text' | 'sanitized-evidence';
+interface NativeToolRuleConfig {
+  readonly tool: string;
+  readonly capability: NativeCapability;
+  readonly pathArguments?: string[];
+  readonly result?: NativeResultPolicy;
+}
+interface NativeEvidenceLimitsConfig {
+  readonly maxBytes?: number;
+  readonly maxLines?: number;
+}
+interface NativeSecurityConfig {
+  readonly toolPolicy?: NativeToolPolicy;
+  readonly workspaceRoot?: string;
+  readonly approval?: NativeApprovalMode;
+  readonly rules?: NativeToolRuleConfig[];
+  readonly evidenceLimits?: NativeEvidenceLimitsConfig;
+}
+interface ResolvedNativeToolRule {
+  readonly tool: string;
+  readonly capability: NativeCapability;
+  readonly pathArguments: readonly string[];
+  readonly result: NativeResultPolicy;
+}
+interface ResolvedNativeSecurityConfig {
+  readonly toolPolicy: NativeToolPolicy;
+  readonly workspaceRoot: string;
+  readonly workspaceRootSource: 'explicit' | 'process.cwd';
+  readonly approval: NativeApprovalMode;
+  readonly rules: readonly ResolvedNativeToolRule[];
+  readonly evidenceLimits: {
+    readonly maxBytes: number;
+    readonly maxLines: number;
+  };
+}
+interface NativePolicyRuntimeIdentity {
+  readonly adapterVersion: string;
+  readonly connectorRuntime: ConnectorRuntime;
+  readonly connectorName: string;
+  readonly brokerSocketPath: string;
+  readonly nativeRuntimeConfigPath: string;
+  readonly managedTunnelClient?: {
+    readonly version: string;
+    readonly sha256: string;
+  };
+}
+type NativeEffectiveCapability = NativeCapability | 'full-unrestricted';
+type NativeEffectiveResultPolicy = NativeResultPolicy | 'raw-unbounded';
+type NativeOutputProvenance = 'operator-declared' | 'unverified-full';
+interface NativePolicySummary {
+  readonly toolPolicy: NativeToolPolicy;
+  readonly workspaceRoot: string;
+  readonly workspaceRootSource: 'explicit' | 'process.cwd';
+  readonly connectorName: string;
+  readonly connectorRuntime: ConnectorRuntime;
+  readonly approval: NativeApprovalMode;
+  readonly tools: readonly {
+    readonly tool: string;
+    readonly capability: NativeEffectiveCapability;
+    readonly pathArguments: readonly string[];
+    readonly result: NativeEffectiveResultPolicy;
+    readonly outputProvenance: NativeOutputProvenance;
+    readonly schemaHash?: string;
+  }[];
+  readonly evidenceLimits: {
+    readonly maxBytes: number;
+    readonly maxLines: number;
+  };
+}
+interface NativeCallPolicyBinding {
+  readonly toolName: string;
+  readonly capability: NativeEffectiveCapability;
+  readonly resultPolicy: NativeEffectiveResultPolicy;
+  readonly schemaHash: string;
+  readonly argumentsHash: string;
+  readonly callOrdinal: number;
+  readonly pathArguments: readonly string[];
+}
+type NativeInvocationDecision = {
+  readonly allowed: false;
+  readonly code: 'NATIVE_POLICY_DENIED';
+  readonly message: string;
+} | {
+  readonly allowed: true;
+  readonly arguments: Readonly<Record<string, unknown>>;
+  readonly binding: NativeCallPolicyBinding;
+};
+interface NativePolicyRound {
+  authorizeInvocation(tool: string, args: Record<string, unknown>, callOrdinal: number): NativeInvocationDecision;
+  projectResult(binding: NativeCallPolicyBinding, result: BrokerToolResult): BrokerToolResult;
+}
+interface NativeCoordinatorSnapshot {
+  readonly sessionId: string;
+  readonly canonicalMessages: readonly Message[];
+  readonly broker: BrokerRoundSnapshot;
+  readonly policyHash: string;
+  readonly inventoryHash: string;
+  readonly approvalHash: string;
+}
+interface PreparedNativeRound {
+  readonly coordinatorSnapshot: NativeCoordinatorSnapshot;
+  openRound(): NativePolicyRound;
+}
+interface PreparedNativeRequest {
+  readonly providerOptions: GenerateOptions;
+  readonly policyHash: string;
+  readonly inventoryHash: string;
+  readonly approvalHash: string;
+  readonly summary: NativePolicySummary;
+  readonly nativeRound?: PreparedNativeRound;
+}
 /** JSON-RPC request/response values used by the private broker socket. */
 interface BrokerRpcError {
   readonly message: string;
@@ -198,6 +312,8 @@ interface ChatGptWebConnectionOptions {
   retryPolicy: ResolvedRetryPolicy;
   /** ChatGPT tool transport; text remains the default. */
   connectorTransport: ConnectorTransport;
+  /** Fully resolved native security policy; text mode keeps it inert. */
+  nativeSecurity: ResolvedNativeSecurityConfig;
   /** Owner of the MCP tunnel process; external preserves current behavior. */
   connectorRuntime: ConnectorRuntime;
   /** Exact ChatGPT connector title used by the native MCP transport. */
@@ -331,6 +447,8 @@ interface Config {
   brokerSocketPath?: string;
   /** Native MCP call/round timeout in milliseconds. */
   mcpInvocationTimeoutMs?: number;
+  /** Native tool policy and workspace security controls. */
+  nativeSecurity?: NativeSecurityConfig;
 }
 declare const Config: z<Config>;
 /**
@@ -344,4 +462,4 @@ declare function defaultBrokerSocketPath(profileDir: string): string;
 declare function resolveAdapterOptions(config: Config, platform?: NodeJS.Platform, arch?: string): ChatGptWebConnectionOptions;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeRoundCleanup, NativeRoundCoordinator, type NativeStepLease, NativeToolBroker, PROVIDER, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };
+export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeApprovalMode, type NativeCapability, type NativeEffectiveCapability, type NativeEffectiveResultPolicy, type NativeEvidenceLimitsConfig, type NativePolicyRuntimeIdentity, type NativePolicySummary, type NativeResultPolicy, type NativeRoundCleanup, NativeRoundCoordinator, type NativeSecurityConfig, type NativeStepLease, NativeToolBroker, type NativeToolPolicy, type NativeToolRuleConfig, PROVIDER, type PreparedNativeRequest, type ResolvedNativeSecurityConfig, type ResolvedNativeToolRule, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };

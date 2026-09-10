@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto'
 import type { GenerateOptions, Message, ReplayEnvelope } from '@deepseek-ai/dsh-llm'
+import { canonicalJson, hashCanonical } from './canonical.ts'
 import type {
   BrokerToolRequest,
   BrokerToolResult,
@@ -45,35 +45,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/**
- * Serialize JSON-shaped values with stable object-key ordering. Undefined
- * object fields are omitted in the same way as JSON.stringify; undefined
- * array entries become null. Native request inputs are JSON-shaped by the LLM
- * contract, but rejecting unsupported values keeps the fingerprint honest.
- */
-function canonicalJson(value: unknown): string {
-  const normalize = (input: unknown, inArray = false): unknown => {
-    if (input === undefined) return inArray ? null : undefined
-    if (input === null || typeof input === 'string' || typeof input === 'boolean') return input
-    if (typeof input === 'number') {
-      if (!Number.isFinite(input)) throw new TypeError('native execution identity cannot contain a non-finite number')
-      return input
-    }
-    if (typeof input !== 'object') throw new TypeError('native execution identity contains a non-JSON value')
-    if (Array.isArray(input)) return input.map(item => normalize(item, true))
-    const result: Record<string, unknown> = {}
-    for (const key of Object.keys(input).sort()) {
-      const child = normalize((input as Record<string, unknown>)[key])
-      if (child !== undefined) result[key] = child
-    }
-    return result
-  }
-  const normalized = normalize(value)
-  const serialized = JSON.stringify(normalized)
-  if (serialized === undefined) return 'undefined'
-  return serialized
-}
-
 function messageProjection(message: Message): CanonicalRecord {
   const source = Object.fromEntries(
     Object.entries(message.source).filter(([key]) => key !== 'replayState'),
@@ -114,17 +85,13 @@ function toolProjection(options: GenerateOptions): unknown {
   return options.tools
 }
 
-function hash(value: unknown): string {
-  return createHash('sha256').update(canonicalJson(value)).digest('hex')
-}
-
 /**
  * Hash the provider-visible request identity. Harness message IDs, session
  * IDs, abort signals, and adapter-private replay metadata are deliberately
  * excluded; the hash is safe to carry as opaque routing state.
  */
 export function nativeExecutionKey(options: GenerateOptions): string {
-  return hash(requestProjection(options))
+  return hashCanonical('native-execution', 1, requestProjection(options))
 }
 
 function assertReplayArguments(executionKey: string, boundary: number, callIds: readonly string[]): void {

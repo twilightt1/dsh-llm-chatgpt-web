@@ -47,12 +47,24 @@ describe('plugin', () => {
   it('resolves defaults and validates the catalog', () => {
     const options = resolveAdapterOptions({})
     expect(options.connectorTransport).toBe('text')
+    expect(options.nativeSecurity).toMatchObject({
+      toolPolicy: 'full',
+      approval: 'none',
+      workspaceRootSource: 'process.cwd',
+      evidenceLimits: { maxBytes: 65_536, maxLines: 200 },
+    })
     expect(options.profileDir.length).toBeGreaterThan(0)
     expect(options.models.map(m => m.id)).toContain('chatgpt-web/high')
     expect(() => resolveAdapterOptions({ models: [{ id: 'openai/gpt-4' }] })).toThrowError(/chatgpt-web\//)
     expect(() => resolveAdapterOptions({
       models: [{ id: 'chatgpt-web/high' }, { id: 'chatgpt-web/high' }],
     })).toThrowError(/duplicate/i)
+  })
+
+  it('rejects control bytes in native path configuration', () => {
+    expect(() => resolveAdapterOptions({ profileDir: '/tmp/profile\nname' })).toThrow(/profileDir.*control/i)
+    expect(() => resolveAdapterOptions({ brokerSocketPath: '/tmp/broker\u0000.sock' })).toThrow(/brokerSocketPath.*control/i)
+    expect(() => resolveAdapterOptions({ nativeRuntimeConfigPath: '/tmp/runtime\r.json' })).toThrow(/nativeRuntimeConfigPath.*control/i)
   })
 
   it('resolves native connector defaults and rejects an empty connector name', () => {
