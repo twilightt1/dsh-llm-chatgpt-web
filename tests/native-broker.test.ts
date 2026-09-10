@@ -78,6 +78,18 @@ describe('NativeToolBroker', () => {
     broker.close()
   })
 
+  it('allows a native response to complete before the optional handshake', () => {
+    const broker = new NativeToolBroker()
+    const requestId = broker.register({
+      sessionId: 's1', tools: [tool], invocationTimeoutMs: 90_000, ttlMs: 1_000,
+    })
+    const revision = broker.beginCompletionFence(requestId)
+    expect(revision).toBeTypeOf('number')
+    expect(broker.commitCompletionFence(requestId, revision!)).toBe(true)
+    expect(broker.beginCompletionFence(requestId)).toBe(revision)
+    broker.close()
+  })
+
   it('renews an active round while the browser is still polling', async () => {
     vi.useFakeTimers()
     const broker = new NativeToolBroker()

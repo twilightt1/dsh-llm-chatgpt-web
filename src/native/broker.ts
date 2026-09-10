@@ -335,7 +335,11 @@ export class NativeToolBroker {
   beginCompletionFence(requestId: string): number | undefined {
     const channel = this.requireRound(requestId)
     if (channel.completionRevision !== undefined) return channel.completionRevision
-    if (channel.state !== 'running') return undefined
+    // A native response may answer without ever invoking a connector tool.
+    // Keep the optional MCP handshake from turning that valid completion into
+    // an inactivity timeout; any later handshake observes the completion fence
+    // and is rejected rather than opening a new activity.
+    if (channel.state !== 'running' && channel.state !== 'awaiting_start') return undefined
     if (channel.activities.size > 0 || channel.invocations.size > 0) return undefined
     return channel.activityRevision
   }
@@ -346,7 +350,7 @@ export class NativeToolBroker {
     }
     const channel = this.requireRound(requestId)
     if (channel.completionRevision !== undefined) return channel.completionRevision === revision
-    if (channel.state !== 'running'
+    if ((channel.state !== 'running' && channel.state !== 'awaiting_start')
       || channel.activityRevision !== revision
       || channel.activities.size > 0
       || channel.invocations.size > 0) return false
