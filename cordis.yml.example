@@ -23,6 +23,19 @@
     # brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
     # nativeRuntimeConfigPath: ~/.dsh-chatgpt-web/native-runtime.json
     # mcpInvocationTimeoutMs: 90000
+    # Secure policy (use an absolute workspace and exact DSH inventory names):
+    # nativeSecurity:
+    #   toolPolicy: evidence-only
+    #   workspaceRoot: /absolute/path/to/workspace
+    #   approval: workspace-policy
+    #   evidenceLimits:
+    #     maxBytes: 65536
+    #     maxLines: 200
+    #   rules:
+    #     - tool: read_file
+    #       capability: workspace.read
+    #       pathArguments: [/path]
+    #       result: sanitized-evidence
     # turnTimeoutMs: 300000
     # stallTimeoutMs: 120000
     models:

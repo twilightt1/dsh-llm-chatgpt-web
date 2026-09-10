@@ -21,17 +21,17 @@ dsh web
 > prebuilt `lib/` and needs **no** `allowBuilds` entry. If your client still
 > prompts, decline it — nothing here needs to run at install time.
 
-## 0.6.0 candidate notes
+## 0.7.0 candidate notes
 
 - Native MCP now keeps compatible tool-result steps on one physical ChatGPT
   response, with exact correlation, journaled replay, and safe fresh-replay
   fallback.
-- Managed setup remains pinned, private, and fail-closed; text transport is
-  unchanged and remains the default.
-- Automated/package gates pass. This is an experimental 0.6.0 release: a real
-  native tool continuation is not yet release-ready because ChatGPT safety
-  checks blocked the bounded live tool probes. It is not presented as
-  API-equivalent or production-ready.
+- Native security policies, local approval grants, private checkpoint recovery,
+  advisory security snapshots, and a read-only JSON doctor are included. Text
+  transport is unchanged and remains the default.
+- This is an experimental 0.7.0 release: a real native tool continuation is not
+  yet release-ready because ChatGPT safety checks blocked the bounded live tool
+  probes. It is not presented as API-equivalent or production-ready.
 
 ## How it works
 
@@ -109,8 +109,8 @@ bundle to the profile automatically (`--dump-config` shows the
 **B. Prebuilt tarball (no build permission asked):**
 
 ```sh
-pnpm pack   # → dsh-llm-chatgpt-web-0.x.y.tgz
-dsh plugin --profile web add ./dsh-llm-chatgpt-web-0.x.y.tgz
+pnpm pack   # → dsh-llm-chatgpt-web-0.7.0.tgz
+dsh plugin --profile web add ./dsh-llm-chatgpt-web-0.7.0.tgz
 ```
 
 **C. GitHub (prebuilt `lib/` committed — no build permission needed):**
@@ -170,6 +170,19 @@ the profile directory and run again.
     # brokerSocketPath: ~/.dsh-chatgpt-web/native-broker.sock
     # nativeRuntimeConfigPath: ~/.dsh-chatgpt-web/native-runtime.json
     # mcpInvocationTimeoutMs: 90000
+    # Secure policy example (use an absolute workspace path and exact DSH tool names):
+    # nativeSecurity:
+    #   toolPolicy: evidence-only
+    #   workspaceRoot: /absolute/path/to/workspace
+    #   approval: workspace-policy
+    #   evidenceLimits:
+    #     maxBytes: 65536
+    #     maxLines: 200
+    #   rules:
+    #     - tool: read_file
+    #       capability: workspace.read
+    #       pathArguments: [/path]
+    #       result: sanitized-evidence
     # chromeExecutablePath: /usr/bin/google-chrome
 
 - id: agent-loop
@@ -272,7 +285,69 @@ it opens a ChatGPT turn. In managed mode, do **not** separately launch
 `dsh-chatgpt-web-mcp`; the managed runtime launches the built stdio MCP
 command itself.
 
-#### 5. Doctor and stop
+#### 5. Security policy, approval, and recovery
+
+Native policy is opt-in and defaults to `toolPolicy: full` with
+`approval: none`; secure deployments should use `toolPolicy: evidence-only` or
+`allowlist`, an explicit absolute `workspaceRoot`, and
+`approval: workspace-policy`. Tool names and RFC 6901 `pathArguments` must
+match the actual DSH inventory exactly. The configured tool must accept the
+canonical absolute paths supplied by the adapter. If `workspaceRoot` is omitted,
+it falls back to `process.cwd`; `doctor` warns about that weaker, launch-location
+dependent boundary. Rule capabilities are operator-declared labels, not
+inferences from a tool name, description, or schema.
+
+A workspace-local `.dsh-chatgptignore` is an optional UTF-8 file no larger than
+64 KiB. Its v1 grammar is deliberately literal: blank lines and `#` comments
+are ignored, and each other line is one workspace-relative POSIX path; a
+trailing `/` covers that directory subtree. Absolute paths, `..`, globs,
+negation, duplicate entries, control bytes, malformed UTF-8, and symlinks are
+rejected. Built-in sensitive-file rules cannot be negated.
+
+`evidence-only` and `allowlist` provide exact inventory filtering,
+authorization-time path validation/rewrite, and deterministic text result
+projection. They are **not** a sandbox, DLP boundary, or provenance proof:
+tools can ignore declared arguments, a path can change after authorization
+(the remaining TOCTOU limitation), and broad output may not originate only from
+approved files. The sanitizer emits text-only, bounded, deterministic output;
+it can redact secrets, replace home paths, and withhold content, while preserving
+`isError`, but it cannot prove where broad tool output originated. Output
+provenance is an operator declaration, not an adapter proof. Full mode preserves
+the existing unrestricted output behavior and is marked with an
+output-provenance warning by `doctor`.
+
+Continuation keeps a canonical DSH history/result view for exact durability
+proof and a separate sanitized/rebased provider view for ChatGPT. Checkpoint,
+grant, and security files store hashes and bounded metadata only—not prompts,
+raw arguments, raw result bodies, cookies, credentials, or conversation IDs.
+
+When a secure policy has effective tools, the first request creates a private
+approval challenge. Review the exact summary and type `approve` through the
+interactive command before any provider submission:
+
+```sh
+dsh-chatgpt-web-native approve \
+  --profile-dir "$HOME/.dsh-chatgpt-web" \
+  --challenge challenge_<challenge-id>
+```
+
+Policy, implementation, connector, schema inventory, workspace, and limit
+changes invalidate the grant. Native journals and the ownership ledger are
+private and fail closed on malformed or uncertain state. The checkpoint-writer
+lease is profile-wide: a live, stale-but-unproven, or ambiguous owner blocks
+mutation and recovery. A blocked checkpoint must not be replayed merely because
+a page or process disappeared; use
+`recover --abandon` only with the runtime stopped, an interactive TTY, the
+exact checkpoint hash, and the exact `abandon` confirmation. Abandonment never
+claims that an uncertain side effect did or did not happen.
+
+A package rollback is safe only after the v0.7.0 runtime is stopped and
+`doctor --json` proves the runtime is offline, no checkpoint writer is held,
+every checkpoint is terminal, no replay is consumed-but-unresolved, and the
+owned-conversation ledger is empty. Preserve that clean report before
+installing an older package.
+
+#### 6. Doctor and stop
 
 `doctor` is read-only and never prints the runtime-key value. Use `--json`
 for a stable, redacted report suitable for an operator check:
@@ -291,7 +366,7 @@ dsh-chatgpt-web-native stop \
 `stop` stops only the configured local tunnel alias; it does not delete the
 runtime key, config, tunnel, or ChatGPT connector.
 
-#### 6. Existing external runtime
+#### 7. Existing external runtime
 
 For an externally owned tunnel, keep the plugin opt-in but select the external
 owner explicitly:
@@ -314,7 +389,7 @@ The package does not authenticate or supervise that external tunnel. Existing
 external MCP deployments remain supported; no managed config or account setup
 is required for them.
 
-#### 7. Fail-closed and evidence semantics
+#### 8. Fail-closed and evidence semantics
 
 Native mode exposes only `dsh_round_start`, `dsh_tool_inventory`, and
 `dsh_tool_call`. The broker snapshots the current DSH tool schemas, and all
@@ -328,7 +403,7 @@ fail closed. After Send, the adapter never switches transport. A sentence
 claiming that a command ran is not evidence; only the DSH call/result events
 count.
 
-#### 8. Live E2E gate
+#### 9. Live E2E gate
 
 Do not call native E2E live or successful unless all of these are verified:
 
@@ -347,7 +422,7 @@ Do not call native E2E live or successful unless all of these are verified:
 If the account connector, tunnel, aligned artifacts, or session evidence
 cannot be verified, report that blocker and do not claim live native E2E.
 
-#### 9. Credential cleanup
+#### 10. Credential cleanup
 
 Runtime keys must stay outside this repository, Cordis YAML, prompts, logs,
 screenshots, and session history. Remove temporary source key files and
