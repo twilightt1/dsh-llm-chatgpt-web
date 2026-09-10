@@ -9,6 +9,7 @@ import {
 import { isAbsolute, join, resolve } from 'node:path'
 import { NativeApprovalRequiredError, NativeSafetyError } from './errors.ts'
 import {
+  assertPrivateDirectory,
   assertPrivateRegularFile,
   durableAtomicWritePrivateFile,
   ensurePrivateDirectory,
@@ -262,6 +263,74 @@ function approvalDirectory(profileDir: string): string {
     throw new NativeSafetyError('native approval directory is not private', error, 'NATIVE_APPROVAL_STATE')
   }
   return directory
+}
+
+function readOnlyProfile(value: string): string {
+  if (typeof value !== 'string' || CONTROL_BYTES.test(value) || !isAbsolute(value)) {
+    throw new NativeSafetyError('native approval profile directory must be an absolute control-free path', undefined, 'NATIVE_APPROVAL_STATE')
+  }
+  const resolved = resolve(value)
+  try {
+    lstatSync(resolved)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return resolved
+    throw new NativeSafetyError('native approval profile directory could not be inspected safely', error, 'NATIVE_APPROVAL_STATE')
+  }
+  try {
+    assertPrivateDirectory(resolved, 'native approval profile directory')
+  } catch (error) {
+    if (error instanceof NativeSafetyError) throw error
+    throw new NativeSafetyError('native approval profile directory is not private', error, 'NATIVE_APPROVAL_STATE')
+  }
+  return resolved
+}
+
+function readOnlyApprovalDirectory(profileDir: string): string | undefined {
+  const resolved = readOnlyProfile(profileDir)
+  try {
+    lstatSync(resolved)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw new NativeSafetyError('native approval profile directory could not be inspected safely', error, 'NATIVE_APPROVAL_STATE')
+  }
+  try {
+    const directory = join(resolved, APPROVAL_DIRECTORY)
+    try {
+      lstatSync(directory)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw error
+    }
+    assertPrivateDirectory(directory, 'native approval directory')
+    inspectApprovalDirectory(directory)
+    return directory
+  } catch (error) {
+    if (error instanceof NativeSafetyError) throw error
+    throw new NativeSafetyError('native approval directory is not private', error, 'NATIVE_APPROVAL_STATE')
+  }
+}
+
+export interface NativeApprovalStateInspection {
+  readonly directory: 'missing' | 'ok'
+  readonly challenge?: NativeApprovalChallengeV1
+  readonly grant?: NativeApprovalGrantV1
+  readonly claimCount: number
+}
+
+/** Read approval files without creating, claiming, replacing, or repairing them. */
+export function readNativeApprovalState(profileDir: string): NativeApprovalStateInspection {
+  const directory = readOnlyApprovalDirectory(profileDir)
+  if (directory === undefined) return { directory: 'missing', claimCount: 0 }
+  const entries = readdirSync(directory)
+  const claimCount = entries.filter(entry => CLAIM_FILE.test(entry)).length
+  const challenge = readJson(join(directory, PENDING_FILE), 'pending challenge', parsePending)
+  const grant = readJson(join(directory, GRANT_FILE), 'grant', parseGrant)
+  return {
+    directory: 'ok',
+    ...(challenge === undefined ? {} : { challenge }),
+    ...(grant === undefined ? {} : { grant }),
+    claimCount,
+  }
 }
 
 function clock(now?: Date): Date {

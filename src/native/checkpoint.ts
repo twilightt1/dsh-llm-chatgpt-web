@@ -1236,9 +1236,22 @@ export class NativeCheckpointStoreImpl implements NativeCheckpointStore {
   }
 
   private load(allowTailTruncate: boolean): JournalState[] {
-    ensurePrivateDirectory(this.profileDir)
-    ensurePrivateDirectory(this.directory)
-    assertPrivateDirectory(this.directory)
+    // Inspection is deliberately read-only. Mutating callers already hold the
+    // writer lease and acquire() has created both directories.
+    try {
+      lstatSync(this.profileDir)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return []
+      throw safety('native checkpoint profile directory could not be inspected safely', error)
+    }
+    assertPrivateDirectory(this.profileDir, 'native checkpoint profile directory')
+    try {
+      lstatSync(this.directory)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return []
+      throw safety('native checkpoint journal directory could not be inspected safely', error)
+    }
+    assertPrivateDirectory(this.directory, 'native checkpoint journal directory')
     const entries = readdirSync(this.directory, { withFileTypes: true })
     const states: JournalState[] = []
     for (const entry of entries) {

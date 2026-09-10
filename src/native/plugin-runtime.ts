@@ -18,6 +18,8 @@ import {
 } from './tunnel-runtime.ts'
 import type { CommandRunner } from './process.ts'
 import { compileNativeSecurityPolicy } from './policy.ts'
+import { writeNativeSecurityState } from './security-state.ts'
+import { currentProcessStartedAt } from './private-files.ts'
 import { createNativeCheckpointStore } from './checkpoint.ts'
 import type {
   NativeCheckpointStore,
@@ -242,7 +244,12 @@ export function createNativePluginRuntime(
         managedConfig.tunnel.profileDir,
       ]),
     ]
-    return compileNativeSecurityPolicy(current.nativeSecurity, privatePaths).prepareRequest(options, policyRuntime)
+    const prepared = compileNativeSecurityPolicy(current.nativeSecurity, privatePaths).prepareRequest(options, policyRuntime)
+    writeNativeSecurityState(current.profileDir, prepared, {
+      pid: process.pid,
+      startedAt: currentProcessStartedAt(),
+    })
+    return prepared
   }
   const quiesce = (): Promise<void> => {
     if (quiescePromise !== undefined) return quiescePromise

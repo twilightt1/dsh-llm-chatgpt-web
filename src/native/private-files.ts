@@ -9,6 +9,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   unlinkSync,
@@ -331,6 +332,60 @@ function readWriterOwner(path: string): PrivateWriterOwner {
 }
 
 const DEFAULT_PROCESS_STARTED_AT = new Date(Date.now() - process.uptime() * 1_000).toISOString()
+
+export type PrivateWriterLeaseInspectionState = 'missing' | 'live' | 'stale' | 'ambiguous' | 'invalid'
+
+export interface PrivateWriterLeaseInspection {
+  readonly state: PrivateWriterLeaseInspectionState
+  readonly reason?: string
+}
+
+/** Stable process-start identity shared by leases and advisory diagnostics. */
+export function currentProcessStartedAt(): string {
+  return DEFAULT_PROCESS_STARTED_AT
+}
+
+/** Inspect the writer lease without acquiring, repairing, or deleting it. */
+export function inspectPrivateWriterLease(profileDir: string, now = new Date()): PrivateWriterLeaseInspection {
+  const lockPath = join(profileDir, PRIVATE_WRITER_LOCK)
+  try {
+    lstatSync(profileDir)
+    assertPrivateDirectory(profileDir, 'private writer profile directory')
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return { state: 'missing' }
+    return { state: 'invalid', reason: 'profile directory is not private' }
+  }
+  try {
+    lstatSync(lockPath)
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return { state: 'missing' }
+    return { state: 'invalid', reason: 'writer lease path could not be inspected' }
+  }
+  try {
+    assertPrivateDirectory(lockPath, 'private writer lease')
+    const entries = readdirSync(lockPath)
+    if (entries.length !== 1 || entries[0] !== PRIVATE_WRITER_OWNER) {
+      return { state: 'invalid', reason: 'writer lease contains unexpected entries' }
+    }
+    const owner = readWriterOwner(join(lockPath, PRIVATE_WRITER_OWNER))
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+      return { state: 'ambiguous', reason: 'writer lease inspection clock is invalid' }
+    }
+    if (Date.parse(owner.heartbeatAt) > now.getTime() || Date.parse(owner.processStartedAt) > now.getTime()) {
+      return { state: 'ambiguous', reason: 'writer lease timestamp is in the future' }
+    }
+    const observed = defaultWriterDependencies().inspectProcess(owner.pid)
+    if (observed.kind === 'dead') return { state: 'stale', reason: 'writer lease owner is dead' }
+    if (observed.kind === 'ambiguous') return { state: 'ambiguous', reason: 'writer lease owner is ambiguous' }
+    if (observed.startedAt !== owner.processStartedAt) {
+      return { state: 'ambiguous', reason: 'writer lease PID reuse is ambiguous' }
+    }
+    return { state: 'live' }
+  } catch (error) {
+    if (error instanceof NativeSafetyError) return { state: 'invalid', reason: 'writer lease metadata is invalid' }
+    return { state: 'ambiguous', reason: 'writer lease process state is ambiguous' }
+  }
+}
 
 function defaultWriterDependencies(): PrivateWriterLeaseDependencies {
   const processStartedAt = DEFAULT_PROCESS_STARTED_AT

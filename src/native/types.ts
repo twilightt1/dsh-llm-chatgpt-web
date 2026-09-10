@@ -65,6 +65,50 @@ export interface NativeApprovalGrantV1 {
   readonly summaryHash: string
 }
 
+/** Private advisory state written after a native request has been prepared. */
+export interface NativeSecurityStateV1 {
+  readonly version: 1
+  readonly generatedAt: string
+  readonly runtimeProcess: {
+    readonly pid: number
+    readonly startedAt: string
+  }
+  readonly policyHash: string
+  readonly inventoryHash: string
+  readonly approvalHash: string
+  readonly workspaceRootSource: 'explicit' | 'process.cwd'
+  readonly summary: NativePolicySummary
+}
+
+export type NativeDoctorStatus = 'ok' | 'warning' | 'error'
+
+export interface NativeDoctorCheck {
+  readonly id: string
+  readonly status: NativeDoctorStatus
+  readonly summary: string
+  readonly action?: string
+}
+
+export interface NativeDoctorReport {
+  readonly version: 2
+  readonly ok: boolean
+  readonly checks: readonly NativeDoctorCheck[]
+  readonly config: 'ok' | 'missing' | 'invalid'
+  readonly binary: 'ok' | 'missing' | 'invalid'
+  readonly key: 'ok' | 'missing' | 'invalid'
+  readonly profile: 'ok' | 'missing'
+  readonly runtime: {
+    readonly ok: boolean
+    readonly processRunning: boolean
+    readonly healthy: boolean
+    readonly ready: boolean
+    readonly state?: string
+    readonly detail: string
+  } | { readonly state: 'stopped' }
+  readonly broker: 'ready' | 'stopped' | 'invalid'
+  readonly issues: readonly string[]
+}
+
 export type NativeToolPolicy = 'full' | 'evidence-only' | 'allowlist'
 export type NativeApprovalMode = 'none' | 'workspace-policy'
 export type NativeCapability =
