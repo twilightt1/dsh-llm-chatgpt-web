@@ -1,13 +1,15 @@
 # dsh-llm-chatgpt-web
 
 ChatGPT Web as a DeepSeek Harness (`dsh`) provider — standalone. The plugin
-owns its Chromium, signs in once, and drives a fresh ChatGPT page per turn.
-Text turns use Temporary Chat; opt-in native MCP turns use a normal
-connector-enabled chat and delete that adapter-owned conversation after its
-round settles. The default text transport needs no external bridge; an opt-in
-Unix MCP transport adds a local broker and stdio MCP server; a separately
-provisioned connector/tunnel makes it reachable without changing DSH's agent
-loop.
+owns its Chromium and signs in once. Text turns use a fresh Temporary Chat
+page; opt-in native MCP turns use a normal connector-enabled chat whose
+physical response can span several compatible DSH tool-result steps. The
+adapter-owned conversation is deleted when that physical response settles; an
+explicit compatibility change or page loss uses safe fresh replay only after
+durable results are proven. The default text transport needs no external
+bridge; an opt-in Unix MCP transport adds a local broker and stdio MCP server;
+a separately provisioned connector/tunnel makes it reachable without changing
+DSH's agent loop.
 
 ```sh
 dsh plugin --profile web add github:twilightt1/dsh-llm-chatgpt-web
@@ -23,26 +25,31 @@ dsh web
 
 ```
 DSH agent-loop → GenerateOptions → ChatGptWebAdapter.stream()
-  → fresh ChatGPT page (Temporary Chat for text; normal chat for native MCP)
-  → select effort → attach prompt → send
-  → poll answer DOM (block segments → Markdown buffer)
-  → text-delta StreamChunks → usage + finish
+  → text: fresh Temporary Chat page
+  → native: one connector-enabled physical response + broker request
+  → select effort → attach prompt → one Send
+  → poll answer DOM (persistent Markdown buffer)
+  → logical StreamChunks → usage + finish/tool boundary
 
 Default text tools: JSON envelope + fenced tool-call contract.
 Opt-in native tools: local broker ← stdio MCP façade ← connector/tunnel
   ← exact ChatGPT connector;
-  broker batches become ordinary DSH tool-call chunks, then the next step uses
-  a fresh normal connector-enabled chat with canonical DSH history.
-  The adapter deletes each exact owned native conversation after settlement.
+  broker batches become ordinary DSH tool-call chunks, then the next compatible
+  step resolves exact results into the same physical response. Incompatible
+  history/configuration or a recoverable page loss fences the old response
+  before one canonical fresh replay. The adapter deletes each exact owned
+  native conversation after settlement.
 ```
 
-Each turn carries the full visible history in its prompt (stateless turns, no
-cross-turn browser state). Text turns use Temporary Chat. Native tool turns
-use a fresh normal chat because ChatGPT disables connectors in Temporary Chat;
-the adapter records its exact conversation ID and deletes that chat after the
-native round completes. A private restart-safe ledger retries failed cleanup
-before the next native turn. Turns are serialized: at most one page is ever
-active.
+Text turns carry the full visible history in their prompt and remain
+stateless across turns. Native tool turns use a normal chat because ChatGPT
+disables connectors in Temporary Chat; one physical response retains its
+assistant identity, broker request, DOM/Markdown cursor, deadlines, and
+append-only logical-boundary journals while DSH executes tools. A compatible
+next request must contain the exact assistant call and one text-only result per
+call; it does not allocate a page, compile a prompt, select a connector, or
+press Send again. A private restart-safe ledger retries failed cleanup before
+the next native turn. Turns are serialized: at most one page is ever active.
 
 The prompt transport follows codex-chatgpt-web's proven design: the DSH
 conversation is wrapped in a `<dsh_context_json>` envelope with an explicit
@@ -55,6 +62,19 @@ append-only buffer with source ranges preserves code fences (including
 ```tool-call blocks), tables, and headings without retracting streamed text.
 The session is persisted back to the profile after every completed turn
 because ChatGPT rotates session tokens.
+
+### Native continuation safety
+
+Native continuation is experimental and remains opt-in. The replay envelope
+contains only a versioned non-secret execution hash, logical boundary, and
+opaque call IDs. Changes to provider-visible history, model, system prompt,
+tool schemas, generation options, steering, or physical-page health select an
+explicit fresh-replay path only when every prior tool result is durable and no
+side effect is uncertain. A transport failure after submission, ambiguous tool
+outcome, correlation conflict, or cleanup failure stops without resubmitting.
+`RATE_LIMIT` opens a fixed five-minute adapter-local cooldown and is never
+automatically retried. Text transport and auxiliary title/compaction calls do
+not use this lifetime.
 
 ## Prerequisites
 
@@ -338,12 +358,15 @@ or retain the managed key intentionally and document the remaining risk.
   Personalized connector named exactly `DSH Native` (or `connectorName`) and
   call `dsh_round_start`, `dsh_tool_inventory`, and `dsh_tool_call`. Broker
   batches are emitted through the normal DSH loop; no nested loop or direct
-  `ctx.tools.execute()` path exists. Native results are text-only. Each native
-  step uses a fresh normal connector-enabled chat, records the exact
-  adapter-created conversation ID, and deletes/verifies it after settlement;
-  failed deletions remain in a private ledger for retry. A tunnel/connector is
-  required for live native E2E; this repository's local MCP and broker tests do
-  not claim that external setup.
+  `ctx.tools.execute()` path exists. Native results are text-only. Compatible
+  tool-result steps continue the same connector-enabled physical response,
+  broker request, conversation, and Send. Context/model/schema/options changes
+  and recoverable page loss use canonical fresh replay only after durable
+  results and cleanup safety are proven; uncertain effects fail without a
+  hidden resubmit. Exact adapter-created conversation IDs are deleted after
+  settlement, and failed deletions remain in a private ledger for retry. A
+  tunnel/connector is required for live native E2E; this repository's local
+  MCP and broker tests do not claim that external setup.
 - Usage is a client-side char-based estimate; the page exposes no measured
   counts.
 - Reasoning/thinking content is not surfaced separately in V1.
@@ -381,11 +404,11 @@ Proven against a real Plus-class account (Sep 2026, after the JSON-envelope
   effort slider → attach JSON-envelope prompt → submit → streamed Markdown
   deltas (headings, lists, bold all survive) → usage + `stop` finish, on
   both the src (tsx) and built `lib/` paths.
-- Text-mode tool behavior is covered locally through the adapter contract and
-  DSH chunk tests. Native turns use a normal connector-enabled chat and
-  exact-ID cleanup; native MCP live E2E is intentionally not claimed until a
-  verifiable ChatGPT connector/tunnel and aligned profile artifacts are
-  available.
+- Text-mode tools and native persistent continuation are covered by local
+  adapter, broker, coordinator, physical-response, and replay tests. Native
+  MCP live E2E is intentionally not claimed until a verifiable ChatGPT
+  connector/tunnel, aligned profile artifacts, one-page/one-Send continuation,
+  final answer, and cleanup ledger are observed.
 - The storage state persists after every completed turn (ChatGPT rotates
   session tokens); `storage-state.json` mtime advances per turn.
 - Heavier reasoning efforts (think/medium/high) need the raised budgets
@@ -412,6 +435,8 @@ Proven against a real Plus-class account (Sep 2026, after the JSON-envelope
 | `src/native/broker-socket.ts` | Private Unix JSON-line RPC transport |
 | `src/native/mcp-server.ts` | Fixed MCP façade and handshake |
 | `src/native/coordinator.ts` | Parked-page/session ownership transitions |
+| `src/native/continuation.ts` | Execution identity, result correlation, and replay decisions |
+| `src/native/physical-response.ts` | Persistent native response journals and uncertainty state |
 | `src/native/plugin-runtime.ts` | Broker, tunnel readiness, and unload lifecycle |
 | `src/native/mcp-main.ts` | Stdio MCP executable entry point |
 | `src/native/setup-main.ts` | Managed runtime setup, doctor, and stop executable |
