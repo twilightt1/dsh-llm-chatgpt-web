@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { ChatGptProgressTracker } from '../src/chatgpt/progress.ts'
 import { classifyTurnFailure } from '../src/adapter.ts'
 import { openNewPageWithReconnect } from '../src/chatgpt/browser.ts'
 import {
@@ -47,6 +48,26 @@ describe('resolveReboundAssistantTurnIdentity', () => {
       'conversation-turn-4',
       ['conversation-turn-2', 'conversation-turn-6'],
     )).toBe('conversation-turn-6')
+  })
+})
+
+describe('ChatGptProgressTracker regression', () => {
+  it('fails a running turn that has no meaningful progress', () => {
+    const tracker = new ChatGptProgressTracker({
+      startedAt: 1_000,
+      absoluteTimeoutMs: 10_000,
+      inactivityTimeoutMs: 2_000,
+    })
+    const sample = {
+      assistantIdentity: 'conversation-turn-2',
+      text: '',
+      html: '',
+      running: true,
+      nativeRevision: 0,
+    }
+    tracker.observe(sample, 1_000)
+    tracker.observe(sample, 2_999)
+    expect(() => tracker.assertAlive('first-progress', 3_000)).toThrow(/first-progress/i)
   })
 })
 

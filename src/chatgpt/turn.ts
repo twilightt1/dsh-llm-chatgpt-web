@@ -40,6 +40,8 @@ import {
   type NativeBrowserControl,
 } from './connector.ts'
 import type { BrokerToolRequest } from '../native/types.ts'
+import { ChatGptProgressTracker } from './progress.ts'
+import type { ChatGptProgressSample, ChatGptProgressStage } from './progress.ts'
 
 /** Composer budget in chars (measured upstream envelope, fail-closed). */
 export const COMPOSER_CHAR_BUDGET = 200_000
@@ -548,6 +550,18 @@ export async function* streamTextTurn(
 ): AsyncGenerator<TextTurnEvent, TextTurnResult> {
   const { signal } = options
   const deadline = Date.now() + options.turnTimeoutMs
+  let progressTracker: ChatGptProgressTracker | undefined
+  const nativeRevision = (): number => options.native?.progressRevision() ?? 0
+  const assertProgress = (stage: ChatGptProgressStage): void => {
+    progressTracker?.assertAlive(stage)
+  }
+  const observeProgress = (sample: ChatGptProgressSample): void => {
+    progressTracker?.observe(sample)
+  }
+  const noteNativeBatch = (): void => {
+    if (progressTracker === undefined || options.native === undefined) return
+    progressTracker.mark('tool-batch', nativeRevision())
+  }
   const checkDeadline = (): void => {
     throwIfAborted(signal)
     if (Date.now() >= deadline) {
@@ -717,22 +731,43 @@ export async function* streamTextTurn(
       await new Promise(resolveSleep => setTimeout(resolveSleep, 200))
     }
     await sendButton.press('Enter')
+    progressTracker = new ChatGptProgressTracker({
+      startedAt: Date.now(),
+      absoluteTimeoutMs: options.turnTimeoutMs,
+      inactivityTimeoutMs: options.stallTimeoutMs,
+    })
+    observeProgress({
+      text: '',
+      html: '',
+      running: true,
+      nativeRevision: nativeRevision(),
+    })
     options.onPromptSubmitted?.()
     checkDeadline()
+    assertProgress('submit')
     const submitDeadline = Date.now() + 60_000
     for (;;) {
       checkDeadline()
+      assertProgress('first-progress')
       await throwIfSessionFailureAlert(page)
       await throwIfRateLimitDialog(page)
       if (options.native !== undefined) {
         const decision = arbitrateNativeObservation(options.native, undefined)
         if (decision.kind === 'tool-batch') {
+          noteNativeBatch()
           await notifyConversationCreated()
           return decision
         }
       }
       const identity = resolveNewAssistantTurnIdentity(initialIdentities, await assistantTurnIdentities())
       if (identity !== undefined) {
+        observeProgress({
+          assistantIdentity: identity,
+          text: '',
+          html: '',
+          running: true,
+          nativeRevision: nativeRevision(),
+        })
         await notifyConversationCreated()
         return { kind: 'assistant', identity }
       }
@@ -754,9 +789,11 @@ export async function* streamTextTurn(
     const domHealthTracker = new ChatGptTurnDomHealthTracker(options.stallTimeoutMs)
     for (;;) {
       checkDeadline()
+      assertProgress(options.native === undefined ? 'first-progress' : 'mcp-wait')
       if (options.native !== undefined) {
         const decision = arbitrateNativeObservation(options.native, undefined)
         if (decision.kind === 'tool-batch') {
+          noteNativeBatch()
           await notifyConversationCreated()
           return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
         }
@@ -782,6 +819,13 @@ export async function* streamTextTurn(
         await new Promise(resolveSleep => setTimeout(resolveSleep, 250))
         continue
       }
+      observeProgress({
+        assistantIdentity: boundResponseIdentity,
+        text: snapshot.visibleText,
+        html: snapshot.segments.map(segment => segment.html).join(''),
+        running: snapshot.running,
+        nativeRevision: nativeRevision(),
+      })
       if (!snapshot.responsePresent) {
         const rebound = resolveReboundAssistantTurnIdentity(
           initialAssistantTurns,
@@ -823,6 +867,7 @@ export async function* streamTextTurn(
       if (options.native !== undefined) {
         const decision = arbitrateNativeObservation(options.native, undefined)
         if (decision.kind === 'tool-batch') {
+          noteNativeBatch()
           await notifyConversationCreated()
           return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
         }
@@ -858,6 +903,7 @@ export async function* streamTextTurn(
         if (options.native !== undefined) {
           const decision = arbitrateNativeObservation(options.native, candidate)
           if (decision.kind === 'tool-batch') {
+            noteNativeBatch()
             return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
           }
           if (decision.kind !== 'completed') {

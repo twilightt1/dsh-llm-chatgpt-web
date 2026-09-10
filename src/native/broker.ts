@@ -163,7 +163,13 @@ export class NativeToolBroker {
     if (channel.completionRevision !== undefined) throw new Error('native broker round is already complete')
     if (channel.state === 'running') return { started: true, duplicate: true }
     channel.state = 'running'
+    channel.activityRevision += 1
     return { started: true, duplicate: false }
+  }
+
+  /** Return the monotonic semantic activity revision for browser liveness. */
+  progressRevision(requestId: string): number {
+    return this.requireRound(requestId).activityRevision
   }
 
   claimActivity(requestId: string, activityId: string): BrokerRoundSnapshot {
@@ -219,6 +225,7 @@ export class NativeToolBroker {
     return new Promise<BrokerToolResult>((resolve, reject) => {
       channel.invocations.set(callId, { request, resolve, reject })
       channel.queued.push(callId)
+      channel.activityRevision += 1
       channel.batchReadyAt ??= Date.now() + BATCH_WINDOW_MS
     })
   }
@@ -230,6 +237,7 @@ export class NativeToolBroker {
     if (channel.batchReadyAt !== undefined && now < channel.batchReadyAt) return undefined
     channel.batchReadyAt = undefined
     channel.delivered.push(...channel.queued.splice(0))
+    channel.activityRevision += 1
     return this.requestsFor(channel, channel.delivered)
   }
 
@@ -237,6 +245,7 @@ export class NativeToolBroker {
     const channel = this.requireRound(requestId)
     if (channel.state === 'settling') return
     channel.state = 'settling'
+    channel.activityRevision += 1
     channel.batchReadyAt = undefined
     const queued = channel.queued.splice(0)
     const error = new Error('native broker round is settling')
@@ -265,6 +274,7 @@ export class NativeToolBroker {
     const queuedIndex = channel.queued.indexOf(callId)
     if (queuedIndex >= 0) channel.queued.splice(queuedIndex, 1)
     channel.completed.set(callId, canonical)
+    channel.activityRevision += 1
     invocation.resolve(cloneResult(result))
     this.settleQuiescence(channel)
   }
@@ -295,6 +305,7 @@ export class NativeToolBroker {
       || channel.activities.size > 0
       || channel.invocations.size > 0) return false
     channel.completionRevision = revision
+    channel.activityRevision += 1
     return true
   }
 

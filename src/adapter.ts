@@ -584,6 +584,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
             connectorName: connection.connectorName,
             requestId: lease.requestId,
             takeToolBatch: (now?: number) => lease!.takeToolBatch(now),
+            progressRevision: () => lease!.progressRevision(),
             beginCompletionFence: () => lease!.beginCompletionFence(),
             commitCompletionFence: (revision: number) => lease!.commitCompletionFence(revision),
           },

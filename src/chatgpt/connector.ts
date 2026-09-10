@@ -13,6 +13,7 @@ export interface NativeBrowserControl {
   readonly connectorName: string
   readonly requestId: string
   takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined
+  progressRevision(): number
   beginCompletionFence(): number | undefined
   commitCompletionFence(revision: number): boolean
 }

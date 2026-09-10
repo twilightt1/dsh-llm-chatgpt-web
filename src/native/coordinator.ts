@@ -11,6 +11,7 @@ export interface NativeStepLease {
   readonly requestId: string
   bindCleanup(cleanup: NativeRoundCleanup): void
   takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined
+  progressRevision(): number
   beginCompletionFence(): number | undefined
   commitCompletionFence(revision: number): boolean
   park(cleanup: NativeRoundCleanup): Promise<void>
@@ -145,6 +146,11 @@ class NativeLease implements NativeStepLease {
     this.assertOpen()
     this.hooks.broker.touch(this.requestId)
     return this.hooks.broker.takeToolBatch(this.requestId, now)
+  }
+
+  progressRevision(): number {
+    this.assertOpen()
+    return this.hooks.broker.progressRevision(this.requestId)
   }
 
   beginCompletionFence(): number | undefined {

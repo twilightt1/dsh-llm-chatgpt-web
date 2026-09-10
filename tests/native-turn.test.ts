@@ -39,6 +39,7 @@ function control(overrides: Partial<NativeBrowserControl> = {}): NativeBrowserCo
     connectorName: 'DSH Native',
     requestId: 'request_abcdefghijklmnopqrstuvwxyz',
     takeToolBatch: vi.fn(() => undefined),
+    progressRevision: vi.fn(() => 0),
     beginCompletionFence: vi.fn(() => 1),
     commitCompletionFence: vi.fn(() => true),
     ...overrides,
