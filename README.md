@@ -21,6 +21,17 @@ dsh web
 > prebuilt `lib/` and needs **no** `allowBuilds` entry. If your client still
 > prompts, decline it — nothing here needs to run at install time.
 
+## 0.6.0 candidate notes
+
+- Native MCP now keeps compatible tool-result steps on one physical ChatGPT
+  response, with exact correlation, journaled replay, and safe fresh-replay
+  fallback.
+- Managed setup remains pinned, private, and fail-closed; text transport is
+  unchanged and remains the default.
+- Automated/package gates pass. A real native tool continuation is not yet
+  release-ready: ChatGPT safety checks blocked the bounded live tool probes,
+  so this candidate is not tagged or presented as API-equivalent.
+
 ## How it works
 
 ```
@@ -405,10 +416,16 @@ Proven against a real Plus-class account (Sep 2026, after the JSON-envelope
   deltas (headings, lists, bold all survive) → usage + `stop` finish, on
   both the src (tsx) and built `lib/` paths.
 - Text-mode tools and native persistent continuation are covered by local
-  adapter, broker, coordinator, physical-response, and replay tests. Native
-  MCP live E2E is intentionally not claimed until a verifiable ChatGPT
-  connector/tunnel, aligned profile artifacts, one-page/one-Send continuation,
-  final answer, and cleanup ledger are observed.
+  adapter, broker, coordinator, physical-response, and replay tests. A managed
+  native turn with a `bash` schema attached but no connector call completed in
+  27.439 s with a terminal `stop` and no broker invocation after the completion
+  fence fix; the owned-conversation ledger was empty and no tunnel/MCP child
+  remained. This validates no-tool completion only, not connector execution.
+- Tool-required managed probes emitted no structured broker call; one provider
+  response explicitly reported that the connector call was blocked by safety
+  checks. Native MCP live E2E is therefore intentionally not claimed until a
+  verifiable connector/tunnel run proves one-page/one-Send continuation, a
+  final answer, exact call/result evidence, and cleanup.
 - The storage state persists after every completed turn (ChatGPT rotates
   session tokens); `storage-state.json` mtime advances per turn.
 - Heavier reasoning efforts (think/medium/high) need the raised budgets
