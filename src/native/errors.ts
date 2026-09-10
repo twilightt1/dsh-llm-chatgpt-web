@@ -22,3 +22,13 @@ export class NativeSafetyError extends LlmError {
     this.nativeCode = nativeCode
   }
 }
+
+/** A missing or stale local policy grant blocks before any provider side effect. */
+export class NativeApprovalRequiredError extends NativeSafetyError {
+  readonly nativeCode = 'NATIVE_APPROVAL_REQUIRED' as const
+
+  constructor(message: string, cause?: unknown) {
+    super(message, cause, 'NATIVE_APPROVAL_REQUIRED')
+    this.name = 'NativeApprovalRequiredError'
+  }
+}

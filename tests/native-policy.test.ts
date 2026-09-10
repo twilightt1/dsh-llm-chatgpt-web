@@ -221,5 +221,10 @@ describe('CompiledNativeSecurityPolicy', () => {
     expect(first.policyHash).toBe(second.policyHash)
     expect(first.inventoryHash).toBe(second.inventoryHash)
     expect(first.approvalHash).not.toBe(second.approvalHash)
+    const externalPathChange = compiled.prepareRequest(request({ tools: [readTool] }), {
+      ...runtime,
+      brokerSocketPath: '/tmp/another-native-broker.sock',
+    })
+    expect(externalPathChange.approvalHash).not.toBe(first.approvalHash)
   })
 })

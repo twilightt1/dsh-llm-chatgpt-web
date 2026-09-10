@@ -194,6 +194,37 @@ describe('native plugin runtime composition', () => {
     await stack.close()
   })
 
+  it('warns once at startup and once on the first secure request when cwd is implicit', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-plugin-'))
+    const log: string[] = []
+    const warnings: string[] = []
+    const { dependencies: baseDependencies } = fakes(log)
+    const secure = resolveAdapterOptions({
+      profileDir: root,
+      connectorTransport: 'mcp',
+      nativeSecurity: {
+        toolPolicy: 'allowlist',
+        rules: [{ tool: 'read', capability: 'workspace.read', pathArguments: ['/path'] }],
+      },
+      brokerSocketPath: join(root, 'broker.sock'),
+    })
+    const stack = createNativePluginRuntime(secure, { ...baseDependencies, warn: message => warnings.push(message) })
+    expect(warnings).toHaveLength(1)
+    stack.prepareRequest({
+      provider: 'chatgpt-web', model: 'chatgpt-web/high', messages: [],
+      tools: [{ name: 'read', description: 'read', parameters: { type: 'object' } }],
+      sessionId: 's1' as never,
+    }, secure)
+    expect(warnings).toHaveLength(2)
+    stack.prepareRequest({
+      provider: 'chatgpt-web', model: 'chatgpt-web/high', messages: [],
+      tools: [{ name: 'read', description: 'read', parameters: { type: 'object' } }],
+      sessionId: 's2' as never,
+    }, secure)
+    expect(warnings).toHaveLength(2)
+    await stack.close()
+  })
+
   it('rejects connection identity changes after the stack is created', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-native-plugin-'))
     const log: string[] = []

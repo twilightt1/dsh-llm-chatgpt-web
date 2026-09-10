@@ -49,6 +49,22 @@ export type ConnectorTransport = 'text' | 'mcp'
 /** Owner of the native MCP tunnel process. */
 export type ConnectorRuntime = 'external' | 'managed'
 
+export interface NativeApprovalChallengeV1 {
+  readonly version: 1
+  readonly challengeId: string
+  readonly approvalHash: string
+  readonly createdAt: string
+  readonly expiresAt: string
+  readonly summary: NativePolicySummary
+}
+
+export interface NativeApprovalGrantV1 {
+  readonly version: 1
+  readonly approvalHash: string
+  readonly approvedAt: string
+  readonly summaryHash: string
+}
+
 export type NativeToolPolicy = 'full' | 'evidence-only' | 'allowlist'
 export type NativeApprovalMode = 'none' | 'workspace-policy'
 export type NativeCapability =
@@ -111,6 +127,8 @@ export type NativeEffectiveResultPolicy = NativeResultPolicy | 'raw-unbounded'
 export type NativeOutputProvenance = 'operator-declared' | 'unverified-full'
 
 export interface NativePolicySummary {
+  /** Adapter/policy implementation identity shown to the approving operator. */
+  readonly policyImplementationVersion?: string
   readonly toolPolicy: NativeToolPolicy
   readonly workspaceRoot: string
   readonly workspaceRootSource: 'explicit' | 'process.cwd'

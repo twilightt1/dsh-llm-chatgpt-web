@@ -44,6 +44,20 @@ interface BrokerRoundSnapshot {
 type ConnectorTransport = 'text' | 'mcp';
 /** Owner of the native MCP tunnel process. */
 type ConnectorRuntime = 'external' | 'managed';
+interface NativeApprovalChallengeV1 {
+  readonly version: 1;
+  readonly challengeId: string;
+  readonly approvalHash: string;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+  readonly summary: NativePolicySummary;
+}
+interface NativeApprovalGrantV1 {
+  readonly version: 1;
+  readonly approvalHash: string;
+  readonly approvedAt: string;
+  readonly summaryHash: string;
+}
 type NativeToolPolicy = 'full' | 'evidence-only' | 'allowlist';
 type NativeApprovalMode = 'none' | 'workspace-policy';
 type NativeCapability = 'workspace.read' | 'workspace.search' | 'git.read' | 'execution.read' | 'side-effect';
@@ -99,6 +113,8 @@ type NativeEffectiveCapability = NativeCapability | 'full-unrestricted';
 type NativeEffectiveResultPolicy = NativeResultPolicy | 'raw-unbounded';
 type NativeOutputProvenance = 'operator-declared' | 'unverified-full';
 interface NativePolicySummary {
+  /** Adapter/policy implementation identity shown to the approving operator. */
+  readonly policyImplementationVersion?: string;
   readonly toolPolicy: NativeToolPolicy;
   readonly workspaceRoot: string;
   readonly workspaceRootSource: 'explicit' | 'process.cwd';
@@ -428,6 +444,47 @@ interface NativePromptBinding {
  */
 declare function compilePrompt(options: GenerateOptions, maxChars: number, notice?: string, native?: NativePromptBinding): string;
 //#endregion
+//#region src/native/grants.d.ts
+/** Require an exact local grant before any effective native capability opens. */
+declare function requireNativeApproval(profileDir: string, approval: NativeApprovalMode, prepared: PreparedNativeRequest, now?: Date): void;
+/** Approve one exact pending challenge through the interactive local CLI. */
+declare function approveNativeChallenge(input: {
+  readonly profileDir: string;
+  readonly challengeId: string;
+  readonly confirmation: string;
+  readonly now?: Date;
+}): NativeApprovalGrantV1;
+/** Quote one value for a POSIX shell without allowing expansion or control bytes. */
+declare function shellQuotePosix(value: string): string;
+/** Render a terminal-safe, human-readable challenge summary. */
+declare function formatNativeApprovalChallenge(challenge: NativeApprovalChallengeV1): string;
+declare function readNativeApprovalChallenge(profileDir: string): NativeApprovalChallengeV1 | undefined;
+//#endregion
+//#region src/native/errors.d.ts
+/** A policy denial is recoverable within the same still-valid broker round. */
+declare class NativePolicyDeniedError extends Error {
+  readonly code: "NATIVE_POLICY_DENIED";
+  readonly releaseRound: false;
+  constructor(message: string);
+}
+/** A native safety failure is an invalid request, never a provider retry. */
+declare class NativeSafetyError extends LlmError {
+  readonly nativeCode: string;
+  readonly retryable: false;
+  constructor(message: string, cause?: unknown, nativeCode?: string);
+}
+/** A missing or stale local policy grant blocks before any provider side effect. */
+declare class NativeApprovalRequiredError extends NativeSafetyError {
+  readonly nativeCode: "NATIVE_APPROVAL_REQUIRED";
+  constructor(message: string, cause?: unknown);
+}
+//#endregion
+//#region src/native/private-files.d.ts
+/** Write a private file with file and parent-directory durability. */
+declare function durableAtomicWritePrivateFile(path: string, data: string | Uint8Array, mode?: 0o600 | 0o700): void;
+/** Sync an already-private directory after a durable mutation. */
+declare function syncPrivateDirectory(path: string): void;
+//#endregion
 //#region src/index.d.ts
 declare const name = "llm-chatgpt-web";
 declare const inject: string[];
@@ -486,4 +543,4 @@ declare function defaultBrokerSocketPath(profileDir: string): string;
 declare function resolveAdapterOptions(config: Config, platform?: NodeJS.Platform, arch?: string): ChatGptWebConnectionOptions;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeApprovalMode, type NativeCapability, type NativeEffectiveCapability, type NativeEffectiveResultPolicy, type NativeEvidenceLimitsConfig, type NativePolicyRuntimeIdentity, type NativePolicySummary, type NativeResultPolicy, type NativeRoundCleanup, NativeRoundCoordinator, type NativeSecurityConfig, type NativeStepLease, NativeToolBroker, type NativeToolPolicy, type NativeToolRuleConfig, PROVIDER, type PreparedNativeRequest, type ResolvedNativeSecurityConfig, type ResolvedNativeToolRule, type WorkspaceBoundary, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };
+export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeApprovalChallengeV1, type NativeApprovalGrantV1, type NativeApprovalMode, NativeApprovalRequiredError, type NativeCapability, type NativeEffectiveCapability, type NativeEffectiveResultPolicy, type NativeEvidenceLimitsConfig, NativePolicyDeniedError, type NativePolicyRuntimeIdentity, type NativePolicySummary, type NativeResultPolicy, type NativeRoundCleanup, NativeRoundCoordinator, NativeSafetyError, type NativeSecurityConfig, type NativeStepLease, NativeToolBroker, type NativeToolPolicy, type NativeToolRuleConfig, PROVIDER, type PreparedNativeRequest, type ResolvedNativeSecurityConfig, type ResolvedNativeToolRule, type WorkspaceBoundary, apply, approveNativeChallenge, compilePrompt, correlateToolResults, defaultBrokerSocketPath, durableAtomicWritePrivateFile, formatNativeApprovalChallenge, inject, name, readNativeApprovalChallenge, requireNativeApproval, resolveAdapterOptions, shellQuotePosix, syncPrivateDirectory };

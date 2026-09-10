@@ -33,6 +33,7 @@ const PROFILE_NAME = 'dsh-chatgpt-web'
 const SETUP_PROFILE_NAME = 'dsh-chatgpt-web-setup'
 const DEFAULT_BROKER_SOCKET_NAME = 'native-broker.sock'
 const SHA256 = /^[a-f0-9]{64}$/
+const CONTROL_BYTES = /[\u0000-\u001f\u007f-\u009f]/
 
 export interface NativeSetupOptions {
   readonly profileDir: string
@@ -82,6 +83,7 @@ export type ParsedNativeSetupCommand =
   | { readonly command: 'setup'; readonly options: NativeSetupOptions }
   | { readonly command: 'doctor'; readonly profileDir: string; readonly connectorName: string; readonly json: boolean }
   | { readonly command: 'stop'; readonly profileDir: string; readonly connectorName: string }
+  | { readonly command: 'approve'; readonly profileDir: string; readonly challengeId: string }
 
 function expandHome(value: string): string {
   if (value === '~' || value.startsWith('~/')) {
@@ -117,12 +119,13 @@ function tunnelId(value: string): string {
 
 function parseCommandOptions(
   args: readonly string[],
-  command: 'setup' | 'doctor' | 'stop',
+  command: 'setup' | 'doctor' | 'stop' | 'approve',
 ): ParsedNativeSetupCommand {
   let profileDir: string | undefined
   let name: string | undefined
   let id: string | undefined
   let keyFile: string | undefined
+  let challenge: string | undefined
   let json = false
   const seen = new Set<string>()
   let index = 1
@@ -136,7 +139,17 @@ function parseCommandOptions(
       index += 1
       continue
     }
+    if (flag === '--challenge') {
+      if (command !== 'approve') throw new Error(`${command} does not accept ${flag}`)
+      if (seen.has(flag)) throw new Error(`duplicate option ${flag}`)
+      seen.add(flag)
+      const option = requiredOption(args, index, flag)
+      challenge = option.value
+      index = option.next
+      continue
+    }
     if (flag === '--profile-dir' || flag === '--connector-name' || flag === '--tunnel-id' || flag === '--runtime-key-file') {
+      if (command === 'approve' && flag !== '--profile-dir') throw new Error(`${command} does not accept ${flag}`)
       if (seen.has(flag)) throw new Error(`duplicate option ${flag}`)
       seen.add(flag)
       const option = requiredOption(args, index, flag)
@@ -150,6 +163,15 @@ function parseCommandOptions(
     throw new Error(`unknown option ${flag}`)
   }
   if (profileDir === undefined) throw new Error('--profile-dir is required')
+  if (command === 'approve') {
+    if (challenge === undefined || challenge.length === 0 || challenge.length > 128 || CONTROL_BYTES.test(challenge)) {
+      throw new Error('--challenge is required and must be control-free')
+    }
+    if (name !== undefined || id !== undefined || keyFile !== undefined || json) {
+      throw new Error('approve accepts only --profile-dir and --challenge')
+    }
+    return { command, profileDir: profilePath(profileDir), challengeId: challenge }
+  }
   if (name === undefined) throw new Error('--connector-name is required')
   if (command === 'setup') {
     if (id === undefined) throw new Error('--tunnel-id is required')
@@ -176,8 +198,8 @@ function parseCommandOptions(
 
 export function parseNativeSetupArgs(args: readonly string[]): ParsedNativeSetupCommand {
   const command = args[0]
-  if (command !== 'setup' && command !== 'doctor' && command !== 'stop') {
-    throw new Error('command must be setup, doctor, or stop')
+  if (command !== 'setup' && command !== 'doctor' && command !== 'stop' && command !== 'approve') {
+    throw new Error('command must be setup, doctor, stop, or approve')
   }
   return parseCommandOptions(args, command)
 }

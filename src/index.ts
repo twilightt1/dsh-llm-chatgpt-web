@@ -48,11 +48,26 @@ export type {
 export { compilePrompt } from './chatgpt/prompt.ts'
 export { NativeToolBroker } from './native/broker.ts'
 export { NativeRoundCoordinator, correlateToolResults } from './native/coordinator.ts'
+export {
+  approveNativeChallenge,
+  formatNativeApprovalChallenge,
+  readNativeApprovalChallenge,
+  requireNativeApproval,
+  shellQuotePosix,
+} from './native/grants.ts'
+export {
+  NativeApprovalRequiredError,
+  NativePolicyDeniedError,
+  NativeSafetyError,
+} from './native/errors.ts'
+export { durableAtomicWritePrivateFile, syncPrivateDirectory } from './native/private-files.ts'
 export type { NativeRoundCleanup, NativeStepLease } from './native/coordinator.ts'
 export type { WorkspaceBoundary } from './native/workspace-boundary.ts'
 export type {
   BrokerRoundSnapshot,
   BrokerRpcError,
+  NativeApprovalChallengeV1,
+  NativeApprovalGrantV1,
   BrokerRpcResponse,
   BrokerToolRequest,
   BrokerToolResult,

@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto'
 import {
   chmodSync,
   closeSync,
+  fchmodSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -93,6 +96,55 @@ function assertReplaceableTarget(path: string): void {
   }
 }
 
+/** Write a private file with file and parent-directory durability. */
+export function durableAtomicWritePrivateFile(
+  path: string,
+  data: string | Uint8Array,
+  mode: 0o600 | 0o700 = 0o600,
+): void {
+  ensurePrivateDirectory(dirname(path))
+  assertReplaceableTarget(path)
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`
+  let fd: number | undefined
+  let createdTemporary = false
+  try {
+    fd = openSync(temporary, 'wx', mode)
+    createdTemporary = true
+    fchmodSync(fd, mode)
+    writeFileSync(fd, data)
+    fsyncSync(fd)
+    closeSync(fd)
+    fd = undefined
+    renameSync(temporary, path)
+    assertPrivateRegularFile(path, 'private file', mode === 0o700)
+    const directoryFd = openSync(dirname(path), 'r')
+    try {
+      fsyncSync(directoryFd)
+    } finally {
+      closeSync(directoryFd)
+    }
+  } catch (error) {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* best effort */ }
+    }
+    if (createdTemporary) {
+      try { rmSync(temporary, { force: true }) } catch { /* preserve the original failure */ }
+    }
+    throw error
+  }
+}
+
+/** Sync an already-private directory after a durable mutation. */
+export function syncPrivateDirectory(path: string): void {
+  assertPrivateDirectory(path)
+  const fd = openSync(path, 'r')
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
 export function atomicWritePrivateFile(
   path: string,
   data: string | Uint8Array,
@@ -100,7 +152,7 @@ export function atomicWritePrivateFile(
 ): void {
   ensurePrivateDirectory(dirname(path))
   assertReplaceableTarget(path)
-  const temporary = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`
   const fd = openSync(temporary, 'wx', mode)
   try {
     writeFileSync(fd, data)

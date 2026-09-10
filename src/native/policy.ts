@@ -471,6 +471,7 @@ function summaryFor(
     }
   })
   return deepFreeze({
+    policyImplementationVersion: runtime.adapterVersion,
     toolPolicy: config.toolPolicy,
     workspaceRoot,
     workspaceRootSource: config.workspaceRootSource,
@@ -528,7 +529,13 @@ export function compileNativeSecurityPolicy(
         connectorTransport: runtime.connectorTransport,
         connectorRuntime: runtime.connectorRuntime,
         connectorName: runtime.connectorName,
-        managedTunnelClient: runtime.managedTunnelClient,
+        ...(runtime.managedTunnelClient === undefined ? {
+          externalRuntime: {
+            brokerSocketPath: runtime.brokerSocketPath,
+            nativeRuntimeConfigPath: runtime.nativeRuntimeConfigPath,
+            mcpInvocationTimeoutMs: runtime.mcpInvocationTimeoutMs ?? null,
+          },
+        } : { managedTunnelClient: runtime.managedTunnelClient }),
       })
       const projectProviderMessages = configSnapshot.toolPolicy === 'full'
         ? (messages: readonly Message[]): readonly Message[] => deepFreeze(structuredClone(messages))

@@ -65,6 +65,8 @@ import {
 } from './native/continuation.ts'
 import type { NativeContinuationIdentity, ParkedContinuationClaim } from './native/continuation.ts'
 import { createNativePhysicalResponse } from './native/physical-response.ts'
+import { requireNativeApproval } from './native/grants.ts'
+import { NativeSafetyError } from './native/errors.ts'
 import type {
   NativePhysicalResponse,
   NativePhysicalResponseDriver,
@@ -954,8 +956,15 @@ export class ChatGptWebAdapter extends LlmAdapter {
         ? undefined
         : this.config.native.prepareRequest?.(options, connection)
       : undefined
+    if (nativeMode && this.config.native !== undefined && prepared === undefined
+      && (connection.nativeSecurity.toolPolicy !== 'full' || connection.nativeSecurity.approval !== 'none')) {
+      throw new NativeSafetyError('native secure policy preparation is unavailable; refusing an unguarded MCP turn', undefined, 'NATIVE_POLICY_UNAVAILABLE')
+    }
     const providerOptions = prepared?.providerOptions ?? options
     const effectiveHasTools = (providerOptions.tools?.length ?? 0) > 0
+    if (nativeMode && prepared !== undefined) {
+      requireNativeApproval(connection.profileDir, connection.nativeSecurity.approval, prepared)
+    }
     // Auxiliary model calls (session titles and compaction) share the adapter
     // but are not DSH agent rounds. They must not enter the native coordinator:
     // a title request queued while an agent round is parked has no durable

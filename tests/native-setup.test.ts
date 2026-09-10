@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, statSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -8,6 +8,7 @@ import {
   atomicWritePrivateFile,
   ensurePrivateDirectory,
 } from '../src/native/private-files.ts'
+import { readNativeApprovalChallenge, requireNativeApproval } from '../src/native/grants.ts'
 import type { ManagedNativeRuntimeConfig } from '../src/native/runtime-config.ts'
 import type {
   TunnelInstallManifest,
@@ -19,8 +20,9 @@ import {
   setupManagedNativeRuntime,
   stopManagedNativeRuntime,
 } from '../src/native/setup.ts'
-import { readHiddenRuntimeKey } from '../src/native/setup-main.ts'
+import { readHiddenRuntimeKey, runDshNativeSetupMain } from '../src/native/setup-main.ts'
 import type { NativeSetupDependencies } from '../src/native/setup.ts'
+import type { PreparedNativeRequest } from '../src/native/types.ts'
 
 const TUNNEL_ID = `tunnel_${'0'.repeat(32)}`
 
@@ -113,6 +115,22 @@ describe('native setup CLI parsing', () => {
     expect(parseNativeSetupArgs([
       'stop', '--profile-dir', '/tmp/p', '--connector-name', 'DSH Native',
     ])).toEqual({ command: 'stop', profileDir: '/tmp/p', connectorName: 'DSH Native' })
+    expect(parseNativeSetupArgs([
+      'approve', '--profile-dir', '/tmp/p', '--challenge', 'challenge_00000000-0000-4000-8000-000000000000',
+    ])).toEqual({
+      command: 'approve',
+      profileDir: '/tmp/p',
+      challengeId: 'challenge_00000000-0000-4000-8000-000000000000',
+    })
+    expect(() => parseNativeSetupArgs([
+      'approve', '--profile-dir', '/tmp/p', '--challenge', 'one', '--challenge', 'two',
+    ])).toThrow(/duplicate/i)
+    expect(() => parseNativeSetupArgs([
+      'approve', '--profile-dir', '/tmp/p', '--challenge', 'one', '--connector-name', 'DSH Native',
+    ])).toThrow(/only|accept/i)
+    expect(() => parseNativeSetupArgs([
+      'approve', '--profile-dir', '/tmp/p', '--challenge', 'one', '--confirmation', 'approve',
+    ])).toThrow(/unknown|only/i)
   })
 })
 
@@ -139,6 +157,73 @@ describe('hidden runtime-key input', () => {
     expect(await promise).toBe('secreX')
     expect(stdin.modes).toEqual([true, false])
     expect(stdin.listenerCount('data')).toBe(0)
+  })
+})
+
+describe('native approval CLI', () => {
+  it('requires a TTY and accepts only the exact approve confirmation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-native-approve-cli-'))
+    const prepared: PreparedNativeRequest = {
+      providerOptions: {
+        provider: 'chatgpt-web', model: 'chatgpt-web/high', messages: [], tools: [], sessionId: 's1' as never,
+      },
+      projectProviderMessages: messages => structuredClone(messages),
+      policyHash: 'a'.repeat(64),
+      inventoryHash: 'b'.repeat(64),
+      approvalHash: 'c'.repeat(64),
+      summary: {
+        toolPolicy: 'allowlist',
+        workspaceRoot: root,
+        workspaceRootSource: 'explicit',
+        connectorName: 'DSH Native',
+        connectorRuntime: 'external',
+        approval: 'workspace-policy',
+        tools: [{
+          tool: 'read_file', capability: 'workspace.read', pathArguments: ['/path'], result: 'text',
+          outputProvenance: 'operator-declared', schemaHash: 'd'.repeat(64),
+        }],
+        evidenceLimits: { maxBytes: 65_536, maxLines: 200 },
+      },
+    }
+    try {
+      expect(() => requireNativeApproval(root, 'workspace-policy', prepared)).toThrow(/approve/i)
+      const challenge = readNativeApprovalChallenge(root)!
+      class FakeApprovalInput extends EventEmitter {
+        readonly isTTY = true
+        readonly modes: boolean[] = []
+        resume(): void {}
+        pause(): void {}
+        setRawMode(mode: boolean): this { this.modes.push(mode); return this }
+      }
+      const stdin = new FakeApprovalInput()
+      const writes: string[] = []
+      const io = {
+        stdin: stdin as never,
+        stdout: { write: (value: string) => { writes.push(value); return true } } as never,
+        stderr: { write: (value: string) => { writes.push(value); return true } } as never,
+      }
+      const pending = runDshNativeSetupMain([
+        'approve', '--profile-dir', root, '--challenge', challenge.challengeId,
+      ], io)
+      stdin.emit('data', 'approve\n')
+      expect(await pending).toBe(0)
+      expect(stdin.modes).toEqual([true, false])
+      expect(writes.join('')).toContain('Native MCP approval challenge')
+      expect(() => requireNativeApproval(root, 'workspace-policy', prepared)).not.toThrow()
+
+      const nonTty = await runDshNativeSetupMain([
+        'approve', '--profile-dir', root, '--challenge', challenge.challengeId,
+      ], {
+        stdin: { isTTY: false, resume() {}, pause() {}, on() { return this }, once() { return this }, removeListener() { return this } } as never,
+        stdout: { write: () => true } as never,
+        stderr: { write: (value: string) => { writes.push(value); return true } } as never,
+      })
+      expect(nonTty).toBe(1)
+      expect(writes.join('')).toMatch(/interactive TTY/i)
+    } finally {
+      rmSync(join(root, 'native-approval'), { recursive: true, force: true })
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
 

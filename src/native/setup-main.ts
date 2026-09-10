@@ -10,6 +10,11 @@ import {
   setupManagedNativeRuntime,
   stopManagedNativeRuntime,
 } from './setup.ts'
+import {
+  approveNativeChallenge,
+  formatNativeApprovalChallenge,
+  readNativeApprovalChallenge,
+} from './grants.ts'
 import type { NativeSetupIo } from './setup.ts'
 import { redactTunnelDetail } from './tunnel-runtime.ts'
 
@@ -67,6 +72,51 @@ export function readHiddenRuntimeKey(io: NativeSetupIo): Promise<string> {
   })
 }
 
+function readApprovalConfirmation(io: NativeSetupIo): Promise<string> {
+  const stdin = io.stdin
+  const setRawMode = stdin.setRawMode
+  if (stdin.isTTY !== true || setRawMode === undefined) {
+    throw new Error('native approval requires an interactive TTY')
+  }
+  const enableRawMode = setRawMode.bind(stdin)
+  return new Promise<string>((resolveConfirmation, reject) => {
+    let value = ''
+    let settled = false
+    const finish = (error?: Error): void => {
+      if (settled) return
+      settled = true
+      stdin.setRawMode?.(false)
+      stdin.removeListener('data', onData)
+      stdin.removeListener('error', onError)
+      stdin.pause()
+      const result = value
+      value = ''
+      if (error !== undefined) reject(error)
+      else resolveConfirmation(result)
+    }
+    const onError = (error: Error): void => finish(error)
+    const onData = (chunk: Buffer | string): void => {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+      for (const character of text) {
+        if (character === '\u0003') {
+          finish(new Error('native approval prompt cancelled'))
+          return
+        }
+        if (character === '\r' || character === '\n') {
+          finish()
+          return
+        }
+        if (character === '\u0008' || character === '\u007f') value = value.slice(0, -1)
+        else value += character
+      }
+    }
+    enableRawMode(true)
+    stdin.resume()
+    stdin.on('data', onData)
+    stdin.once('error', onError)
+  })
+}
+
 export async function runDshNativeSetupMain(
   args: readonly string[],
   io: NativeSetupIo = defaultIo(),
@@ -92,6 +142,21 @@ export async function runDshNativeSetupMain(
       const report = doctorManagedNativeRuntime(command)
       io.stdout.write(formatNativeDoctorReport(report, command.json))
       return report.ok ? 0 : 1
+    }
+    if (command.command === 'approve') {
+      if (io.stdin.isTTY !== true) throw new Error('native approval requires an interactive TTY')
+      const challenge = readNativeApprovalChallenge(command.profileDir)
+      if (challenge === undefined) throw new Error('native approval challenge is missing or already claimed')
+      io.stdout.write(formatNativeApprovalChallenge(challenge))
+      io.stdout.write('Confirmation: ')
+      const confirmation = await readApprovalConfirmation(io)
+      approveNativeChallenge({
+        profileDir: command.profileDir,
+        challengeId: command.challengeId,
+        confirmation,
+      })
+      io.stdout.write('Native policy approval recorded.\n')
+      return 0
     }
     await stopManagedNativeRuntime(command)
     io.stdout.write('Managed native tunnel stopped.\n')

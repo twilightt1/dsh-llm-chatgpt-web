@@ -53,6 +53,7 @@ export interface NativePluginRuntimeDependencies {
   readonly nodeExecutable?: string
   readonly mcpEntrypoint?: string
   readonly run?: CommandRunner
+  readonly warn?: (message: string) => void
 }
 
 function errorMessage(error: unknown): string {
@@ -146,6 +147,11 @@ export function createNativePluginRuntime(
     }
   }
 
+  const warn = dependencies.warn ?? ((message: string): void => { console.warn(message) })
+  let secureFallbackRequestWarningIssued = false
+  if (connection.nativeSecurity.toolPolicy !== 'full' && connection.nativeSecurity.workspaceRootSource === 'process.cwd') {
+    warn('dsh-chatgpt-web native secure policy is using process.cwd as its workspace root; configure nativeSecurity.workspaceRoot explicitly')
+  }
   let quiescing = false
   const ready = socket.listen().then(async () => {
     if (configurationError !== undefined) throw configurationError
@@ -171,6 +177,12 @@ export function createNativePluginRuntime(
   }
   const prepareRequest = (options: GenerateOptions, current: ChatGptWebConnectionOptions): PreparedNativeRequest => {
     assertConnection(current)
+    if (!secureFallbackRequestWarningIssued
+      && current.nativeSecurity.toolPolicy !== 'full'
+      && current.nativeSecurity.workspaceRootSource === 'process.cwd') {
+      secureFallbackRequestWarningIssued = true
+      warn('dsh-chatgpt-web native secure policy request is using process.cwd as its workspace root; configure nativeSecurity.workspaceRoot explicitly')
+    }
     const policyRuntime: NativePolicyRuntimeIdentity = {
       adapterVersion: NATIVE_POLICY_ADAPTER_VERSION,
       connectorTransport: current.connectorTransport,

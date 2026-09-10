@@ -97,6 +97,7 @@ import { ChatGptWebAdapter } from '../src/adapter.ts'
 import { ManagedRuntimeTransportError } from '../src/native/tunnel-runtime.ts'
 import { NativeRoundCoordinator } from '../src/native/coordinator.ts'
 import { NativeToolBroker } from '../src/native/broker.ts'
+import { NativeApprovalRequiredError } from '../src/native/errors.ts'
 import { resolveAdapterOptions } from '../src/index.ts'
 import type { GenerateOptions, Message, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { PreparedNativeRequest } from '../src/native/types.ts'
@@ -143,6 +144,55 @@ function input(
 describe('native adapter lifecycle', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  it('fails once before browser/checkpoint work when approval is required, even with always retry configured', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-approval-adapter-'))
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      connectorRuntime: 'external',
+      profileDir: root,
+      brokerSocketPath: join(root, 'broker.sock'),
+      retryPolicy: { mode: 'always' },
+      nativeSecurity: {
+        toolPolicy: 'allowlist',
+        workspaceRoot: root,
+        approval: 'workspace-policy',
+        rules: [{ tool: 'write', capability: 'workspace.read', pathArguments: ['/path'] }],
+      },
+    })
+    const prepareRequest = vi.fn((request: GenerateOptions): PreparedNativeRequest => ({
+      providerOptions: structuredClone(request),
+      projectProviderMessages: messages => structuredClone(messages),
+      policyHash: 'a'.repeat(64),
+      inventoryHash: 'b'.repeat(64),
+      approvalHash: 'c'.repeat(64),
+      summary: {
+        toolPolicy: 'allowlist', workspaceRoot: root, workspaceRootSource: 'explicit',
+        connectorName: 'DSH Native', connectorRuntime: 'external', approval: 'workspace-policy',
+        tools: [{
+          tool: 'write', capability: 'workspace.read', pathArguments: ['/path'], result: 'sanitized-evidence',
+          outputProvenance: 'operator-declared', schemaHash: 'd'.repeat(64),
+        }],
+        evidenceLimits: { maxBytes: 65_536, maxLines: 200 },
+      },
+    }))
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {}, prepareRequest },
+    })
+    try {
+      await expect(collect(adapter.stream(input('approval-required')))).rejects.toBeInstanceOf(NativeApprovalRequiredError)
+      expect(prepareRequest).toHaveBeenCalledTimes(1)
+      expect(fixtures.browser.ensureReady).not.toHaveBeenCalled()
+      expect(fixtures.browser.newTurnPage).not.toHaveBeenCalled()
+      expect(adapter.providerRetryPolicy('chatgpt-web')).toMatchObject({ mode: 'always' })
+    } finally {
+      await adapter.dispose()
+      broker.close()
+    }
   })
 
   it('uses the connector-enabled surface only for native tool turns', async () => {
