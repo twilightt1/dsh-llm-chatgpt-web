@@ -56,6 +56,8 @@ declare class NativeToolBroker {
     started: true;
     duplicate: boolean;
   };
+  /** Return the monotonic semantic activity revision for browser liveness. */
+  progressRevision(requestId: string): number;
   claimActivity(requestId: string, activityId: string): BrokerRoundSnapshot;
   completeActivity(requestId: string, activityId: string): void;
   invoke(requestId: string, activityId: string, name: string, args: Record<string, unknown>): Promise<BrokerToolResult>;
@@ -86,6 +88,7 @@ interface NativeStepLease {
   readonly requestId: string;
   bindCleanup(cleanup: NativeRoundCleanup): void;
   takeToolBatch(now?: number): readonly BrokerToolRequest[] | undefined;
+  progressRevision(): number;
   beginCompletionFence(): number | undefined;
   commitCompletionFence(revision: number): boolean;
   park(cleanup: NativeRoundCleanup): Promise<void>;

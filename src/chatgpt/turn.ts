@@ -540,14 +540,23 @@ export async function prepareTemporaryChatSurface(
   return prepareChatGptSurface(page, 'temporary', diagDir, settleTimeoutMs)
 }
 
+/** A submitted ChatGPT response observer that can cross DSH boundaries. */
+export interface ChatGptTurnSession {
+  readonly responseIdentity: string | undefined
+  readonly conversationId: string | undefined
+  nextBoundary(): AsyncGenerator<TextTurnEvent, TextTurnResult>
+  markToolResultDelivered(revision: number): void
+  stop(): Promise<void>
+}
+
 /**
- * Stream one turn on a prepared page. The caller owns the page (fresh per
- * turn) and closes it. Yields text deltas, then returns the final answer.
+ * Prepare and submit one turn, returning an observer whose state survives
+ * native MCP tool boundaries. The caller owns the page and closes it.
  */
-export async function* streamTextTurn(
+export async function startChatGptTurnSession(
   page: Page,
   options: TextTurnOptions,
-): AsyncGenerator<TextTurnEvent, TextTurnResult> {
+): Promise<ChatGptTurnSession> {
   const { signal } = options
   const deadline = Date.now() + options.turnTimeoutMs
   let progressTracker: ChatGptProgressTracker | undefined
@@ -712,7 +721,7 @@ export async function* streamTextTurn(
 
   type SubmitResult =
     | { readonly kind: 'assistant'; readonly identity: string }
-    | { readonly kind: 'tool-batch'; readonly calls: readonly BrokerToolRequest[] }
+    | { readonly kind: 'tool-batch'; readonly calls: readonly BrokerToolRequest[]; readonly identity?: string }
 
   /** Submit and wait for either the model turn identity or an early MCP batch. */
   async function submit(initialIdentities: readonly string[]): Promise<SubmitResult> {
@@ -756,7 +765,20 @@ export async function* streamTextTurn(
         if (decision.kind === 'tool-batch') {
           noteNativeBatch()
           await notifyConversationCreated()
-          return decision
+          const identity = resolveNewAssistantTurnIdentity(initialIdentities, await assistantTurnIdentities())
+          if (identity !== undefined) {
+            observeProgress({
+              assistantIdentity: identity,
+              text: '',
+              html: '',
+              running: true,
+              nativeRevision: nativeRevision(),
+            })
+          }
+          await notifyConversationCreated()
+          return identity === undefined
+            ? { kind: 'tool-batch', calls: decision.calls }
+            : { kind: 'tool-batch', calls: decision.calls, identity }
         }
       }
       const identity = resolveNewAssistantTurnIdentity(initialIdentities, await assistantTurnIdentities())
@@ -779,15 +801,20 @@ export async function* streamTextTurn(
     }
   }
 
+  let boundResponseIdentity: string | undefined
+  let emittedText = ''
+  const markdownBuffer = new ChatGptMarkdownBuffer()
+  const completionTracker = new ChatGptCompletionTracker()
+  const observationFaults = new ChatGptObservationFaultTracker()
+  const domHealthTracker = new ChatGptTurnDomHealthTracker(options.stallTimeoutMs)
+
   /** Poll one identity-bound assistant turn to completion or native batch. */
   async function* captureRound(responseIdentity: string): AsyncGenerator<TextTurnEvent, TextTurnResult> {
-    let boundResponseIdentity = responseIdentity
-    let emittedText = ''
-    const markdownBuffer = new ChatGptMarkdownBuffer()
-    const completionTracker = new ChatGptCompletionTracker()
-    const observationFaults = new ChatGptObservationFaultTracker()
-    const domHealthTracker = new ChatGptTurnDomHealthTracker(options.stallTimeoutMs)
+    boundResponseIdentity = responseIdentity
+    const boundaryStart = emittedText.length
     for (;;) {
+      const currentIdentity = boundResponseIdentity
+      if (currentIdentity === undefined) throw new LlmError('ChatGPT response identity was lost.', 'PROVIDER_ERROR')
       checkDeadline()
       assertProgress(options.native === undefined ? 'first-progress' : 'mcp-wait')
       if (options.native !== undefined) {
@@ -795,7 +822,7 @@ export async function* streamTextTurn(
         if (decision.kind === 'tool-batch') {
           noteNativeBatch()
           await notifyConversationCreated()
-          return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
+          return { kind: 'tool-batch', text: emittedText.slice(boundaryStart), promptChars: options.prompt.length, calls: decision.calls }
         }
       }
       // ONE evaluate per poll (upstream discipline): the snapshot IIFE
@@ -805,7 +832,7 @@ export async function* streamTextTurn(
       // hard that short answers never finished rendering.
       let snapshot: ResponseSnapshot
       try {
-        snapshot = await responseSnapshot(page, boundResponseIdentity)
+        snapshot = await responseSnapshot(page, currentIdentity)
         observationFaults.recordSuccess()
       } catch (error) {
         if (page.isClosed()) {
@@ -820,7 +847,7 @@ export async function* streamTextTurn(
         continue
       }
       observeProgress({
-        assistantIdentity: boundResponseIdentity,
+        assistantIdentity: currentIdentity,
         text: snapshot.visibleText,
         html: snapshot.segments.map(segment => segment.html).join(''),
         running: snapshot.running,
@@ -829,7 +856,7 @@ export async function* streamTextTurn(
       if (!snapshot.responsePresent) {
         const rebound = resolveReboundAssistantTurnIdentity(
           initialAssistantTurns,
-          boundResponseIdentity,
+          currentIdentity,
           await assistantTurnIdentities(),
         )
         if (rebound !== undefined && rebound !== boundResponseIdentity) {
@@ -869,7 +896,7 @@ export async function* streamTextTurn(
         if (decision.kind === 'tool-batch') {
           noteNativeBatch()
           await notifyConversationCreated()
-          return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
+          return { kind: 'tool-batch', text: emittedText.slice(boundaryStart), promptChars: options.prompt.length, calls: decision.calls }
         }
       }
 
@@ -904,7 +931,7 @@ export async function* streamTextTurn(
           const decision = arbitrateNativeObservation(options.native, candidate)
           if (decision.kind === 'tool-batch') {
             noteNativeBatch()
-            return { kind: 'tool-batch', text: emittedText, promptChars: options.prompt.length, calls: decision.calls }
+            return { kind: 'tool-batch', text: emittedText.slice(boundaryStart), promptChars: options.prompt.length, calls: decision.calls }
           }
           if (decision.kind !== 'completed') {
             await new Promise(resolveSleep => setTimeout(resolveSleep, 250))
@@ -917,7 +944,7 @@ export async function* streamTextTurn(
             emittedText += final.delta
             yield { type: 'delta', delta: final.delta }
           }
-          return { kind: 'completed', text: final.markdown.length > 0 ? final.markdown : visible, promptChars: options.prompt.length }
+          return { kind: 'completed', text: emittedText.slice(boundaryStart), promptChars: options.prompt.length }
         } catch (error) {
           throw new LlmError(
             'ChatGPT rewrote text that was already streamed; the turn cannot be completed safely.',
@@ -937,8 +964,99 @@ export async function* streamTextTurn(
   // duplicated streamed text and made ordinary final answers impossible.
   await attach(options.prompt)
   const submitted = await submit(initialAssistantTurns)
-  if (submitted.kind === 'tool-batch') {
-    return { kind: 'tool-batch', text: '', promptChars: options.prompt.length, calls: submitted.calls }
+  let pendingSubmission: SubmitResult | undefined = submitted
+  if (submitted.kind === 'assistant' || submitted.identity !== undefined) {
+    boundResponseIdentity = submitted.kind === 'assistant' ? submitted.identity : submitted.identity
   }
-  return yield* captureRound(submitted.identity)
+  let finished = false
+  let stopped = false
+
+  async function resolveSubmittedIdentity(): Promise<string> {
+    for (;;) {
+      checkDeadline()
+      assertProgress('post-tool-progress')
+      const identity = resolveNewAssistantTurnIdentity(initialAssistantTurns, await assistantTurnIdentities())
+      if (identity !== undefined) {
+        boundResponseIdentity = identity
+        return identity
+      }
+      await waitForDomMutation(page, 250)
+    }
+  }
+
+  async function* nextBoundary(): AsyncGenerator<TextTurnEvent, TextTurnResult> {
+    if (stopped) throw new LlmError('ChatGPT Web turn was stopped.', 'ABORTED')
+    if (finished) throw new LlmError('ChatGPT Web turn is already complete.', 'PROVIDER_ERROR')
+    if (pendingSubmission !== undefined) {
+      const first = pendingSubmission
+      pendingSubmission = undefined
+      if (first.kind === 'tool-batch') {
+        if (first.identity !== undefined) boundResponseIdentity = first.identity
+        return { kind: 'tool-batch', text: '', promptChars: options.prompt.length, calls: first.calls }
+      }
+      boundResponseIdentity = first.identity
+    }
+    const identity = boundResponseIdentity ?? await resolveSubmittedIdentity()
+    const inner = captureRound(identity)
+    let completed = false
+    try {
+      for (;;) {
+        const step = await inner.next()
+        if (step.done) {
+          completed = true
+          if (step.value.kind === 'completed') finished = true
+          return step.value
+        }
+        yield step.value
+      }
+    } finally {
+      if (!completed && inner.return !== undefined) await inner.return(undefined as never)
+    }
+  }
+
+  return {
+    get responseIdentity(): string | undefined {
+      return boundResponseIdentity
+    },
+    get conversationId(): string | undefined {
+      return conversationIdFromUrl(page.url())
+    },
+    nextBoundary,
+    markToolResultDelivered(revision: number): void {
+      if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('ChatGPT native progress revision is invalid')
+      progressTracker?.mark('tool-result', revision)
+    },
+    async stop(): Promise<void> {
+      if (stopped || finished) return
+      stopped = true
+      if (page.isClosed()) return
+      const stopButton = page.locator('[data-testid="stop-button"]').last()
+      if (await stopButton.isVisible().catch(() => false)) await stopButton.press('Enter').catch(() => {})
+    },
+  }
+}
+
+/** Backward-compatible one-boundary wrapper used by text-mode callers. */
+export async function* streamTextTurn(
+  page: Page,
+  options: TextTurnOptions,
+): AsyncGenerator<TextTurnEvent, TextTurnResult> {
+  const session = await startChatGptTurnSession(page, options)
+  const inner = session.nextBoundary()
+  let logicalBoundaryComplete = false
+  try {
+    for (;;) {
+      const step = await inner.next()
+      if (step.done) {
+        logicalBoundaryComplete = true
+        return step.value
+      }
+      yield step.value
+    }
+  } finally {
+    if (!logicalBoundaryComplete) {
+      if (inner.return !== undefined) await inner.return(undefined as never).catch(() => {})
+      await session.stop().catch(() => {})
+    }
+  }
 }
