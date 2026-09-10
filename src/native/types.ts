@@ -1,4 +1,5 @@
 import type { ContentBlock, GenerateOptions, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { WorkspaceBoundary } from './workspace-boundary.ts'
 
 export type BrokerCallId = Extract<ContentBlock, { type: 'tool-call' }>['id']
 
@@ -174,6 +175,7 @@ export interface CompiledNativeSecurityPolicy {
   readonly config: ResolvedNativeSecurityConfig
   readonly workspaceRoot: string
   readonly policyHash: string
+  readonly workspaceBoundary?: WorkspaceBoundary
   prepareRequest(
     options: GenerateOptions,
     runtime: NativePolicyRuntimeIdentity,

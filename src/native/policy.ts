@@ -2,6 +2,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import type { GenerateOptions, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { hashCanonical } from './canonical.ts'
+import { createWorkspaceBoundary } from './workspace-boundary.ts'
 import type {
   CompiledNativeSecurityPolicy,
   NativeApprovalMode,
@@ -268,6 +269,7 @@ function summaryFor(
   config: ResolvedNativeSecurityConfig,
   runtime: NativePolicyRuntimeIdentity,
   tools: readonly ToolSchema[],
+  workspaceRoot = config.workspaceRoot,
 ): NativePolicySummary {
   const rules = new Map(config.rules.map(rule => [rule.tool, rule]))
   const summaryTools = tools.map(tool => {
@@ -294,7 +296,7 @@ function summaryFor(
   })
   return deepFreeze({
     toolPolicy: config.toolPolicy,
-    workspaceRoot: config.workspaceRoot,
+    workspaceRoot,
     workspaceRootSource: config.workspaceRootSource,
     connectorName: runtime.connectorName,
     connectorRuntime: runtime.connectorRuntime,
@@ -311,17 +313,27 @@ export function compileNativeSecurityPolicy(
 ): CompiledNativeSecurityPolicy {
   const configSnapshot = deepFreeze(structuredClone(config))
   const privatePathSnapshot = Object.freeze([...new Set(privatePaths.map(path => assertSafePath(path, 'private path')))].sort())
+  const workspaceBoundary = configSnapshot.toolPolicy === 'full'
+    ? undefined
+    : createWorkspaceBoundary(configSnapshot, privatePathSnapshot)
   const policyHash = hashCanonical('native-policy', NATIVE_POLICY_FORMAT_VERSION, {
     config: configSnapshot,
+    canonicalWorkspace: workspaceBoundary?.canonicalRoot ?? configSnapshot.workspaceRoot,
     privatePaths: privatePathSnapshot,
-    builtInSensitiveRules: BUILT_IN_SENSITIVE_RULE_VERSION,
+    sensitiveRules: workspaceBoundary?.sensitiveDigest ?? hashCanonical(
+      'native-sensitive-rules',
+      BUILT_IN_SENSITIVE_RULE_VERSION,
+      { privatePaths: privatePathSnapshot },
+    ),
+    ignoreDigest: workspaceBoundary?.ignoreDigest ?? hashCanonical('native-ignore', 1, { present: false }),
     sanitizer: NATIVE_SANITIZER_FORMAT_VERSION,
   })
 
   const compiled: CompiledNativeSecurityPolicy = {
     config: configSnapshot,
-    workspaceRoot: configSnapshot.workspaceRoot,
+    workspaceRoot: workspaceBoundary?.canonicalRoot ?? configSnapshot.workspaceRoot,
     policyHash,
+    ...(workspaceBoundary === undefined ? {} : { workspaceBoundary }),
     prepareRequest(options, runtime): PreparedNativeRequest {
       assertRuntime(runtime)
       const inputTools = options.tools ?? []
@@ -346,7 +358,7 @@ export function compileNativeSecurityPolicy(
         policyHash,
         inventoryHash,
         approvalHash,
-        summary: summaryFor(configSnapshot, runtime, inventoryTools),
+        summary: summaryFor(configSnapshot, runtime, inventoryTools, workspaceBoundary?.canonicalRoot),
       })
     },
   }

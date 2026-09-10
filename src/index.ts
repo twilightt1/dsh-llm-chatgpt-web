@@ -49,6 +49,7 @@ export { compilePrompt } from './chatgpt/prompt.ts'
 export { NativeToolBroker } from './native/broker.ts'
 export { NativeRoundCoordinator, correlateToolResults } from './native/coordinator.ts'
 export type { NativeRoundCleanup, NativeStepLease } from './native/coordinator.ts'
+export type { WorkspaceBoundary } from './native/workspace-boundary.ts'
 export type {
   BrokerRoundSnapshot,
   BrokerRpcError,

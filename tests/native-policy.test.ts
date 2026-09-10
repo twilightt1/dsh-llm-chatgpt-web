@@ -37,6 +37,7 @@ const runtime: NativePolicyRuntimeIdentity = {
   brokerSocketPath: '/tmp/dsh-native.sock',
   nativeRuntimeConfigPath: '/tmp/native-runtime.json',
 }
+const existingWorkspace = process.cwd()
 
 function request(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
   return {
@@ -106,7 +107,7 @@ describe('native security config', () => {
 
 describe('CompiledNativeSecurityPolicy', () => {
   it('keeps full mode compatible while returning detached immutable preparation', () => {
-    const config = resolveNativeSecurityConfig(undefined, '/tmp/project')
+    const config = resolveNativeSecurityConfig(undefined, existingWorkspace)
     const compiled = compileNativeSecurityPolicy(config, ['/tmp/private-runtime.json'])
     const original = request()
     const prepared = compiled.prepareRequest(original, runtime)
@@ -134,8 +135,9 @@ describe('CompiledNativeSecurityPolicy', () => {
         { tool: 'search', capability: 'workspace.search', pathArguments: ['/path'] },
         { tool: 'read_file', capability: 'workspace.read', pathArguments: ['/path'] },
       ],
-    }, '/tmp/project')
+    }, existingWorkspace)
     const compiled = compileNativeSecurityPolicy(config, [])
+    expect(compiled.workspaceBoundary?.canonicalRoot).toBe(existingWorkspace)
     const prepared = compiled.prepareRequest(request(), runtime)
     expect(prepared.providerOptions.tools?.map(tool => tool.name)).toEqual(['read_file', 'search'])
     expect(prepared.summary.tools.map(tool => tool.tool)).toEqual(['read_file', 'search'])
@@ -145,7 +147,7 @@ describe('CompiledNativeSecurityPolicy', () => {
     const empty = compileNativeSecurityPolicy(resolveNativeSecurityConfig({
       toolPolicy: 'allowlist',
       rules: [{ tool: 'missing', capability: 'workspace.read', pathArguments: ['/path'] }],
-    }, '/tmp/project'), []).prepareRequest(request(), runtime)
+    }, existingWorkspace), []).prepareRequest(request(), runtime)
     expect(empty.providerOptions.tools).toEqual([])
     expect(empty.summary.tools).toEqual([])
   })
@@ -154,7 +156,7 @@ describe('CompiledNativeSecurityPolicy', () => {
     const config = resolveNativeSecurityConfig({
       toolPolicy: 'allowlist',
       rules: [{ tool: 'read_file', capability: 'workspace.read', pathArguments: ['/path'] }],
-    }, '/tmp/project')
+    }, existingWorkspace)
     const compiled = compileNativeSecurityPolicy(config, [])
     expect(() => compiled.prepareRequest(request({ tools: [readTool, readTool] }), runtime)).toThrow(/duplicate/i)
     const prepared = compiled.prepareRequest(request({ purpose: 'session-title' }), runtime)
@@ -166,7 +168,7 @@ describe('CompiledNativeSecurityPolicy', () => {
     const compiled = compileNativeSecurityPolicy(resolveNativeSecurityConfig({
       toolPolicy: 'allowlist',
       rules: [{ tool: 'read_file', capability: 'workspace.read', pathArguments: ['/path'] }],
-    }, '/tmp/project'), [])
+    }, existingWorkspace), [])
     const first = compiled.prepareRequest(request({ tools: [readTool] }), runtime)
     const second = compiled.prepareRequest(request({ tools: [readTool] }), {
       ...runtime,

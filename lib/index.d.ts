@@ -1,6 +1,19 @@
 import z from "@deepseek-ai/schemastery";
 import { ContentBlock, GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, Message, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk, ToolSchema } from "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
+//#region src/native/workspace-boundary.d.ts
+interface WorkspaceBoundary {
+  readonly canonicalRoot: string;
+  readonly rootSource: 'explicit' | 'process.cwd';
+  readonly sensitiveDigest: string;
+  readonly ignoreDigest: string;
+  rewriteArguments(args: Record<string, unknown>, pointers: readonly string[]): {
+    readonly arguments: Readonly<Record<string, unknown>>;
+    readonly argumentsHash: string;
+  };
+  rebaseProviderArguments(args: Record<string, unknown>, pointers: readonly string[]): Readonly<Record<string, unknown>>;
+}
+//#endregion
 //#region src/native/types.d.ts
 type BrokerCallId = Extract<ContentBlock, {
   type: 'tool-call';
@@ -462,4 +475,4 @@ declare function defaultBrokerSocketPath(profileDir: string): string;
 declare function resolveAdapterOptions(config: Config, platform?: NodeJS.Platform, arch?: string): ChatGptWebConnectionOptions;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeApprovalMode, type NativeCapability, type NativeEffectiveCapability, type NativeEffectiveResultPolicy, type NativeEvidenceLimitsConfig, type NativePolicyRuntimeIdentity, type NativePolicySummary, type NativeResultPolicy, type NativeRoundCleanup, NativeRoundCoordinator, type NativeSecurityConfig, type NativeStepLease, NativeToolBroker, type NativeToolPolicy, type NativeToolRuleConfig, PROVIDER, type PreparedNativeRequest, type ResolvedNativeSecurityConfig, type ResolvedNativeToolRule, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };
+export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeApprovalMode, type NativeCapability, type NativeEffectiveCapability, type NativeEffectiveResultPolicy, type NativeEvidenceLimitsConfig, type NativePolicyRuntimeIdentity, type NativePolicySummary, type NativeResultPolicy, type NativeRoundCleanup, NativeRoundCoordinator, type NativeSecurityConfig, type NativeStepLease, NativeToolBroker, type NativeToolPolicy, type NativeToolRuleConfig, PROVIDER, type PreparedNativeRequest, type ResolvedNativeSecurityConfig, type ResolvedNativeToolRule, type WorkspaceBoundary, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };
