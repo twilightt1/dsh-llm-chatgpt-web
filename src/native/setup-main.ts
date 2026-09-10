@@ -4,6 +4,7 @@ import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { resolve } from 'node:path'
 import {
+  abandonNativeCheckpoint,
   doctorManagedNativeRuntime,
   formatNativeDoctorReport,
   parseNativeSetupArgs,
@@ -142,6 +143,15 @@ export async function runDshNativeSetupMain(
       const report = doctorManagedNativeRuntime(command)
       io.stdout.write(formatNativeDoctorReport(report, command.json))
       return report.ok ? 0 : 1
+    }
+    if (command.command === 'recover') {
+      if (io.stdin.isTTY !== true) throw new Error('native recovery requires an interactive TTY')
+      io.stdout.write(`Abandon checkpoint ${JSON.stringify(command.checkpointHash)}? Type abandon: `)
+      const confirmation = await readApprovalConfirmation(io)
+      if (confirmation !== 'abandon') throw new Error('native recovery requires the exact confirmation "abandon"')
+      await abandonNativeCheckpoint(command.profileDir, command.checkpointHash)
+      io.stdout.write('Native checkpoint marked abandoned.\n')
+      return 0
     }
     if (command.command === 'approve') {
       if (io.stdin.isTTY !== true) throw new Error('native approval requires an interactive TTY')

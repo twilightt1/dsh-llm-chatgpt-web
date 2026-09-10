@@ -60,7 +60,17 @@ export {
   NativePolicyDeniedError,
   NativeSafetyError,
 } from './native/errors.ts'
-export { durableAtomicWritePrivateFile, syncPrivateDirectory } from './native/private-files.ts'
+export {
+  appendDurablePrivateJsonLine,
+  acquirePrivateWriterLease,
+  durableAtomicWritePrivateFile,
+  syncPrivateDirectory,
+} from './native/private-files.ts'
+export {
+  createNativeCheckpointStore,
+  nativeCheckpointProjectionHash,
+  nativeCheckpointRawResultHash,
+} from './native/checkpoint.ts'
 export type { NativeRoundCleanup, NativeStepLease } from './native/coordinator.ts'
 export type { WorkspaceBoundary } from './native/workspace-boundary.ts'
 export type {
@@ -71,6 +81,12 @@ export type {
   BrokerRpcResponse,
   BrokerToolRequest,
   BrokerToolResult,
+  NativeCheckpoint,
+  NativeCheckpointCallBinding,
+  NativeCheckpointEventType,
+  NativeCheckpointStore,
+  NativeCheckpointSummary,
+  NativeRecoveryVerdict,
   NativeApprovalMode,
   NativeCapability,
   NativeEffectiveCapability,
@@ -85,6 +101,9 @@ export type {
   PreparedNativeRequest,
   ResolvedNativeSecurityConfig,
   ResolvedNativeToolRule,
+  PrivateProcessState,
+  PrivateWriterLease,
+  PrivateWriterLeaseDependencies,
 } from './native/types.ts'
 
 export const name = 'llm-chatgpt-web'

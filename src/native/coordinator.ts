@@ -3,8 +3,10 @@ import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { canonicalJson } from './canonical.ts'
 import { NativeToolBroker } from './broker.ts'
 import type {
+  BrokerAuthorizedToolRequest,
   BrokerToolRequest,
   BrokerToolResult,
+  NativeCheckpoint,
   NativeCoordinatorSnapshot,
   NativePolicyRound,
 } from './types.ts'
@@ -51,6 +53,7 @@ interface BeginStepInput {
   readonly invocationTimeoutMs?: number
   readonly signal?: AbortSignal
   readonly continuation?: { readonly kind: 'continue' | 'fresh-replay' }
+  readonly checkpoint?: NativeCheckpoint
 }
 
 interface NormalizedBeginStepInput {
@@ -59,6 +62,7 @@ interface NormalizedBeginStepInput {
   readonly ttlMs: number
   readonly signal?: AbortSignal
   readonly continuation?: { readonly kind: 'continue' | 'fresh-replay' }
+  readonly checkpoint?: NativeCheckpoint
 }
 
 interface BeginWaiter {
@@ -90,6 +94,7 @@ class RoundRecord {
     readonly sessionId: string,
     readonly requestId: string,
     readonly snapshot: NativeCoordinatorSnapshot,
+    readonly checkpoint: NativeCheckpoint | undefined,
     hooks: NativeLeaseHooks,
   ) {
     this.lease = new NativeLease(this, hooks)
@@ -159,6 +164,7 @@ function normalizeBeginStepInput(input: BeginStepInput): NormalizedBeginStepInpu
       ttlMs: input.ttlMs,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
       ...(input.continuation === undefined ? {} : { continuation: input.continuation }),
+      ...(input.checkpoint === undefined ? {} : { checkpoint: input.checkpoint }),
     }
   }
   if (input.sessionId === undefined || input.messages === undefined || input.tools === undefined
@@ -184,6 +190,7 @@ function normalizeBeginStepInput(input: BeginStepInput): NormalizedBeginStepInpu
     ttlMs: input.ttlMs,
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     ...(input.continuation === undefined ? {} : { continuation: input.continuation }),
+    ...(input.checkpoint === undefined ? {} : { checkpoint: input.checkpoint }),
   }
 }
 
@@ -305,10 +312,16 @@ export class NativeRoundCoordinator {
     return deferred.promise
   }
 
-  async stopAtTurnBoundary(sessionId: string): Promise<void> {
+  async stopAtTurnBoundary(sessionId: string, preserveCheckpoint = false): Promise<void> {
     const record = this.reservation
     if (record?.sessionId === sessionId) {
-      await this.finish(record, 'stop', record.cleanup, new Error('native round stopped at turn boundary'))
+      await this.finish(
+        record,
+        'stop',
+        record.cleanup,
+        new Error('native round stopped at turn boundary'),
+        !preserveCheckpoint,
+      )
     }
     this.rejectQueuedSession(sessionId, new Error('native step stopped at turn boundary'))
   }
@@ -363,7 +376,12 @@ export class NativeRoundCoordinator {
     return waiter
   }
 
-  private createRecord(sessionId: string, requestId: string, snapshot: NativeCoordinatorSnapshot): RoundRecord {
+  private createRecord(
+    sessionId: string,
+    requestId: string,
+    snapshot: NativeCoordinatorSnapshot,
+    checkpoint?: NativeCheckpoint,
+  ): RoundRecord {
     let record!: RoundRecord
     const hooks: NativeLeaseHooks = {
       broker: this.broker,
@@ -379,7 +397,7 @@ export class NativeRoundCoordinator {
       complete: cleanup => this.finish(record, 'close', cleanup),
       fail: (cleanup, cause) => this.finish(record, 'stop', cleanup, cause),
     }
-    record = new RoundRecord(sessionId, requestId, snapshot, hooks)
+    record = new RoundRecord(sessionId, requestId, snapshot, checkpoint, hooks)
     return record
   }
 
@@ -389,8 +407,9 @@ export class NativeRoundCoordinator {
         ...waiter.input.snapshot.broker,
         ttlMs: waiter.input.ttlMs,
         ...(waiter.input.openPolicyRound === undefined ? {} : { policyRound: waiter.input.openPolicyRound() }),
+        ...(waiter.input.checkpoint === undefined ? {} : { checkpoint: waiter.input.checkpoint }),
       })
-      const record = this.createRecord(waiter.input.snapshot.sessionId, requestId, waiter.input.snapshot)
+      const record = this.createRecord(waiter.input.snapshot.sessionId, requestId, waiter.input.snapshot, waiter.input.checkpoint)
       this.reservation = record
       this.watchRetirement(record)
       this.resolveWaiter(waiter, record.lease)
@@ -411,6 +430,10 @@ export class NativeRoundCoordinator {
         throw new Error('native parked round has no pending tool batch to resume')
       }
       const results = correlateToolResults(waiter.input.snapshot.canonicalMessages, calls)
+      record.checkpoint?.confirmResults(
+        calls as readonly BrokerAuthorizedToolRequest[],
+        results,
+      )
       if (waiter.input.continuation?.kind === 'continue') {
         this.broker.completeBatch(record.requestId, calls.map((call, index) => ({
           callId: call.callId,
@@ -428,8 +451,12 @@ export class NativeRoundCoordinator {
         this.broker.completeTool(record.requestId, call.callId, results[index]!)
       }
       await this.broker.waitForQuiescence(record.requestId, waiter.input.signal)
-      await this.releaseRecord(record, 'stop', new Error('native predecessor resumed'))
-      const lease = await this.registerFresh(waiter.input)
+      await this.releaseRecord(record, 'stop', new Error('native predecessor resumed'), false)
+      const checkpoint = record.checkpoint
+      checkpoint?.consumeReplayAndPrepareNextGeneration()
+      const lease = await this.registerFresh(
+        checkpoint === undefined ? waiter.input : { ...waiter.input, checkpoint },
+      )
       this.resolveWaiter(waiter, lease)
     } catch (error) {
       await this.releaseRecord(record, 'stop', error instanceof Error ? error : new Error(String(error))).catch(() => {})
@@ -445,8 +472,9 @@ export class NativeRoundCoordinator {
       ...input.snapshot.broker,
       ttlMs: input.ttlMs,
       ...(input.openPolicyRound === undefined ? {} : { policyRound: input.openPolicyRound() }),
+      ...(input.checkpoint === undefined ? {} : { checkpoint: input.checkpoint }),
     })
-    const record = this.createRecord(input.snapshot.sessionId, requestId, input.snapshot)
+    const record = this.createRecord(input.snapshot.sessionId, requestId, input.snapshot, input.checkpoint)
     this.reservation = record
     this.watchRetirement(record)
     return record.lease
@@ -457,6 +485,7 @@ export class NativeRoundCoordinator {
     mode: 'stop' | 'close',
     cleanup: NativeRoundCleanup | undefined,
     cause?: Error,
+    terminalCheckpoint = true,
   ): Promise<void> {
     if (record.released || record.state === 'terminal') throw new Error('native step lease is already terminal')
     if (cleanup !== undefined && record.cleanup === undefined) record.cleanup = cleanup
@@ -466,14 +495,24 @@ export class NativeRoundCoordinator {
         this.broker.beginSettlement(record.requestId)
         await this.broker.waitForQuiescence(record.requestId)
       } catch (error) {
-        await this.releaseRecord(record, 'stop', cause ?? (error instanceof Error ? error : new Error(String(error))))
+        await this.releaseRecord(
+          record,
+          'stop',
+          cause ?? (error instanceof Error ? error : new Error(String(error))),
+          terminalCheckpoint,
+        )
         throw error
       }
     }
-    await this.releaseRecord(record, mode, cause)
+    await this.releaseRecord(record, mode, cause, terminalCheckpoint)
   }
 
-  private async releaseRecord(record: RoundRecord, mode: 'stop' | 'close', cause?: Error): Promise<void> {
+  private async releaseRecord(
+    record: RoundRecord,
+    mode: 'stop' | 'close',
+    cause?: Error,
+    terminalCheckpoint = true,
+  ): Promise<void> {
     if (record.released) return
     record.released = true
     record.retired = true
@@ -490,9 +529,18 @@ export class NativeRoundCoordinator {
       }
     }
     this.broker.revoke(record.requestId, cause ?? new Error(`native round ${mode}d`))
+    let checkpointError: unknown
+    if (terminalCheckpoint && record.checkpoint !== undefined && cleanupError === undefined) {
+      try {
+        record.checkpoint.markTerminal(mode === 'close' ? 'completed' : 'failed')
+      } catch (error) {
+        checkpointError = error
+      }
+    }
     if (this.reservation === record) this.reservation = undefined
     this.scheduleDrain()
     if (cleanupError !== undefined) throw cleanupError
+    if (checkpointError !== undefined) throw checkpointError
   }
 
   private watchRetirement(record: RoundRecord): void {

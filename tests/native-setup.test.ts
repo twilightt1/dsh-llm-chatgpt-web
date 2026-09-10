@@ -122,6 +122,17 @@ describe('native setup CLI parsing', () => {
       profileDir: '/tmp/p',
       challengeId: 'challenge_00000000-0000-4000-8000-000000000000',
     })
+    expect(parseNativeSetupArgs([
+      'recover', '--profile-dir', '/tmp/p', '--checkpoint', 'a'.repeat(64), '--abandon',
+    ])).toEqual({
+      command: 'recover', profileDir: '/tmp/p', checkpointHash: 'a'.repeat(64), abandon: true,
+    })
+    expect(() => parseNativeSetupArgs([
+      'recover', '--profile-dir', '/tmp/p', '--checkpoint', 'a'.repeat(64),
+    ])).toThrow(/abandon/i)
+    expect(() => parseNativeSetupArgs([
+      'recover', '--profile-dir', '/tmp/p', '--checkpoint', 'a'.repeat(64), '--abandon', '--connector-name', 'x',
+    ])).toThrow(/only|accept/i)
     expect(() => parseNativeSetupArgs([
       'approve', '--profile-dir', '/tmp/p', '--challenge', 'one', '--challenge', 'two',
     ])).toThrow(/duplicate/i)

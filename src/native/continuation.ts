@@ -309,11 +309,11 @@ export function decideNativeContinuation(
   const incomingAssistant = options.messages[expectedAssistantIndex]
   if (incomingAssistant === undefined || !sameMessages([incomingAssistant], [claim.assistantMessage])) {
     if (freshReason !== undefined) {
-      return claim.physicalAvailable
-        ? { kind: 'fresh-replay', reason: freshReason }
-        : claim.durableResults
-          ? { kind: 'fresh-replay', reason: claim.unavailableReason ?? 'page-lost' }
-          : failure('UNCERTAIN_OUTCOME', 'native response history changed before durable tool results were proven')
+      return claim.durableResults
+        ? claim.physicalAvailable
+          ? { kind: 'fresh-replay', reason: freshReason }
+          : { kind: 'fresh-replay', reason: claim.unavailableReason ?? 'page-lost' }
+        : failure('UNCERTAIN_OUTCOME', 'native response history changed before durable tool results were proven')
     }
     return failure('HISTORY_MISMATCH', 'native continuation history does not contain the emitted assistant tool-call message')
   }
@@ -346,19 +346,19 @@ export function decideNativeContinuation(
       || message.content.some(block => block.type === 'tool-result'))) {
       return failure('DUPLICATE_TOOL_RESULT', 'native continuation contains an extra tool result for the parked batch')
     }
-    return claim.physicalAvailable
-      ? { kind: 'fresh-replay', reason: extraTailReason(extra) ?? 'context-added' }
-      : claim.durableResults
-        ? { kind: 'fresh-replay', reason: claim.unavailableReason ?? 'page-lost' }
-        : failure('UNCERTAIN_OUTCOME', 'native response has extra history and no durable replay boundary')
+    return claim.durableResults
+      ? claim.physicalAvailable
+        ? { kind: 'fresh-replay', reason: extraTailReason(extra) ?? 'context-added' }
+        : { kind: 'fresh-replay', reason: claim.unavailableReason ?? 'page-lost' }
+      : failure('UNCERTAIN_OUTCOME', 'native response has extra history and no durable replay boundary')
   }
 
   if (freshReason !== undefined) {
-    return claim.physicalAvailable
-      ? { kind: 'fresh-replay', reason: freshReason }
-      : claim.durableResults
-        ? { kind: 'fresh-replay', reason: claim.unavailableReason ?? 'page-lost' }
-        : failure('UNCERTAIN_OUTCOME', 'native response cannot safely replay before durable tool results')
+    return claim.durableResults
+      ? claim.physicalAvailable
+        ? { kind: 'fresh-replay', reason: freshReason }
+        : { kind: 'fresh-replay', reason: claim.unavailableReason ?? 'page-lost' }
+      : failure('UNCERTAIN_OUTCOME', 'native response cannot safely replay before durable tool results')
   }
   if (!claim.physicalAvailable) {
     return claim.durableResults

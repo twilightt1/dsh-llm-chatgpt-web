@@ -5,7 +5,7 @@ import {
   createNativePhysicalResponse,
   type NativePhysicalResponseDriver,
 } from '../src/native/physical-response.ts'
-import type { BrokerToolRequest, BrokerToolResult } from '../src/native/types.ts'
+import type { BrokerToolRequest, BrokerToolResult, NativeCheckpoint } from '../src/native/types.ts'
 import { testCallId } from './call-id.ts'
 
 const call = {
@@ -105,6 +105,36 @@ describe('NativePhysicalResponse', () => {
     const replay = await collect(response.streamBoundary(1))
     expect(replay).toEqual(first)
     expect(driver.nextBoundaryCount()).toBe(2)
+  })
+
+  it('fences a captured boundary before exposing tool-call chunks', async () => {
+    const events: string[] = []
+    const checkpoint = {
+      checkpointHash: 'a'.repeat(64), generation: 1,
+      recordSubmissionAttempted: vi.fn(), recordSubmitted: vi.fn(),
+      recordBatch: vi.fn(() => { events.push('batch-journaled') }),
+      confirmResults: vi.fn(), prepareHandoff: vi.fn(), confirmHandoff: vi.fn(),
+      recordCompletion: vi.fn(() => { events.push('completion-journaled') }),
+      prepareCleanup: vi.fn(), confirmCleanup: vi.fn(),
+      consumeReplayAndPrepareNextGeneration: vi.fn(), markNonReplayable: vi.fn(), markTerminal: vi.fn(),
+    } satisfies NativeCheckpoint
+    const driver = fakeDriver([
+      boundary([{ type: 'delta', delta: 'tool' }], {
+        kind: 'tool-batch', text: 'tool', promptChars: 10, calls: [call],
+      }),
+      boundary([{ type: 'delta', delta: 'done' }], {
+        kind: 'completed', text: 'done', promptChars: 10,
+      }),
+    ])
+    const response = createNativePhysicalResponse({ ...fixture(driver), checkpoint })
+    const first = await collect(response.streamBoundary())
+    expect(events).toEqual(['batch-journaled'])
+    expect(first.some(chunk => chunk.type === 'tool-call-delta')).toBe(true)
+    await response.deliverResults([result])
+    await collect(response.streamBoundary())
+    expect(events).toEqual(['batch-journaled', 'completion-journaled'])
+    expect(await collect(response.streamBoundary(1))).toEqual(first)
+    expect(events).toEqual(['batch-journaled', 'completion-journaled'])
   })
 
   it('supports a second serial tool boundary without duplicating prior text', async () => {

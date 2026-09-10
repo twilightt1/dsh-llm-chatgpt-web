@@ -250,6 +250,17 @@ describe('decideNativeContinuation', () => {
     }] }))).toEqual({ kind: 'fresh-replay', reason: 'steering' })
   })
 
+  it('refuses fresh replay when a parked side effect has no exact durable results', () => {
+    expect(decideNativeContinuation(
+      claim({ durableResults: false }),
+      request({ model: 'chatgpt-web/light' }),
+    )).toMatchObject({ kind: 'fail', code: 'UNCERTAIN_OUTCOME' })
+    expect(decideNativeContinuation(
+      claim({ durableResults: false }),
+      request({ messages: [user, assistant] }),
+    )).toMatchObject({ kind: 'fail' })
+  })
+
   it('allows page-loss replay only after durable results and rejects uncertain outcomes', () => {
     expect(decideNativeContinuation(
       claim({ physicalAvailable: false }),

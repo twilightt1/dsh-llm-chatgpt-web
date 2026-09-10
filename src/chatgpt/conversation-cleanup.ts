@@ -2,7 +2,7 @@ import { lstatSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { Locator, Page } from 'playwright-core'
-import { atomicWritePrivateFile, assertPrivateRegularFile } from '../native/private-files.ts'
+import { durableAtomicWritePrivateFile, assertPrivateRegularFile } from '../native/private-files.ts'
 
 const CHATGPT_ORIGIN = 'https://chatgpt.com'
 const CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -81,7 +81,7 @@ function readLedgerFile(path: string): string[] {
 
 function writeLedgerFile(path: string, ids: readonly string[]): void {
   const file: LedgerFile = { version: LEDGER_VERSION, conversationIds: ids }
-  atomicWritePrivateFile(path, `${JSON.stringify(file)}\n`, 0o600)
+  durableAtomicWritePrivateFile(path, `${JSON.stringify(file)}\n`, 0o600)
 }
 
 export interface OwnedConversationLedger {

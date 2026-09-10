@@ -8,6 +8,13 @@ import {
 } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { assertPrivateDirectory, assertPrivateRegularFile, atomicWritePrivateFile, ensurePrivateDirectory, snapshotPrivateFile } from './private-files.ts'
+import { createNativeCheckpointStore } from './checkpoint.ts'
+import { hashCanonical } from './canonical.ts'
+import { ChatGptBrowser } from '../chatgpt/browser.ts'
+import {
+  createOwnedConversationLedger,
+  retryPendingConversationDeletions,
+} from '../chatgpt/conversation-cleanup.ts'
 import {
   defaultManagedRuntimePaths,
   ensureManagedRuntimeDirectories,
@@ -84,6 +91,7 @@ export type ParsedNativeSetupCommand =
   | { readonly command: 'doctor'; readonly profileDir: string; readonly connectorName: string; readonly json: boolean }
   | { readonly command: 'stop'; readonly profileDir: string; readonly connectorName: string }
   | { readonly command: 'approve'; readonly profileDir: string; readonly challengeId: string }
+  | { readonly command: 'recover'; readonly profileDir: string; readonly checkpointHash: string; readonly abandon: true }
 
 function expandHome(value: string): string {
   if (value === '~' || value.startsWith('~/')) {
@@ -119,13 +127,15 @@ function tunnelId(value: string): string {
 
 function parseCommandOptions(
   args: readonly string[],
-  command: 'setup' | 'doctor' | 'stop' | 'approve',
+  command: 'setup' | 'doctor' | 'stop' | 'approve' | 'recover',
 ): ParsedNativeSetupCommand {
   let profileDir: string | undefined
   let name: string | undefined
   let id: string | undefined
   let keyFile: string | undefined
   let challenge: string | undefined
+  let checkpointHash: string | undefined
+  let abandon = false
   let json = false
   const seen = new Set<string>()
   let index = 1
@@ -139,6 +149,23 @@ function parseCommandOptions(
       index += 1
       continue
     }
+    if (flag === '--abandon') {
+      if (command !== 'recover') throw new Error(`${command} does not accept ${flag}`)
+      if (seen.has(flag)) throw new Error(`duplicate option ${flag}`)
+      seen.add(flag)
+      abandon = true
+      index += 1
+      continue
+    }
+    if (flag === '--checkpoint') {
+      if (command !== 'recover') throw new Error(`${command} does not accept ${flag}`)
+      if (seen.has(flag)) throw new Error(`duplicate option ${flag}`)
+      seen.add(flag)
+      const option = requiredOption(args, index, flag)
+      checkpointHash = option.value
+      index = option.next
+      continue
+    }
     if (flag === '--challenge') {
       if (command !== 'approve') throw new Error(`${command} does not accept ${flag}`)
       if (seen.has(flag)) throw new Error(`duplicate option ${flag}`)
@@ -149,7 +176,7 @@ function parseCommandOptions(
       continue
     }
     if (flag === '--profile-dir' || flag === '--connector-name' || flag === '--tunnel-id' || flag === '--runtime-key-file') {
-      if (command === 'approve' && flag !== '--profile-dir') throw new Error(`${command} does not accept ${flag}`)
+      if ((command === 'approve' || command === 'recover') && flag !== '--profile-dir') throw new Error(`${command} does not accept ${flag}`)
       if (seen.has(flag)) throw new Error(`duplicate option ${flag}`)
       seen.add(flag)
       const option = requiredOption(args, index, flag)
@@ -163,6 +190,16 @@ function parseCommandOptions(
     throw new Error(`unknown option ${flag}`)
   }
   if (profileDir === undefined) throw new Error('--profile-dir is required')
+  if (command === 'recover') {
+    if (checkpointHash === undefined || !SHA256.test(checkpointHash)) {
+      throw new Error('--checkpoint is required and must be a public checkpoint hash')
+    }
+    if (!abandon) throw new Error('recover requires --abandon')
+    if (name !== undefined || id !== undefined || keyFile !== undefined || json || challenge !== undefined) {
+      throw new Error('recover accepts only --profile-dir, --checkpoint, and --abandon')
+    }
+    return { command, profileDir: profilePath(profileDir), checkpointHash, abandon: true }
+  }
   if (command === 'approve') {
     if (challenge === undefined || challenge.length === 0 || challenge.length > 128 || CONTROL_BYTES.test(challenge)) {
       throw new Error('--challenge is required and must be control-free')
@@ -198,8 +235,8 @@ function parseCommandOptions(
 
 export function parseNativeSetupArgs(args: readonly string[]): ParsedNativeSetupCommand {
   const command = args[0]
-  if (command !== 'setup' && command !== 'doctor' && command !== 'stop' && command !== 'approve') {
-    throw new Error('command must be setup, doctor, stop, or approve')
+  if (command !== 'setup' && command !== 'doctor' && command !== 'stop' && command !== 'approve' && command !== 'recover') {
+    throw new Error('command must be setup, doctor, stop, approve, or recover')
   }
   return parseCommandOptions(args, command)
 }
@@ -527,6 +564,59 @@ export function doctorManagedNativeRuntime(options: {
     broker,
     issues,
   }
+}
+
+export async function abandonNativeCheckpoint(profileDir: string, checkpointHash: string): Promise<void> {
+  const resolvedProfileDir = profilePath(profileDir)
+  const store = createNativeCheckpointStore(resolvedProfileDir)
+  const lease = store.acquire()
+  let browser: ChatGptBrowser | undefined
+  let page: Awaited<ReturnType<ChatGptBrowser['newTurnPage']>> | undefined
+  let failure: unknown
+  try {
+    if (store.abandon === undefined
+      || store.prepareRecoveryCleanup === undefined
+      || store.confirmRecoveryCleanup === undefined) {
+      throw new Error('native checkpoint abandonment is unavailable')
+    }
+    // This first mutation is the durable operator acknowledgement. It either
+    // closes a pre-submit checkpoint or leaves a non-replayable fence for the
+    // exact owned-conversation cleanup below.
+    store.abandon(checkpointHash)
+    const ledger = createOwnedConversationLedger(resolvedProfileDir)
+    const pending = ledger.pending()
+    if (pending.length !== 0) {
+      if (pending.length !== 1) throw new Error('native checkpoint abandonment requires exactly one owned conversation')
+      store.prepareRecoveryCleanup(checkpointHash)
+      browser = new ChatGptBrowser({
+        profileDir: resolvedProfileDir,
+        chromeExecutablePath: undefined,
+        headed: false,
+        offscreen: true,
+        loginTimeoutMs: 600_000,
+        daemonIdleMs: 1_800_000,
+      })
+      await browser.ensureReady()
+      page = await browser.newTurnPage()
+      await retryPendingConversationDeletions(page, ledger)
+      if (ledger.pending().length !== 0) throw new Error('native checkpoint ownership cleanup remained pending')
+      store.confirmRecoveryCleanup(
+        checkpointHash,
+        hashCanonical('native-ledger-correlation', 1, pending[0]),
+      )
+      store.abandon(checkpointHash)
+    }
+    const remaining = store.inspect().find(summary => summary.checkpointHash === checkpointHash)
+    if (remaining !== undefined && !remaining.terminal) {
+      throw new Error('native checkpoint abandonment remains blocked; exact cleanup could not be confirmed')
+    }
+  } catch (error) {
+    failure = error
+  }
+  try { await page?.close() } catch (error) { failure ??= error }
+  try { await browser?.close() } catch (error) { failure ??= error }
+  try { lease.release() } catch (error) { failure ??= error }
+  if (failure !== undefined) throw failure
 }
 
 export async function stopManagedNativeRuntime(options: {

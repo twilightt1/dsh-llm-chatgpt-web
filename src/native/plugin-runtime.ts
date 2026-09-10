@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url'
 import { realpathSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import type { ChatGptWebConnectionOptions } from '../adapter.ts'
+import { createOwnedConversationLedger } from '../chatgpt/conversation-cleanup.ts'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { NativeBrokerSocketServer } from './broker-socket.ts'
 import { NativeToolBroker } from './broker.ts'
@@ -17,7 +18,13 @@ import {
 } from './tunnel-runtime.ts'
 import type { CommandRunner } from './process.ts'
 import { compileNativeSecurityPolicy } from './policy.ts'
-import type { PreparedNativeRequest, NativePolicyRuntimeIdentity } from './types.ts'
+import { createNativeCheckpointStore } from './checkpoint.ts'
+import type {
+  NativeCheckpointStore,
+  PreparedNativeRequest,
+  NativePolicyRuntimeIdentity,
+  PrivateWriterLease,
+} from './types.ts'
 
 export interface NativeRuntimeIdentity {
   readonly connectorTransport: ChatGptWebConnectionOptions['connectorTransport']
@@ -34,6 +41,7 @@ export interface NativePluginRuntime {
   readonly broker: NativeToolBroker
   readonly socket: NativeBrokerSocketServer
   readonly coordinator: NativeRoundCoordinator
+  readonly checkpointStore: NativeCheckpointStore
   readonly ready: Promise<void>
   assertConnection(connection: ChatGptWebConnectionOptions): void
   prepareRequest(options: GenerateOptions, connection: ChatGptWebConnectionOptions): PreparedNativeRequest
@@ -48,6 +56,7 @@ export interface NativePluginRuntimeDependencies {
   readonly createBroker?: () => NativeToolBroker
   readonly createSocket?: (path: string, broker: NativeToolBroker) => NativeBrokerSocketServer
   readonly createCoordinator?: (broker: NativeToolBroker) => NativeRoundCoordinator
+  readonly createCheckpointStore?: (profileDir: string) => NativeCheckpointStore
   readonly loadConfig?: typeof loadManagedNativeRuntimeConfig
   readonly createTunnel?: (options: TunnelRuntimeOptions) => TunnelRuntimeLike
   readonly nodeExecutable?: string
@@ -132,6 +141,20 @@ export function createNativePluginRuntime(
   const socket = dependencies.createSocket?.(connection.brokerSocketPath, broker)
     ?? new NativeBrokerSocketServer(connection.brokerSocketPath, broker)
   const coordinator = dependencies.createCoordinator?.(broker) ?? new NativeRoundCoordinator(broker)
+  const checkpointStore = dependencies.createCheckpointStore?.(connection.profileDir)
+    ?? createNativeCheckpointStore(connection.profileDir)
+  let checkpointWriter: PrivateWriterLease | undefined
+  let checkpointError: ManagedRuntimeConfigurationError | undefined
+  try {
+    checkpointWriter = checkpointStore.acquire()
+    // Parse existing journals and ownership state before exposing the runtime.
+    // With the lease held, a single crash-incomplete tail may be truncated;
+    // malformed interior state still fails closed.
+    checkpointStore.inspect()
+    createOwnedConversationLedger(connection.profileDir).pending()
+  } catch (error) {
+    checkpointError = configurationFailure(error)
+  }
   const runtimeIdentity = identity(connection)
   const loadConfig = dependencies.loadConfig ?? loadManagedNativeRuntimeConfig
   let managed: TunnelRuntimeLike | undefined
@@ -153,11 +176,22 @@ export function createNativePluginRuntime(
     warn('dsh-chatgpt-web native secure policy is using process.cwd as its workspace root; configure nativeSecurity.workspaceRoot explicitly')
   }
   let quiescing = false
-  const ready = socket.listen().then(async () => {
+  const heartbeat = checkpointWriter === undefined
+    ? undefined
+    : setInterval(() => {
+        try { checkpointWriter?.heartbeat() } catch { /* the next request fails closed */ }
+      }, 30_000)
+  heartbeat?.unref?.()
+  const ready = (async (): Promise<void> => {
+    // Do not expose the broker endpoint until private state and managed
+    // configuration have passed their fail-closed startup gates.
+    if (checkpointError !== undefined) throw checkpointError
     if (configurationError !== undefined) throw configurationError
     if (quiescing) return
+    await socket.listen()
+    if (quiescing) return
     if (managed !== undefined) await managed.start()
-  })
+  })()
   void ready.catch(() => {})
 
   let quiescePromise: Promise<void> | undefined
@@ -229,6 +263,9 @@ export function createNativePluginRuntime(
       try { await quiesce() } catch (error) { errors.push(error) }
       try { await socket.close() } catch (error) { errors.push(error) }
       try { broker.close() } catch (error) { errors.push(error) }
+      heartbeat?.unref?.()
+      if (heartbeat !== undefined) clearInterval(heartbeat)
+      try { checkpointWriter?.release() } catch (error) { errors.push(error) }
       if (errors.length > 0) throw new AggregateError(errors, 'native plugin runtime close failed')
     })()
     return closePromise
@@ -237,6 +274,7 @@ export function createNativePluginRuntime(
     broker,
     socket,
     coordinator,
+    checkpointStore,
     ready,
     assertConnection,
     prepareRequest,

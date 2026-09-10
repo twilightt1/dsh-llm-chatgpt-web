@@ -7,6 +7,7 @@ import type {
   BrokerToolRequest,
   BrokerToolResult,
   NativeCallPolicyBinding,
+  NativeCheckpoint,
   NativePolicyRound,
 } from './types.ts'
 
@@ -49,6 +50,7 @@ interface RoundChannel {
   state: RoundState
   readonly snapshot: BrokerRoundSnapshot
   readonly policyRound: NativePolicyRound | undefined
+  readonly checkpoint: NativeCheckpoint | undefined
   readonly queued: BrokerCallId[]
   readonly delivered: BrokerCallId[]
   readonly invocations: Map<BrokerCallId, PendingInvocation>
@@ -110,7 +112,11 @@ export class NativeToolBroker {
   private readonly retired = new Map<string, true>()
   private closed = false
 
-  register(input: BrokerRoundSnapshot & { readonly ttlMs: number; readonly policyRound?: NativePolicyRound }): string {
+  register(input: BrokerRoundSnapshot & {
+    readonly ttlMs: number
+    readonly policyRound?: NativePolicyRound
+    readonly checkpoint?: NativeCheckpoint
+  }): string {
     if (this.closed) throw new Error('native tool broker is closed')
     if (!Number.isSafeInteger(input.ttlMs) || input.ttlMs <= 0 || input.ttlMs > MAX_TIMER_MS) {
       throw new Error(`native broker TTL must be a positive safe integer no greater than ${MAX_TIMER_MS}`)
@@ -135,6 +141,7 @@ export class NativeToolBroker {
       state: 'awaiting_start',
       snapshot,
       policyRound: input.policyRound,
+      checkpoint: input.checkpoint,
       queued: [],
       delivered: [],
       invocations: new Map(),
@@ -344,6 +351,20 @@ export class NativeToolBroker {
     for (const callId of expected) {
       if (!seen.has(callId)) throw new Error(`missing native broker result for ${String(callId)}`)
     }
+    try {
+      channel.checkpoint?.prepareHandoff()
+    } catch (error) {
+      try { channel.checkpoint?.markNonReplayable('handoff-preparation-failed') } catch { /* remain blocked */ }
+      channel.state = 'settling'
+      channel.batchReadyAt = undefined
+      channel.queued.splice(0)
+      channel.delivered.splice(0)
+      channel.activities.clear()
+      for (const invocation of channel.invocations.values()) invocation.reject(error instanceof Error ? error : new Error(String(error)))
+      channel.invocations.clear()
+      this.settleQuiescence(channel)
+      throw error
+    }
     for (const { item, canonical, projected, invocation } of validated) {
       channel.invocations.delete(item.callId)
       const deliveredIndex = channel.delivered.indexOf(item.callId)
@@ -353,6 +374,18 @@ export class NativeToolBroker {
       channel.completed.set(item.callId, canonical)
       channel.activityRevision += 1
       invocation.resolve(cloneResult(projected))
+    }
+    try {
+      channel.checkpoint?.confirmHandoff(validated.map(item => item.projected))
+    } catch (error) {
+      try { channel.checkpoint?.markNonReplayable('handoff-confirmation-failed') } catch { /* remain blocked */ }
+      channel.state = 'settling'
+      channel.queued.splice(0)
+      channel.activities.clear()
+      for (const invocation of channel.invocations.values()) invocation.reject(error instanceof Error ? error : new Error(String(error)))
+      channel.invocations.clear()
+      this.settleQuiescence(channel)
+      throw error
     }
     this.settleQuiescence(channel)
   }

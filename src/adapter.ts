@@ -11,6 +11,7 @@
  */
 
 import { contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, MessageId } from '@deepseek-ai/dsh-llm'
+import { hashCanonical } from './native/canonical.ts'
 import type {
   ContentBlock,
   GenerateOptions,
@@ -30,6 +31,7 @@ import type {
   BrokerCallId,
   BrokerToolRequest,
   ConnectorRuntime,
+  NativeCheckpoint,
   ConnectorTransport,
   PreparedNativeRequest,
   ResolvedNativeSecurityConfig,
@@ -202,6 +204,7 @@ export interface ChatGptWebAdapterOptions {
     readonly coordinator: NativeRoundCoordinator
     readonly ready: Promise<void>
     readonly assertConnection: (connection: ChatGptWebConnectionOptions) => void
+    readonly checkpointStore?: import('./native/types.ts').NativeCheckpointStore
     readonly prepareRequest?: (options: GenerateOptions, connection: ChatGptWebConnectionOptions) => PreparedNativeRequest
   }
 }
@@ -236,6 +239,7 @@ interface ActiveNativeResponse {
   readonly lease: NativeStepLease
   claim?: ParkedContinuationClaim
   readonly cleanup: NativeRoundCleanup
+  readonly checkpoint?: NativeCheckpoint
   readonly isPhysicalAvailable: () => boolean
 }
 
@@ -636,6 +640,51 @@ export class ChatGptWebAdapter extends LlmAdapter {
     await active.lease.fail(active.cleanup, cause).catch(() => {})
   }
 
+  private async recoverOwnedConversationCleanup(
+    options: GenerateOptions,
+    connection: ChatGptWebConnectionOptions,
+    checkpointHash: string,
+  ): Promise<void> {
+    const store = this.config.native?.checkpointStore
+    if (store?.prepareRecoveryCleanup === undefined || store.confirmRecoveryCleanup === undefined) {
+      throw new NativeSafetyError('native checkpoint cleanup recovery is unavailable', undefined, 'NATIVE_CHECKPOINT_UNAVAILABLE')
+    }
+    const ledger = createOwnedConversationLedger(connection.profileDir)
+    const pending = ledger.pending()
+    if (pending.length !== 1) {
+      throw new NativeSafetyError(
+        'native checkpoint cleanup cannot be correlated to exactly one owned conversation',
+        undefined,
+        'NATIVE_CHECKPOINT_CLEANUP_REQUIRED',
+      )
+    }
+    store.prepareRecoveryCleanup(checkpointHash)
+    const browser = this.browserFor(connection)
+    let page: Page | undefined
+    let cleanupError: unknown
+    try {
+      await browser.ensureReady(options.signal)
+      page = await browser.newTurnPage()
+      await retryPendingConversationDeletions(page, ledger)
+      if (ledger.pending().length !== 0) throw new Error('owned conversation cleanup remained pending')
+      store.confirmRecoveryCleanup(
+        checkpointHash,
+        hashCanonical('native-ledger-correlation', 1, pending[0]),
+      )
+    } catch (error) {
+      cleanupError = error
+    }
+    if (page !== undefined) await page.close().catch(error => { cleanupError ??= error })
+    await browser.persistSession().catch(error => { cleanupError ??= error })
+    if (cleanupError !== undefined) {
+      throw new NativeSafetyError(
+        'native checkpoint owned-conversation cleanup could not be confirmed',
+        cleanupError,
+        'NATIVE_CHECKPOINT_CLEANUP_REQUIRED',
+      )
+    }
+  }
+
   private async * runPersistentNativeTurn(
     options: GenerateOptions,
     connection: ChatGptWebConnectionOptions,
@@ -658,6 +707,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
     let active = this.nativeResponses.get(sessionId)
     let lease: NativeStepLease | undefined = active?.lease
     let activeCleanup: NativeRoundCleanup | undefined = active?.cleanup
+    let checkpoint: NativeCheckpoint | undefined = active?.checkpoint
     let nativeReleased = false
 
     try {
@@ -688,14 +738,43 @@ export class ChatGptWebAdapter extends LlmAdapter {
           throw new LlmError(decision.message, decision.code)
         }
         if (decision.kind === 'fresh-replay') {
-          await active.response.stop(new LlmError(
-            `Native continuation requires a fresh replay (${decision.reason}).`,
-            'PROVIDER_ERROR',
-          ))
           this.nativeResponses.delete(sessionId)
-          await nativeRuntime.coordinator.stopAtTurnBoundary(sessionId)
+          if (active.checkpoint === undefined) {
+            await active.response.stop(new LlmError(
+              `Native continuation requires a fresh replay (${decision.reason}).`,
+              'PROVIDER_ERROR',
+            ))
+            await nativeRuntime.coordinator.stopAtTurnBoundary(sessionId)
+            lease = undefined
+          } else {
+            const replayCheckpoint = active.checkpoint
+            // Let the coordinator correlate the exact durable results and run
+            // owned cleanup before consuming the one-shot replay fence. It
+            // then allocates a fresh broker record for the replacement.
+            const replayLease = await nativeRuntime.coordinator.beginStep(
+              preparedRound === undefined
+                ? {
+                    sessionId,
+                    messages: options.messages,
+                    tools: options.tools ?? [],
+                    ttlMs: connection.mcpInvocationTimeoutMs,
+                    invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+                    continuation: { kind: 'fresh-replay' },
+                    checkpoint: replayCheckpoint,
+                    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+                  }
+                : {
+                    snapshot: preparedRound.coordinatorSnapshot,
+                    openPolicyRound: preparedRound.openRound,
+                    ttlMs: connection.mcpInvocationTimeoutMs,
+                    continuation: { kind: 'fresh-replay' },
+                    checkpoint: replayCheckpoint,
+                    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+                  },
+            )
+            lease = replayLease
+          }
           active = undefined
-          lease = undefined
         } else {
           const resumed = await nativeRuntime.coordinator.beginStep(
             preparedRound === undefined
@@ -706,6 +785,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
                   ttlMs: connection.mcpInvocationTimeoutMs,
                   invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
                   continuation: { kind: 'continue' },
+                  ...(checkpoint === undefined ? {} : { checkpoint }),
                   ...(options.signal !== undefined ? { signal: options.signal } : {}),
                 }
               : {
@@ -713,6 +793,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
                   openPolicyRound: preparedRound.openRound,
                   ttlMs: connection.mcpInvocationTimeoutMs,
                   continuation: { kind: 'continue' },
+                  ...(checkpoint === undefined ? {} : { checkpoint }),
                   ...(options.signal !== undefined ? { signal: options.signal } : {}),
                 },
           )
@@ -748,6 +829,39 @@ export class ChatGptWebAdapter extends LlmAdapter {
 
       await nativeRuntime.ready
       nativeRuntime.assertConnection(connection)
+      if (checkpoint === undefined && prepared !== undefined && preparedRound !== undefined
+        && nativeRuntime.checkpointStore !== undefined) {
+        const verdict = nativeRuntime.checkpointStore.recoverForRequest(prepared)
+        if (verdict.kind === 'blocked') {
+          throw new NativeSafetyError(
+            `native checkpoint recovery is blocked (${verdict.reason}); inspect checkpoint ${verdict.checkpointHash}`,
+            undefined,
+            'NATIVE_CHECKPOINT_BLOCKED',
+          )
+        }
+        if (verdict.kind === 'normal') {
+          checkpoint = nativeRuntime.checkpointStore.begin(prepared)
+        } else if (verdict.kind === 'fresh-replay') {
+          if (nativeRuntime.checkpointStore.prepareFreshReplay === undefined) {
+            throw new NativeSafetyError('native checkpoint replay support is unavailable', undefined, 'NATIVE_CHECKPOINT_UNAVAILABLE')
+          }
+          checkpoint = nativeRuntime.checkpointStore.prepareFreshReplay(prepared, verdict.checkpointHash)
+        } else if (verdict.kind === 'cleanup-required') {
+          await this.recoverOwnedConversationCleanup(options, connection, verdict.checkpointHash)
+          const afterCleanup = nativeRuntime.checkpointStore.recoverForRequest(prepared)
+          if (afterCleanup.kind !== 'fresh-replay') {
+            throw new NativeSafetyError(
+              `native checkpoint ${verdict.checkpointHash} did not become replayable after cleanup`,
+              undefined,
+              'NATIVE_CHECKPOINT_CLEANUP_REQUIRED',
+            )
+          }
+          if (nativeRuntime.checkpointStore.prepareFreshReplay === undefined) {
+            throw new NativeSafetyError('native checkpoint replay support is unavailable', undefined, 'NATIVE_CHECKPOINT_UNAVAILABLE')
+          }
+          checkpoint = nativeRuntime.checkpointStore.prepareFreshReplay(prepared, afterCleanup.checkpointHash)
+        }
+      }
       const ledger = createOwnedConversationLedger(connection.profileDir)
       const browser = this.browserFor(connection)
       let page: Page | undefined
@@ -762,14 +876,32 @@ export class ChatGptWebAdapter extends LlmAdapter {
         sessionStopped = true
         await session.stop().catch(() => {})
       }
+      const prepareCheckpointCleanup = (): void => {
+        if (checkpoint === undefined) return
+        try {
+          checkpoint.prepareCleanup()
+        } catch {
+          checkpoint.markNonReplayable('cleanup-preparation-failed')
+          checkpoint.prepareCleanup()
+        }
+      }
       const cleanup: NativeRoundCleanup = (mode): Promise<void> => {
         if (cleanupRequested === undefined || mode === 'stop') cleanupRequested = mode
         if (cleanupPromise !== undefined) return cleanupPromise
-        if (page === undefined && session === undefined) return Promise.resolve()
+        if (page === undefined && session === undefined) {
+          cleanupPromise = (async () => {
+            if (checkpoint !== undefined && !promptSubmitted) {
+              prepareCheckpointCleanup()
+              checkpoint.confirmCleanup(hashCanonical('native-ledger-correlation', 1, []))
+            }
+          })()
+          return cleanupPromise
+        }
         cleanupPromise = (async () => {
-          if (mode === 'stop') await stopSession()
           let cleanupError: unknown
           try {
+            prepareCheckpointCleanup()
+            if (mode === 'stop') await stopSession()
             if (page !== undefined && promptSubmitted) {
               const conversationId = ownedConversationId ?? conversationIdFromUrl(page.url())
               if (conversationId !== undefined) {
@@ -777,6 +909,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
                 if (!ledger.pending().includes(conversationId)) ledger.remember(conversationId)
                 await deleteOwnedConversation(page, conversationId)
                 ledger.forget(conversationId)
+                checkpoint?.confirmCleanup(hashCanonical('native-ledger-correlation', 1, conversationId))
                 ownedConversationId = undefined
               } else {
                 throw new LlmError(
@@ -784,9 +917,12 @@ export class ChatGptWebAdapter extends LlmAdapter {
                   'PROVIDER_ERROR',
                 )
               }
+            } else if (checkpoint !== undefined) {
+              checkpoint.confirmCleanup(hashCanonical('native-ledger-correlation', 1, []))
             }
           } catch (error) {
             cleanupError = error
+            try { checkpoint?.markNonReplayable('cleanup-failed') } catch { /* preserve the cleanup failure */ }
           }
           if (page !== undefined) {
             await page.close().catch(error => { cleanupError ??= error })
@@ -830,23 +966,27 @@ export class ChatGptWebAdapter extends LlmAdapter {
         browser.markProbed()
       }
       const capabilities = this.capabilities
-      lease = await nativeRuntime.coordinator.beginStep(
-        preparedRound === undefined
-          ? {
-              sessionId,
-              messages: options.messages,
-              tools: options.tools ?? [],
-              ttlMs: connection.mcpInvocationTimeoutMs,
-              invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
-              ...(options.signal !== undefined ? { signal: options.signal } : {}),
-            }
-          : {
-              snapshot: preparedRound.coordinatorSnapshot,
-              openPolicyRound: preparedRound.openRound,
-              ttlMs: connection.mcpInvocationTimeoutMs,
-              ...(options.signal !== undefined ? { signal: options.signal } : {}),
-            },
-      )
+      if (lease === undefined) {
+        lease = await nativeRuntime.coordinator.beginStep(
+          preparedRound === undefined
+            ? {
+                sessionId,
+                messages: options.messages,
+                tools: options.tools ?? [],
+                ttlMs: connection.mcpInvocationTimeoutMs,
+                invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+                ...(checkpoint === undefined ? {} : { checkpoint }),
+                ...(options.signal !== undefined ? { signal: options.signal } : {}),
+              }
+            : {
+                snapshot: preparedRound.coordinatorSnapshot,
+                openPolicyRound: preparedRound.openRound,
+                ttlMs: connection.mcpInvocationTimeoutMs,
+                ...(checkpoint === undefined ? {} : { checkpoint }),
+                ...(options.signal !== undefined ? { signal: options.signal } : {}),
+              },
+        )
+      }
       lease.bindCleanup(cleanup)
       const prompt = compilePrompt(providerOptions, COMPOSER_CHAR_BUDGET, this.takeNotice(options), {
         requestId: lease.requestId,
@@ -857,7 +997,13 @@ export class ChatGptWebAdapter extends LlmAdapter {
         prompt,
         capabilities,
         surface: 'connector',
-        onPromptSubmitted: markPromptSubmitted,
+        onPromptSubmitting: () => checkpoint?.recordSubmissionAttempted(),
+        onPromptSubmitted: () => {
+          // Mark the provider boundary before durability failures can escape;
+          // cleanup must never treat an accepted prompt as pre-submit.
+          markPromptSubmitted()
+          checkpoint?.recordSubmitted()
+        },
         onConversationCreated: rememberConversation,
         turnTimeoutMs: connection.turnTimeoutMs,
         stallTimeoutMs: connection.stallTimeoutMs,
@@ -884,11 +1030,13 @@ export class ChatGptWebAdapter extends LlmAdapter {
         promptChars: prompt.length,
         driver,
         cleanup,
+        ...(checkpoint === undefined ? {} : { checkpoint }),
       })
       const current: ActiveNativeResponse = {
         response,
         lease,
         cleanup,
+        ...(checkpoint === undefined ? {} : { checkpoint }),
         isPhysicalAvailable: () => {
           try {
             return page !== undefined && !page.isClosed()
@@ -930,10 +1078,31 @@ export class ChatGptWebAdapter extends LlmAdapter {
         await active.response.stop(failure).catch(() => {})
         this.nativeResponses.delete(sessionId)
       }
+      let cleanupAttempted = false
+      let cleanupSucceeded = activeCleanup === undefined
       if (lease !== undefined && !nativeReleased) {
         await lease.fail(activeCleanup ?? (async () => {}), failure).catch(() => {})
       } else if (activeCleanup !== undefined && active === undefined) {
-        await activeCleanup(options.signal?.aborted ? 'stop' : 'close').catch(() => {})
+        cleanupAttempted = true
+        try {
+          await activeCleanup(options.signal?.aborted ? 'stop' : 'close')
+          cleanupSucceeded = true
+        } catch { /* unresolved ownership remains blocked for recovery */ }
+      }
+      if (checkpoint !== undefined && lease === undefined) {
+        if (!cleanupAttempted && activeCleanup !== undefined) {
+          cleanupAttempted = true
+          try {
+            await activeCleanup('close')
+            cleanupSucceeded = true
+          } catch { /* unresolved ownership remains blocked for recovery */ }
+        }
+        try { checkpoint.markNonReplayable('pre-submit-failure') } catch { /* already fenced or terminal */ }
+        if (cleanupSucceeded) {
+          try { checkpoint.prepareCleanup() } catch { /* cleanup could already be prepared */ }
+          try { checkpoint.confirmCleanup(hashCanonical('native-ledger-correlation', 1, [])) } catch { /* unresolved ownership remains blocked */ }
+          try { checkpoint.markTerminal('failed') } catch { /* unresolved ownership remains blocked for recovery */ }
+        }
       }
       throw failure
     }
