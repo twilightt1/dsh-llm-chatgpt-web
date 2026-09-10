@@ -28,9 +28,10 @@ dsh web
   fallback.
 - Managed setup remains pinned, private, and fail-closed; text transport is
   unchanged and remains the default.
-- Automated/package gates pass. A real native tool continuation is not yet
-  release-ready: ChatGPT safety checks blocked the bounded live tool probes,
-  so this candidate is not tagged or presented as API-equivalent.
+- Automated/package gates pass. This is an experimental 0.6.0 release: a real
+  native tool continuation is not yet release-ready because ChatGPT safety
+  checks blocked the bounded live tool probes. It is not presented as
+  API-equivalent or production-ready.
 
 ## How it works
 
