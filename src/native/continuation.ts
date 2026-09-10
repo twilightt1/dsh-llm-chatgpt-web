@@ -20,6 +20,8 @@ export type NativeFreshReplayReason =
 export interface ParkedContinuationClaim {
   readonly sessionId: string
   readonly executionKey: string
+  /** Fingerprint of the logical request prefix represented by `request`. */
+  readonly requestKey?: string
   readonly request: GenerateOptions
   readonly assistantMessage: Message
   readonly pendingCalls: readonly BrokerToolRequest[]
@@ -231,8 +233,9 @@ export function decideNativeContinuation(
   claim: ParkedContinuationClaim,
   options: GenerateOptions,
 ): NativeContinuationDecision {
-  if (claim.executionKey !== nativeExecutionKey(claim.request)) {
-    return failure('INVALID_REPLAY_STATE', 'native parked response has an invalid execution identity')
+  const requestKey = claim.requestKey ?? nativeExecutionKey(claim.request)
+  if (requestKey !== nativeExecutionKey(claim.request)) {
+    return failure('INVALID_REPLAY_STATE', 'native parked response has an invalid logical request identity')
   }
   if (String(options.sessionId ?? '') !== claim.sessionId) {
     return failure('SESSION_MISMATCH', 'native parked response belongs to a different DSH session')

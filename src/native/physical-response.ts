@@ -167,7 +167,7 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
     }
     const emittedText = deltas.join('')
     const chunks: StreamChunk[] = []
-    if (emittedText.length > 0) {
+    if (emittedText.length > 0 || result.kind !== 'tool-batch') {
       chunks.push({ type: 'block-start', index: 0, blockType: 'text' })
       for (const delta of deltas) chunks.push({ type: 'text-delta', index: 0, text: delta })
       chunks.push({ type: 'block-end', index: 0, block: { type: 'text', text: emittedText } })
@@ -230,7 +230,11 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
       this.currentState = 'failed'
       return chunks
     }
-    chunks.push({ type: 'finish', reason: { kind: 'stop' } })
+    chunks.push({
+      type: 'finish',
+      reason: { kind: 'stop' },
+      replayState: nativeReplayState(this.executionKey, this.journals.length + 1, []),
+    })
     await this.cleanup('close')
     this.currentState = 'completed'
     return chunks

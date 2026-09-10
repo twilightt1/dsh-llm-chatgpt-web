@@ -10,13 +10,14 @@
  * @module dsh-llm-chatgpt-web/adapter
  */
 
-import { contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, MessageId } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   GenerateOptions,
   LlmModelInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
+  Message,
   ModelModality,
   ResolvedRetryPolicy,
   StreamChunk,
@@ -34,8 +35,13 @@ import type {
 export type { ConnectorRuntime, ConnectorTransport } from './native/types.ts'
 import { CHATGPT_COMPOSER_SELECTOR, detectChatGptAccountCapabilities } from './chatgpt/session.ts'
 import type { ChatGptWebAccountCapabilities } from './chatgpt/session.ts'
-import { COMPOSER_CHAR_BUDGET, prepareChatGptSurface, streamTextTurn } from './chatgpt/turn.ts'
-import type { TextTurnEvent, TextTurnResult } from './chatgpt/turn.ts'
+import {
+  COMPOSER_CHAR_BUDGET,
+  prepareChatGptSurface,
+  startChatGptTurnSession,
+  streamTextTurn,
+} from './chatgpt/turn.ts'
+import type { ChatGptTurnSession, TextTurnEvent, TextTurnResult } from './chatgpt/turn.ts'
 import type { OwnedConversationLedger } from './chatgpt/conversation-cleanup.ts'
 import { estimateUsage } from './chatgpt/usage.ts'
 import {
@@ -49,6 +55,17 @@ import {
   ManagedRuntimeConfigurationError,
   ManagedRuntimeTransportError,
 } from './native/tunnel-runtime.ts'
+import {
+  decideNativeContinuation,
+  nativeExecutionKey,
+  parseNativeReplayState,
+} from './native/continuation.ts'
+import type { ParkedContinuationClaim } from './native/continuation.ts'
+import { createNativePhysicalResponse } from './native/physical-response.ts'
+import type {
+  NativePhysicalResponse,
+  NativePhysicalResponseDriver,
+} from './native/physical-response.ts'
 
 /** Monotonic suffix for provider-issued call ids (unique per process). */
 let toolCallSequence = 0
@@ -203,6 +220,109 @@ function modelInfo(provider: string, model: ChatGptWebCatalogModel): LlmModelInf
   }
 }
 
+interface ActiveNativeResponse {
+  readonly response: NativePhysicalResponse
+  readonly lease: NativeStepLease
+  claim?: ParkedContinuationClaim
+  readonly cleanup: NativeRoundCleanup
+}
+
+function requestSnapshot(options: GenerateOptions): GenerateOptions {
+  return {
+    provider: options.provider,
+    model: options.model,
+    messages: structuredClone(options.messages),
+    ...options.reasoningEffort === undefined ? {} : { reasoningEffort: options.reasoningEffort },
+    ...options.system === undefined ? {} : { system: options.system },
+    ...options.tools === undefined ? {} : { tools: structuredClone(options.tools) },
+    ...options.temperature === undefined ? {} : { temperature: options.temperature },
+    ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+    ...options.stop === undefined ? {} : { stop: structuredClone(options.stop) },
+    ...options.purpose === undefined ? {} : { purpose: options.purpose },
+  }
+}
+
+function nativeBoundaryBlocks(chunks: readonly StreamChunk[]): ContentBlock[] {
+  return chunks
+    .filter((chunk): chunk is Extract<StreamChunk, { type: 'block-end' }> => chunk.type === 'block-end')
+    .filter(chunk => chunk.block.type === 'text' || chunk.block.type === 'tool-call')
+    .map(chunk => structuredClone(chunk.block))
+}
+
+function nativeBoundaryCalls(chunks: readonly StreamChunk[]): BrokerToolRequest[] {
+  const calls: BrokerToolRequest[] = []
+  for (const block of nativeBoundaryBlocks(chunks)) {
+    if (block.type !== 'tool-call') continue
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(block.arguments)
+    } catch (error) {
+      throw new LlmError(
+        `Native broker arguments for ${String(block.id)} are not valid JSON.`,
+        'PROVIDER_ERROR',
+        { cause: error },
+      )
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new LlmError(`Native broker arguments for ${String(block.id)} must be a JSON object.`, 'PROVIDER_ERROR')
+    }
+    calls.push({
+      callId: block.id,
+      name: block.name,
+      arguments: structuredClone(parsed) as Record<string, unknown>,
+    })
+  }
+  return calls
+}
+
+function nativeToolFinish(chunks: readonly StreamChunk[]): boolean {
+  return chunks.some(chunk => chunk.type === 'finish' && chunk.reason.kind === 'tool-calls')
+}
+
+function nativeClaim(
+  options: GenerateOptions,
+  response: NativePhysicalResponse,
+  chunks: readonly StreamChunk[],
+): ParkedContinuationClaim {
+  const finish = [...chunks].reverse().find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')
+  const replay = finish?.replayState === undefined ? undefined : parseNativeReplayState(finish.replayState)
+  if (replay === undefined) throw new LlmError('Native tool boundary did not carry valid replay state.', 'PROVIDER_ERROR')
+  const pendingCalls = nativeBoundaryCalls(chunks)
+  if (pendingCalls.length === 0 || pendingCalls.length !== replay.callIds.length
+    || pendingCalls.some((call, index) => String(call.callId) !== String(replay.callIds[index]))) {
+    throw new LlmError('Native tool boundary replay state does not match its call batch.', 'PROVIDER_ERROR')
+  }
+  const request = requestSnapshot(options)
+  const assistantMessage: Message = {
+    id: MessageId(`native-${response.executionKey.slice(0, 16)}-${replay.boundary}`),
+    role: 'assistant',
+    content: nativeBoundaryBlocks(chunks),
+    source: { kind: 'model', provider: options.provider, model: options.model },
+  }
+  return {
+    sessionId: String(options.sessionId ?? ''),
+    executionKey: response.executionKey,
+    requestKey: nativeExecutionKey(request),
+    request,
+    assistantMessage,
+    pendingCalls,
+    physicalAvailable: true,
+    durableResults: false,
+    uncertainOutcome: false,
+  }
+}
+
+async function* forwardNativeBoundary(
+  response: NativePhysicalResponse,
+): AsyncGenerator<StreamChunk, StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of response.streamBoundary()) {
+    chunks.push(chunk)
+    yield chunk
+  }
+  return chunks
+}
+
 /** One-line page snapshot for probe/setup failures (no content, just shape). */
 async function describeProbePage(page: import('playwright-core').Page): Promise<string> {
   const url = page.url()
@@ -220,6 +340,8 @@ export class ChatGptWebAdapter extends LlmAdapter {
   private browserKey: string | undefined
   private capabilities: ChatGptWebAccountCapabilities | undefined
   private queue: Promise<void> = Promise.resolve()
+  /** Parked physical native responses keyed by their DSH session owner. */
+  private readonly nativeResponses = new Map<string, ActiveNativeResponse>()
   /** One-shot retry notices keyed by session (consumed on next turn). */
   private pendingNotices = new Map<string, string>()
 
@@ -260,7 +382,24 @@ export class ChatGptWebAdapter extends LlmAdapter {
 
   /** Stop a parked native round at a durable agent turn boundary. */
   async stopNativeRound(sessionId: string): Promise<void> {
-    await this.config.native?.coordinator.stopAtTurnBoundary(sessionId)
+    const key = String(sessionId)
+    const active = this.nativeResponses.get(key)
+    let stopError: unknown
+    if (active !== undefined) {
+      try {
+        await active.response.stop(new LlmError('Native round stopped at a DSH turn boundary.', 'ABORTED'))
+      } catch (error) {
+        stopError = error
+      } finally {
+        this.nativeResponses.delete(key)
+      }
+    }
+    try {
+      await this.config.native?.coordinator.stopAtTurnBoundary(sessionId)
+    } catch (error) {
+      stopError ??= error
+    }
+    if (stopError !== undefined) throw stopError
   }
 
   /** Release the owned browser. Hosts should call this on plugin unload. */
@@ -271,8 +410,14 @@ export class ChatGptWebAdapter extends LlmAdapter {
     this.queue = new Promise<void>((resolve) => { release = resolve })
     await pending
     try {
+      for (const [sessionId, active] of this.nativeResponses) {
+        await active.response.stop(new LlmError('Native adapter disposed.', 'ABORTED')).catch(() => {})
+        this.nativeResponses.delete(sessionId)
+      }
+      await this.config.native?.coordinator.dispose().catch(() => {})
       await this.browser?.close().catch(() => {})
     } finally {
+      this.nativeResponses.clear()
       this.browser = undefined
       this.browserKey = undefined
       this.capabilities = undefined
@@ -416,6 +561,246 @@ export class ChatGptWebAdapter extends LlmAdapter {
     yield { type: 'finish', reason: callCount > 0 ? { kind: 'tool-calls' } : { kind: 'stop' } }
   }
 
+  private async abandonNativeResponse(active: ActiveNativeResponse, cause: Error): Promise<void> {
+    await active.response.stop(cause).catch(() => {})
+    this.nativeResponses.delete(active.response.sessionId)
+    await active.lease.fail(active.cleanup, cause).catch(() => {})
+  }
+
+  private async * runPersistentNativeTurn(
+    options: GenerateOptions,
+    connection: ChatGptWebConnectionOptions,
+  ): AsyncIterable<StreamChunk> {
+    const nativeRuntime = this.config.native
+    if (nativeRuntime === undefined) {
+      throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
+    }
+    const sessionId = String(options.sessionId ?? '')
+    let active = this.nativeResponses.get(sessionId)
+    let lease: NativeStepLease | undefined = active?.lease
+    let activeCleanup: NativeRoundCleanup | undefined = active?.cleanup
+    let nativeReleased = false
+
+    try {
+      if (active !== undefined) {
+        if (active.claim === undefined) {
+          throw new LlmError('Native response is still opening and cannot accept a continuation.', 'TRANSPORT')
+        }
+        const decision = decideNativeContinuation(active.claim, options)
+        if (decision.kind === 'fail') {
+          throw new LlmError(decision.message, decision.code)
+        }
+        if (decision.kind === 'fresh-replay') {
+          await active.response.stop(new LlmError(
+            `Native continuation requires a fresh replay (${decision.reason}).`,
+            'PROVIDER_ERROR',
+          ))
+          this.nativeResponses.delete(sessionId)
+          await nativeRuntime.coordinator.stopAtTurnBoundary(sessionId)
+          active = undefined
+          lease = undefined
+        } else {
+          const resumed = await nativeRuntime.coordinator.beginStep({
+            sessionId,
+            messages: options.messages,
+            tools: options.tools ?? [],
+            ttlMs: connection.mcpInvocationTimeoutMs,
+            invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+            continuation: { kind: 'continue' },
+            ...(options.signal !== undefined ? { signal: options.signal } : {}),
+          })
+          if (resumed.requestId !== active.response.requestId) {
+            throw new LlmError('Native continuation changed the broker request unexpectedly.', 'TRANSPORT')
+          }
+          lease = resumed
+          await active.response.deliverResults(decision.results, resumed.progressRevision())
+          let boundaryDelivered = false
+          try {
+            const boundary = yield* forwardNativeBoundary(active.response)
+            boundaryDelivered = true
+            if (nativeToolFinish(boundary)) {
+              active.claim = nativeClaim(options, active.response, boundary)
+              await resumed.park(active.cleanup)
+            } else {
+              await resumed.complete(active.cleanup)
+              nativeReleased = true
+              this.nativeResponses.delete(sessionId)
+            }
+          } finally {
+            if (!boundaryDelivered && !nativeReleased) {
+              await this.abandonNativeResponse(active, new LlmError(
+                'Native response consumer closed before the logical boundary was committed.',
+                'ABORTED',
+              ))
+              nativeReleased = true
+            }
+          }
+          return
+        }
+      }
+
+      await nativeRuntime.ready
+      nativeRuntime.assertConnection(connection)
+      const ledger = createOwnedConversationLedger(connection.profileDir)
+      const browser = this.browserFor(connection)
+      let page: Page | undefined
+      let session: ChatGptTurnSession | undefined
+      let cleanupPromise: Promise<void> | undefined
+      let cleanupRequested: 'stop' | 'close' | undefined
+      let ownedConversationId: string | undefined
+      let promptSubmitted = false
+      const cleanup: NativeRoundCleanup = (mode): Promise<void> => {
+        if (cleanupRequested === undefined || mode === 'stop') cleanupRequested = mode
+        if (cleanupPromise !== undefined) return cleanupPromise
+        if (page === undefined && session === undefined) return Promise.resolve()
+        cleanupPromise = (async () => {
+          if (mode === 'stop') await session?.stop().catch(() => {})
+          let cleanupError: unknown
+          try {
+            if (page !== undefined && promptSubmitted) {
+              const conversationId = ownedConversationId ?? conversationIdFromUrl(page.url())
+              if (conversationId !== undefined) {
+                ownedConversationId = conversationId
+                if (!ledger.pending().includes(conversationId)) ledger.remember(conversationId)
+                await deleteOwnedConversation(page, conversationId)
+                ledger.forget(conversationId)
+                ownedConversationId = undefined
+              } else {
+                throw new LlmError(
+                  'ChatGPT native turn exposed no stable conversation ID; refusing to leave an untracked chat.',
+                  'PROVIDER_ERROR',
+                )
+              }
+            }
+          } catch (error) {
+            cleanupError = error
+          }
+          if (page !== undefined) {
+            await page.close().catch(error => { cleanupError ??= error })
+            await browser.persistSession().catch(error => { cleanupError ??= error })
+          }
+          if (cleanupError !== undefined) throw cleanupError
+        })()
+        return cleanupPromise
+      }
+      activeCleanup = cleanup
+      const rememberConversation = (conversationId: string): void => {
+        ownedConversationId = conversationId
+        ledger.remember(conversationId)
+      }
+      const markPromptSubmitted = (): void => {
+        promptSubmitted = true
+        const conversationId = page === undefined ? undefined : conversationIdFromUrl(page.url())
+        if (conversationId !== undefined) rememberConversation(conversationId)
+      }
+
+      await browser.ensureReady(options.signal)
+      page = await browser.newTurnPage()
+      if (cleanupRequested !== undefined) {
+        await cleanup(cleanupRequested)
+        throw new LlmError('ChatGPT Web turn stopped at a turn boundary.', 'ABORTED')
+      }
+      await retryPendingConversationDeletions(page, ledger)
+      await prepareChatGptSurface(page, 'connector', connection.profileDir)
+      if (!this.capabilities || !browser.probed) {
+        try {
+          this.capabilities = await detectChatGptAccountCapabilities(page)
+        } catch (error) {
+          throw new LlmError(
+            `ChatGPT account capability probe failed (${error instanceof Error ? error.message : String(error)}).`
+            + ` page=${await describeProbePage(page)}`,
+            'PROVIDER_ERROR',
+            { cause: error },
+          )
+        }
+        browser.markProbed()
+      }
+      const capabilities = this.capabilities
+      lease = await nativeRuntime.coordinator.beginStep({
+        sessionId,
+        messages: options.messages,
+        tools: options.tools ?? [],
+        ttlMs: connection.mcpInvocationTimeoutMs,
+        invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      })
+      lease.bindCleanup(cleanup)
+      const prompt = compilePrompt(options, COMPOSER_CHAR_BUDGET, this.takeNotice(options), {
+        requestId: lease.requestId,
+        connectorName: connection.connectorName,
+      })
+      session = await startChatGptTurnSession(page, {
+        model: options.model,
+        prompt,
+        capabilities,
+        surface: 'connector',
+        onPromptSubmitted: markPromptSubmitted,
+        onConversationCreated: rememberConversation,
+        turnTimeoutMs: connection.turnTimeoutMs,
+        stallTimeoutMs: connection.stallTimeoutMs,
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        native: {
+          connectorName: connection.connectorName,
+          requestId: lease.requestId,
+          takeToolBatch: (now?: number) => lease!.takeToolBatch(now),
+          progressRevision: () => lease!.progressRevision(),
+          beginCompletionFence: () => lease!.beginCompletionFence(),
+          commitCompletionFence: (revision: number) => lease!.commitCompletionFence(revision),
+        },
+      })
+      const driver: NativePhysicalResponseDriver = {
+        nextBoundary: () => session!.nextBoundary(),
+        deliverResults: async () => {},
+        markToolResultDelivered: (revision: number) => session!.markToolResultDelivered(revision),
+        stop: () => session!.stop(),
+      }
+      const response = createNativePhysicalResponse({
+        sessionId,
+        executionKey: nativeExecutionKey(options),
+        requestId: lease.requestId,
+        promptChars: prompt.length,
+        driver,
+        cleanup,
+      })
+      const current: ActiveNativeResponse = { response, lease, cleanup }
+      active = current
+      this.nativeResponses.set(sessionId, current)
+      let boundaryDelivered = false
+      try {
+        const boundary = yield* forwardNativeBoundary(response)
+        boundaryDelivered = true
+        if (nativeToolFinish(boundary)) {
+          current.claim = nativeClaim(options, response, boundary)
+          await lease.park(cleanup)
+        } else {
+          await lease.complete(cleanup)
+          nativeReleased = true
+          this.nativeResponses.delete(sessionId)
+        }
+      } finally {
+        if (!boundaryDelivered && !nativeReleased) {
+          await this.abandonNativeResponse(current, new LlmError(
+            'Native response consumer closed before the logical boundary was committed.',
+            'ABORTED',
+          ))
+          nativeReleased = true
+        }
+      }
+    } catch (error: unknown) {
+      const failure = options.signal?.aborted
+        ? new LlmError('ChatGPT Web request aborted by caller.', 'ABORTED', { cause: error })
+        : classifyTurnFailure(error)
+      if (active !== undefined) {
+        await active.response.stop(failure).catch(() => {})
+        this.nativeResponses.delete(sessionId)
+      }
+      if (lease !== undefined && !nativeReleased) {
+        await lease.fail(activeCleanup ?? (async () => {}), failure).catch(() => {})
+      }
+      throw failure
+    }
+  }
+
   private async * runTurn(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const connection = this.config.options()
     for (const message of options.messages) {
@@ -440,6 +825,10 @@ export class ChatGptWebAdapter extends LlmAdapter {
     }
     if (nativeRound && this.config.native === undefined) {
       throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
+    }
+    if (nativeTools) {
+      yield* this.runPersistentNativeTurn(options, connection)
+      return
     }
 
     let browser: ChatGptBrowser | undefined

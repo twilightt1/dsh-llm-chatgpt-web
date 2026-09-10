@@ -230,6 +230,8 @@ declare class ChatGptWebAdapter extends LlmAdapter {
   private browserKey;
   private capabilities;
   private queue;
+  /** Parked physical native responses keyed by their DSH session owner. */
+  private readonly nativeResponses;
   /** One-shot retry notices keyed by session (consumed on next turn). */
   private pendingNotices;
   constructor(config: ChatGptWebAdapterOptions);
@@ -262,6 +264,8 @@ declare class ChatGptWebAdapter extends LlmAdapter {
    * source order with fresh indexes (assembler joins them deterministically).
    */
   private emitTurnResult;
+  private abandonNativeResponse;
+  private runPersistentNativeTurn;
   private runTurn;
 }
 //#endregion

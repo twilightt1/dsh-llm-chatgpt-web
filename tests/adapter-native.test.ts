@@ -20,6 +20,7 @@ const fixtures = vi.hoisted(() => {
   }
   const page = {
     isClosed: vi.fn(() => false),
+    url: vi.fn(() => 'https://chatgpt.com/c/6aa191d8-a134-83ec-8f59-da2b18ec3024'),
     locator: vi.fn(() => ({ last: () => stopLocator })),
     close: vi.fn(async () => {}),
   }
@@ -30,10 +31,37 @@ const fixtures = vi.hoisted(() => {
     close: vi.fn(async () => {}),
     markProbed: vi.fn(),
   }
-  return { browser, page, prepare: vi.fn(async () => {}), compile: vi.fn(() => 'prompt'), detect: vi.fn(async () => ({ solAvailable: true, proAvailable: true })), stream: vi.fn(() => (async function* () {
+  const stream = vi.fn((..._args: unknown[]) => (async function* () {
     yield { type: 'delta', delta: 'answer' }
     return { kind: 'completed', text: 'answer', promptChars: 6 }
-  })()) }
+  })())
+  const start = vi.fn(async (...args: unknown[]) => {
+    const turnOptions = args[1] as { onPromptSubmitted?: () => void }
+    turnOptions.onPromptSubmitted?.()
+    const source = stream(...args) as AsyncIterable<{ type: 'delta'; delta: string } | unknown>
+    const iterator = source[Symbol.asyncIterator]()
+    return {
+      nextBoundary: async function* () {
+        for (;;) {
+          const step = await iterator.next()
+          if (step.done) return step.value
+          yield step.value as { type: 'delta'; delta: string }
+        }
+      },
+      deliverResults: vi.fn(async () => {}),
+      markToolResultDelivered: vi.fn(),
+      stop: vi.fn(async () => {}),
+    }
+  })
+  return {
+    browser,
+    page,
+    prepare: vi.fn(async () => {}),
+    compile: vi.fn(() => 'prompt'),
+    detect: vi.fn(async () => ({ solAvailable: true, proAvailable: true })),
+    stream,
+    start,
+  }
 })
 
 vi.mock('../src/chatgpt/browser.ts', () => ({
@@ -48,7 +76,7 @@ vi.mock('../src/chatgpt/browser.ts', () => ({
 }))
 vi.mock('../src/chatgpt/prompt.ts', () => ({ compilePrompt: fixtures.compile }))
 vi.mock('../src/chatgpt/conversation-cleanup.ts', () => ({
-  conversationIdFromUrl: vi.fn(() => undefined),
+  conversationIdFromUrl: vi.fn(() => '6aa191d8-a134-83ec-8f59-da2b18ec3024'),
   createOwnedConversationLedger: vi.fn(() => cleanupFixtures.ledger),
   deleteOwnedConversation: cleanupFixtures.deleteOwnedConversation,
   retryPendingConversationDeletions: cleanupFixtures.retryPendingConversationDeletions,
@@ -60,10 +88,11 @@ vi.mock('../src/chatgpt/session.ts', () => ({
 vi.mock('../src/chatgpt/turn.ts', () => ({
   COMPOSER_CHAR_BUDGET: 1000,
   prepareChatGptSurface: fixtures.prepare,
+  startChatGptTurnSession: fixtures.start,
   streamTextTurn: fixtures.stream,
 }))
 
-import { MessageId } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, MessageId } from '@deepseek-ai/dsh-llm'
 import { ChatGptWebAdapter } from '../src/adapter.ts'
 import { ManagedRuntimeTransportError } from '../src/native/tunnel-runtime.ts'
 import { NativeRoundCoordinator } from '../src/native/coordinator.ts'
@@ -355,6 +384,92 @@ describe('native adapter lifecycle', () => {
       { type: 'block-end', index: 0, block: { type: 'text', text: '' } },
     ])
     expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error' } })
+    await adapter.dispose()
+    broker.close()
+  })
+
+  it('continues one physical response across tool-result streams without a second page', async () => {
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const invocationResults: Promise<unknown>[] = []
+    const deliveredResults: unknown[] = []
+    const activityId = 'activity_adapter_abcdefghijklmnop'
+    fixtures.start.mockImplementationOnce(async (...args: unknown[]) => {
+      const turnOptions = args[1] as {
+        onPromptSubmitted?: () => void
+        native?: {
+          requestId: string
+          takeToolBatch: (now?: number) => readonly { callId: string; name: string; arguments: Record<string, unknown> }[] | undefined
+        }
+      }
+      turnOptions.onPromptSubmitted?.()
+      const native = turnOptions.native
+      if (native === undefined) throw new Error('native controls missing')
+      let boundary = 0
+      return {
+        nextBoundary: async function* () {
+          if (boundary++ === 0) {
+            broker.start(native.requestId)
+            broker.claimActivity(native.requestId, activityId)
+            invocationResults.push(broker.invoke(native.requestId, activityId, 'write', { path: 'x' }))
+            const calls = native.takeToolBatch(Date.now() + 100)
+            if (calls === undefined) throw new Error('native call batch missing')
+            return { kind: 'tool-batch', text: '', calls, promptChars: 6 }
+          }
+          broker.completeActivity(native.requestId, activityId)
+          yield { type: 'delta', delta: 'done' }
+          return { kind: 'completed', text: 'done', promptChars: 6 }
+        },
+        deliverResults: vi.fn(async (results: unknown[]) => { deliveredResults.push(results) }),
+        markToolResultDelivered: vi.fn(),
+        stop: vi.fn(async () => {}),
+      }
+    })
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      profileDir: '/tmp/dsh-native-adapter-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    const first = await collect(adapter.stream(input('s1')))
+    const callBlock = first.find((chunk): chunk is Extract<StreamChunk, { type: 'block-end' }> =>
+      chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    const finish = first.find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')
+    expect(callBlock?.block.type).toBe('tool-call')
+    expect(finish?.reason.kind).toBe('tool-calls')
+    if (callBlock?.block.type !== 'tool-call' || finish?.reason.kind !== 'tool-calls') throw new Error('missing native boundary')
+    const assistant: Message = {
+      id: MessageId('assistant-native-boundary-1'),
+      role: 'assistant',
+      content: [callBlock.block],
+      source: {
+        kind: 'model',
+        provider: 'chatgpt-web',
+        model: 'chatgpt-web/high',
+        replayState: finish.replayState,
+      },
+    }
+    const result = createToolResultMessage({
+      callId: callBlock.block.id,
+      content: [{ type: 'text', text: 'ok' }],
+      isError: false,
+    })
+    const second = await collect(adapter.stream({
+      ...input('s1'),
+      messages: [userMessage, assistant, result],
+    }))
+    await expect(invocationResults[0]).resolves.toMatchObject({ isError: false })
+    expect(deliveredResults).toEqual([])
+    expect(second.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
+    expect(fixtures.browser.newTurnPage).toHaveBeenCalledTimes(1)
+    expect(fixtures.start).toHaveBeenCalledTimes(1)
+    expect(fixtures.prepare).toHaveBeenCalledTimes(1)
+    expect(fixtures.compile).toHaveBeenCalledTimes(1)
     await adapter.dispose()
     broker.close()
   })
