@@ -15,6 +15,15 @@ export interface BrokerToolResult {
   readonly isError: boolean
 }
 
+/** Versioned, opaque adapter state carried by a native assistant finish. */
+export interface NativeReplayStateV1 {
+  readonly kind: 'chatgpt-web-native'
+  readonly version: 1
+  readonly executionKey: string
+  readonly boundary: number
+  readonly callIds: readonly BrokerCallId[]
+}
+
 /** Immutable facts captured when one provider round is registered. */
 export interface BrokerRoundSnapshot {
   readonly sessionId: string
