@@ -234,6 +234,61 @@ describe('decideNativeContinuation', () => {
     )).toMatchObject({ kind: 'fail' })
   })
 
+  it('treats exact current results as durable when older tool history was pruned', () => {
+    const priorCall: BrokerToolRequest = {
+      callId: testCallId('call_00000000000000000000000000000002'),
+      name: 'write',
+      arguments: { path: 'older' },
+    }
+    const priorAssistant: Message = {
+      ...assistant,
+      id: MessageId('prior-assistant'),
+      content: [{
+        type: 'tool-call',
+        id: priorCall.callId,
+        name: priorCall.name,
+        arguments: JSON.stringify(priorCall.arguments),
+      }],
+    }
+    const priorResult: Message = {
+      id: MessageId('prior-result'),
+      role: 'user',
+      content: [{
+        type: 'tool-result',
+        toolCallId: priorCall.callId,
+        content: [{ type: 'text', text: 'large original output' }],
+        isError: false,
+      }],
+      source: { kind: 'tool', callId: priorCall.callId },
+    }
+    const prunedPriorResult: Message = {
+      ...priorResult,
+      content: [{
+        type: 'tool-result',
+        toolCallId: priorCall.callId,
+        content: [{ type: 'text', text: '[older tool output pruned]' }],
+        isError: false,
+      }],
+    }
+    const base = request({ messages: [user, priorAssistant, priorResult] })
+    const parked = claim({
+      executionKey: nativeExecutionKey(base),
+      request: base,
+      canonicalRequest: base,
+      canonicalAssistantMessage: assistant,
+      durableResults: false,
+    })
+    const incoming = request({
+      messages: [user, priorAssistant, prunedPriorResult, assistant, resultMessage()],
+    })
+
+    const durableResults = hasExactNativeToolResults(parked, incoming)
+
+    expect(durableResults).toBe(true)
+    expect(decideNativeContinuation({ ...parked, durableResults }, incoming))
+      .toEqual({ kind: 'fresh-replay', reason: 'context-added' })
+  })
+
   it('selects typed fresh replay for model, schema, generation, and context changes', () => {
     expect(decideNativeContinuation(claim(), request({ model: 'chatgpt-web/light', messages: [user, assistant, resultMessage()] })))
       .toEqual({ kind: 'fresh-replay', reason: 'model-changed' })

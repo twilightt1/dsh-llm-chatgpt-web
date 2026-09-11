@@ -222,8 +222,11 @@ export function hasExactNativeToolResults(
   const canonicalRequest = claim.canonicalRequest ?? claim.request
   const baseLength = canonicalRequest.messages.length
   const incomingAssistant = options.messages[baseLength]
+  // Durability belongs to the current boundary. Older history may be pruned
+  // between DSH steps; decideNativeContinuation still detects that prefix
+  // change and requires cleanup plus a fresh replay instead of resuming this
+  // physical response.
   if (incomingAssistant === undefined
-    || !sameMessages(options.messages.slice(0, baseLength), canonicalRequest.messages)
     || !sameMessages([incomingAssistant], [claim.canonicalAssistantMessage ?? claim.assistantMessage])
     || !assistantCallsMatch(incomingAssistant, claim.pendingCalls)) return false
   const resultMessages = options.messages.slice(baseLength + 1)
