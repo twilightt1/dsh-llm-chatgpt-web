@@ -214,22 +214,34 @@ function assistantCallsMatch(message: Message, calls: readonly BrokerToolRequest
   })
 }
 
+function exactNativeBoundaryIndex(
+  claim: ParkedContinuationClaim,
+  messages: readonly Message[],
+): number | undefined {
+  const expectedAssistant = claim.canonicalAssistantMessage ?? claim.assistantMessage
+  let match: number | undefined
+  for (const [index, message] of messages.entries()) {
+    if (!sameMessages([message], [expectedAssistant])
+      || !assistantCallsMatch(message, claim.pendingCalls)) continue
+    // Repeated boundaries cannot prove which result delivery is authoritative.
+    if (match !== undefined) return undefined
+    match = index
+  }
+  return match
+}
+
 /** Prove that the incoming history contains this boundary's exact results. */
 export function hasExactNativeToolResults(
   claim: ParkedContinuationClaim,
   options: GenerateOptions,
 ): boolean {
-  const canonicalRequest = claim.canonicalRequest ?? claim.request
-  const baseLength = canonicalRequest.messages.length
-  const incomingAssistant = options.messages[baseLength]
-  // Durability belongs to the current boundary. Older history may be pruned
-  // between DSH steps; decideNativeContinuation still detects that prefix
-  // change and requires cleanup plus a fresh replay instead of resuming this
-  // physical response.
-  if (incomingAssistant === undefined
-    || !sameMessages([incomingAssistant], [claim.canonicalAssistantMessage ?? claim.assistantMessage])
-    || !assistantCallsMatch(incomingAssistant, claim.pendingCalls)) return false
-  const resultMessages = options.messages.slice(baseLength + 1)
+  // Durability belongs to the current boundary. Older history may be pruned or
+  // replaced by a compaction summary between DSH steps, moving this boundary
+  // to a different index. Locate the one exact assistant call batch instead of
+  // trusting the parked request's obsolete message count.
+  const assistantIndex = exactNativeBoundaryIndex(claim, options.messages)
+  if (assistantIndex === undefined) return false
+  const resultMessages = options.messages.slice(assistantIndex + 1)
   if (resultMessages.length < claim.pendingCalls.length) return false
   for (const [index, call] of claim.pendingCalls.entries()) {
     const message = resultMessages[index]

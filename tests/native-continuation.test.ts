@@ -289,6 +289,82 @@ describe('decideNativeContinuation', () => {
       .toEqual({ kind: 'fresh-replay', reason: 'context-added' })
   })
 
+  it('treats exact current results as durable when compaction replaces older history with a summary', () => {
+    const priorCall: BrokerToolRequest = {
+      callId: testCallId('call_00000000000000000000000000000003'),
+      name: 'write',
+      arguments: { path: 'older' },
+    }
+    const priorAssistant: Message = {
+      ...assistant,
+      id: MessageId('compacted-prior-assistant'),
+      content: [{
+        type: 'tool-call',
+        id: priorCall.callId,
+        name: priorCall.name,
+        arguments: JSON.stringify(priorCall.arguments),
+      }],
+    }
+    const priorResult: Message = {
+      id: MessageId('compacted-prior-result'),
+      role: 'user',
+      content: [{
+        type: 'tool-result',
+        toolCallId: priorCall.callId,
+        content: [{ type: 'text', text: 'large original output' }],
+        isError: false,
+      }],
+      source: { kind: 'tool', callId: priorCall.callId },
+    }
+    const retainedContext: Message = {
+      id: MessageId('retained-context'),
+      role: 'user',
+      content: [{ type: 'text', text: 'recent context retained verbatim' }],
+      source: { kind: 'plugin', plugin: 'test-context' },
+    }
+    const summary: Message = {
+      id: MessageId('compaction-summary'),
+      role: 'user',
+      content: [{ type: 'text', text: 'summary of the replaced older span' }],
+      source: { kind: 'plugin', plugin: 'compact' },
+    }
+    const base = request({ messages: [user, priorAssistant, priorResult, retainedContext] })
+    const parked = claim({
+      executionKey: nativeExecutionKey(base),
+      request: base,
+      canonicalRequest: base,
+      canonicalAssistantMessage: assistant,
+      durableResults: false,
+    })
+    const incoming = request({
+      messages: [summary, retainedContext, assistant, resultMessage()],
+    })
+
+    const durableResults = hasExactNativeToolResults(parked, incoming)
+
+    expect(durableResults).toBe(true)
+    expect(decideNativeContinuation({ ...parked, durableResults }, incoming))
+      .toEqual({ kind: 'fresh-replay', reason: 'context-added' })
+  })
+
+  it('refuses durability proof when compaction leaves duplicate matching boundaries', () => {
+    const base = request()
+    const parked = claim({
+      executionKey: nativeExecutionKey(base),
+      request: base,
+      canonicalRequest: base,
+      canonicalAssistantMessage: assistant,
+      durableResults: false,
+    })
+    const incoming = request({
+      messages: [assistant, resultMessage(), assistant, resultMessage()],
+    })
+
+    expect(hasExactNativeToolResults(parked, incoming)).toBe(false)
+    expect(decideNativeContinuation(parked, incoming))
+      .toMatchObject({ kind: 'fail', code: 'UNCERTAIN_OUTCOME' })
+  })
+
   it('selects typed fresh replay for model, schema, generation, and context changes', () => {
     expect(decideNativeContinuation(claim(), request({ model: 'chatgpt-web/light', messages: [user, assistant, resultMessage()] })))
       .toEqual({ kind: 'fresh-replay', reason: 'model-changed' })

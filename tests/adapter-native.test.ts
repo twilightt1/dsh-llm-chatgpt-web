@@ -598,12 +598,14 @@ describe('native adapter lifecycle', () => {
     broker.close()
   })
 
-  it('fresh-replays through the adapter when older tool output is pruned', async () => {
-    const events: string[] = []
-    const broker = new NativeToolBroker()
-    const coordinator = new NativeRoundCoordinator(broker)
-    const priorCallId = CallId('call_prior_history_000000000000000000')
-    const priorAssistant: Message = {
+  it.each(['pruned', 'compacted'] as const)(
+    'fresh-replays through the adapter when older history is %s',
+    async (historyChange) => {
+      const events: string[] = []
+      const broker = new NativeToolBroker()
+      const coordinator = new NativeRoundCoordinator(broker)
+      const priorCallId = CallId('call_prior_history_000000000000000000')
+      const priorAssistant: Message = {
       id: MessageId('assistant-prior-history'),
       role: 'assistant',
       content: [{
@@ -628,6 +630,24 @@ describe('native adapter lifecycle', () => {
         isError: false,
       }],
     }
+    const retainedContext: Message = {
+      id: MessageId('adapter-retained-context'),
+      role: 'user',
+      content: [{ type: 'text', text: 'recent context retained verbatim' }],
+      source: { kind: 'plugin', plugin: 'test-context' },
+    }
+    const summary: Message = {
+      id: MessageId('adapter-compaction-summary'),
+      role: 'user',
+      content: [{ type: 'text', text: 'summary of the replaced older span' }],
+      source: { kind: 'plugin', plugin: 'compact' },
+    }
+    const initialMessages = historyChange === 'pruned'
+      ? [userMessage, priorAssistant, priorResult]
+      : [userMessage, priorAssistant, priorResult, retainedContext]
+    const continuationPrefix = historyChange === 'pruned'
+      ? [userMessage, priorAssistant, prunedPriorResult]
+      : [summary, retainedContext]
     const activityId = 'activity_adapter_pruned_abcdefghijkl'
     fixtures.start.mockImplementationOnce(async (...args: unknown[]) => {
       const turnOptions = args[1] as {
@@ -670,12 +690,12 @@ describe('native adapter lifecycle', () => {
         stop: vi.fn(async () => {}),
       }
     })
-    const options = resolveAdapterOptions({
-      connectorTransport: 'mcp',
-      profileDir: '/tmp/dsh-native-adapter-pruned-test',
-      brokerSocketPath: '/tmp/dsh-native-adapter-pruned-test.sock',
-      mcpInvocationTimeoutMs: 1_000,
-    })
+      const options = resolveAdapterOptions({
+        connectorTransport: 'mcp',
+        profileDir: '/tmp/dsh-native-adapter-pruned-test',
+        brokerSocketPath: '/tmp/dsh-native-adapter-pruned-test.sock',
+        mcpInvocationTimeoutMs: 1_000,
+      })
     const adapter = new ChatGptWebAdapter({
       options: () => options,
       native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
@@ -684,7 +704,7 @@ describe('native adapter lifecycle', () => {
     try {
       const first = await collect(adapter.stream({
         ...input('pruned-history'),
-        messages: [userMessage, priorAssistant, priorResult],
+        messages: initialMessages,
       }))
       const callBlock = first.find((chunk): chunk is Extract<StreamChunk, { type: 'block-end' }> =>
         chunk.type === 'block-end' && chunk.block.type === 'tool-call')
@@ -708,7 +728,7 @@ describe('native adapter lifecycle', () => {
       })
       const second = await collect(adapter.stream({
         ...input('pruned-history'),
-        messages: [userMessage, priorAssistant, prunedPriorResult, assistant, result],
+        messages: [...continuationPrefix, assistant, result],
       }))
 
       expect(second.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
