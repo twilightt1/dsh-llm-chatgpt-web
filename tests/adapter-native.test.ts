@@ -92,7 +92,7 @@ vi.mock('../src/chatgpt/turn.ts', () => ({
   streamTextTurn: fixtures.stream,
 }))
 
-import { createToolResultMessage, LlmError, MessageId } from '@deepseek-ai/dsh-llm'
+import { CallId, createToolResultMessage, LlmError, MessageId } from '@deepseek-ai/dsh-llm'
 import { ChatGptWebAdapter } from '../src/adapter.ts'
 import { ManagedRuntimeTransportError } from '../src/native/tunnel-runtime.ts'
 import { NativeRoundCoordinator } from '../src/native/coordinator.ts'
@@ -596,6 +596,129 @@ describe('native adapter lifecycle', () => {
     expect(fixtures.compile).toHaveBeenCalledTimes(1)
     await adapter.dispose()
     broker.close()
+  })
+
+  it('fresh-replays through the adapter when older tool output is pruned', async () => {
+    const events: string[] = []
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const priorCallId = CallId('call_prior_history_000000000000000000')
+    const priorAssistant: Message = {
+      id: MessageId('assistant-prior-history'),
+      role: 'assistant',
+      content: [{
+        type: 'tool-call',
+        id: priorCallId,
+        name: 'write',
+        arguments: JSON.stringify({ path: 'older' }),
+      }],
+      source: { kind: 'model', provider: 'chatgpt-web', model: 'chatgpt-web/high' },
+    }
+    const priorResult = createToolResultMessage({
+      callId: priorCallId,
+      content: [{ type: 'text', text: 'large original output' }],
+      isError: false,
+    })
+    const prunedPriorResult: Message = {
+      ...priorResult,
+      content: [{
+        type: 'tool-result',
+        toolCallId: priorCallId,
+        content: [{ type: 'text', text: '[older tool output pruned]' }],
+        isError: false,
+      }],
+    }
+    const activityId = 'activity_adapter_pruned_abcdefghijkl'
+    fixtures.start.mockImplementationOnce(async (...args: unknown[]) => {
+      const turnOptions = args[1] as {
+        onPromptSubmitted?: () => void
+        native?: {
+          requestId: string
+          takeToolBatch: (now?: number) => readonly { callId: string; name: string; arguments: Record<string, unknown> }[] | undefined
+        }
+      }
+      turnOptions.onPromptSubmitted?.()
+      const native = turnOptions.native
+      if (native === undefined) throw new Error('native controls missing')
+      let boundary = 0
+      return {
+        nextBoundary: async function* () {
+          if (boundary++ !== 0) throw new Error('old native response resumed after history pruning')
+          broker.start(native.requestId)
+          broker.claimActivity(native.requestId, activityId)
+          const invocation = broker.invoke(native.requestId, activityId, 'write', { path: 'x' })
+          void invocation.catch(() => {})
+          const calls = native.takeToolBatch(Date.now() + 100)
+          if (calls === undefined) throw new Error('native call batch missing')
+          return { kind: 'tool-batch', text: '', calls, promptChars: 6 }
+        },
+        deliverResults: vi.fn(async () => {}),
+        markToolResultDelivered: vi.fn(),
+        stop: vi.fn(async () => { events.push('old:stopped') }),
+      }
+    }).mockImplementationOnce(async (...args: unknown[]) => {
+      events.push('new:send')
+      const turnOptions = args[1] as { onPromptSubmitted?: () => void }
+      turnOptions.onPromptSubmitted?.()
+      return {
+        nextBoundary: async function* () {
+          yield { type: 'delta', delta: 'replayed' }
+          return { kind: 'completed', text: 'replayed', promptChars: 6 }
+        },
+        deliverResults: vi.fn(async () => {}),
+        markToolResultDelivered: vi.fn(),
+        stop: vi.fn(async () => {}),
+      }
+    })
+    const options = resolveAdapterOptions({
+      connectorTransport: 'mcp',
+      profileDir: '/tmp/dsh-native-adapter-pruned-test',
+      brokerSocketPath: '/tmp/dsh-native-adapter-pruned-test.sock',
+      mcpInvocationTimeoutMs: 1_000,
+    })
+    const adapter = new ChatGptWebAdapter({
+      options: () => options,
+      native: { coordinator, ready: Promise.resolve(), assertConnection: () => {} },
+    })
+
+    try {
+      const first = await collect(adapter.stream({
+        ...input('pruned-history'),
+        messages: [userMessage, priorAssistant, priorResult],
+      }))
+      const callBlock = first.find((chunk): chunk is Extract<StreamChunk, { type: 'block-end' }> =>
+        chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+      const finish = first.find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')
+      if (callBlock?.block.type !== 'tool-call' || finish?.reason.kind !== 'tool-calls') throw new Error('missing native boundary')
+      const assistant: Message = {
+        id: MessageId('assistant-native-pruned-history'),
+        role: 'assistant',
+        content: [callBlock.block],
+        source: {
+          kind: 'model',
+          provider: 'chatgpt-web',
+          model: 'chatgpt-web/high',
+          replayState: finish.replayState,
+        },
+      }
+      const result = createToolResultMessage({
+        callId: callBlock.block.id,
+        content: [{ type: 'text', text: 'ok' }],
+        isError: false,
+      })
+      const second = await collect(adapter.stream({
+        ...input('pruned-history'),
+        messages: [userMessage, priorAssistant, prunedPriorResult, assistant, result],
+      }))
+
+      expect(second.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
+      expect(events).toEqual(['old:stopped', 'new:send'])
+      expect(fixtures.browser.newTurnPage).toHaveBeenCalledTimes(2)
+      expect(fixtures.start).toHaveBeenCalledTimes(2)
+    } finally {
+      await adapter.dispose()
+      broker.close()
+    }
   })
 
   it('stops the old page before one safe fresh replay after page loss', async () => {
