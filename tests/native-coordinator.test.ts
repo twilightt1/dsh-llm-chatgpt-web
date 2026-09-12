@@ -6,7 +6,7 @@ import {
   NativeRoundCoordinator,
   correlateToolResults,
 } from '../src/native/coordinator.ts'
-import type { BrokerCallId, BrokerToolRequest } from '../src/native/types.ts'
+import type { BrokerCallId, BrokerToolRequest, NativeCheckpoint } from '../src/native/types.ts'
 import { testCallId } from './call-id.ts'
 
 const tool: ToolSchema = {
@@ -123,6 +123,82 @@ describe('correlateToolResults', () => {
 })
 
 describe('NativeRoundCoordinator', () => {
+  it('fences exact results and broker handoff through the checkpoint owner', async () => {
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const events: string[] = []
+    const checkpoint = {
+      checkpointHash: 'a'.repeat(64), generation: 1,
+      recordSubmissionAttempted: vi.fn(), recordSubmitted: vi.fn(), recordBatch: vi.fn(),
+      confirmResults: vi.fn(() => { events.push('results-confirmed') }),
+      prepareHandoff: vi.fn(() => { events.push('handoff-prepared') }),
+      confirmHandoff: vi.fn(() => { events.push('handoff-confirmed') }),
+      recordCompletion: vi.fn(), prepareCleanup: vi.fn(), confirmCleanup: vi.fn(),
+      consumeReplayAndPrepareNextGeneration: vi.fn(), markNonReplayable: vi.fn(),
+      markTerminal: vi.fn(() => { events.push('terminal') }),
+    } satisfies NativeCheckpoint
+    const cleanup = async (): Promise<void> => {}
+    const first = await coordinator.beginStep({ ...stepInput('s1'), checkpoint })
+    broker.start(first.requestId)
+    const activity = 'activity_checkpoint_abcdefghijkl'
+    broker.claimActivity(first.requestId, activity)
+    const invocation = broker.invoke(first.requestId, activity, 'write', { path: 'x' })
+    const call = first.takeToolBatch(Date.now() + 20)?.[0]
+    if (call === undefined) throw new Error('test harness did not receive a broker call')
+    await first.park(cleanup)
+    const resumed = coordinator.beginStep({
+      ...stepInput('s1'), checkpoint, continuation: { kind: 'continue' },
+      messages: [toolResultMessage(call.callId, 'written')],
+    })
+    const lease = await resumed
+    await expect(invocation).resolves.toEqual({ content: [{ type: 'text', text: 'written' }], isError: false })
+    expect(events).toEqual(['results-confirmed', 'handoff-prepared', 'handoff-confirmed'])
+    broker.completeActivity(lease.requestId, activity)
+    await lease.complete(cleanup)
+    expect(events).toEqual(['results-confirmed', 'handoff-prepared', 'handoff-confirmed', 'terminal'])
+    await coordinator.dispose()
+  })
+
+  it('consumes the replay fence only after fresh continuation cleanup', async () => {
+    const broker = new NativeToolBroker()
+    const coordinator = new NativeRoundCoordinator(broker)
+    const events: string[] = []
+    const checkpoint = {
+      checkpointHash: 'b'.repeat(64), generation: 1,
+      recordSubmissionAttempted: vi.fn(), recordSubmitted: vi.fn(), recordBatch: vi.fn(),
+      confirmResults: vi.fn(() => { events.push('results-confirmed') }),
+      prepareHandoff: vi.fn(), confirmHandoff: vi.fn(), recordCompletion: vi.fn(),
+      prepareCleanup: vi.fn(() => { events.push('cleanup-prepared') }),
+      confirmCleanup: vi.fn((_correlation: string) => { events.push('cleanup-confirmed') }),
+      consumeReplayAndPrepareNextGeneration: vi.fn(() => { events.push('replay-consumed'); return 2 }),
+      markNonReplayable: vi.fn(), markTerminal: vi.fn(),
+    } satisfies NativeCheckpoint
+    const cleanup = async (): Promise<void> => {
+      checkpoint.prepareCleanup()
+      checkpoint.confirmCleanup('c'.repeat(64))
+    }
+    const first = await coordinator.beginStep({ ...stepInput('s1'), checkpoint })
+    broker.start(first.requestId)
+    const activity = 'activity_fresh_replay_abcdefghijkl'
+    broker.claimActivity(first.requestId, activity)
+    const invocation = broker.invoke(first.requestId, activity, 'write', { path: 'x' })
+    const call = first.takeToolBatch(Date.now() + 20)?.[0]
+    if (call === undefined) throw new Error('test harness did not receive a broker call')
+    broker.completeActivity(first.requestId, activity)
+    await first.park(cleanup)
+    const resumed = coordinator.beginStep({
+      ...stepInput('s1'), checkpoint, continuation: { kind: 'fresh-replay' },
+      messages: [toolResultMessage(call.callId, 'written')],
+    })
+    const lease = await resumed
+    expect(lease.requestId).not.toBe(first.requestId)
+    expect(events).toEqual(['results-confirmed', 'cleanup-prepared', 'cleanup-confirmed', 'replay-consumed'])
+    await expect(invocation).resolves.toEqual({ content: [{ type: 'text', text: 'written' }], isError: false })
+    await lease.complete(cleanup)
+    expect(checkpoint.markTerminal).toHaveBeenCalledTimes(1)
+    await coordinator.dispose()
+  })
+
   it('settles and stops the predecessor before registering a fresh round', async () => {
     vi.useFakeTimers()
     const broker = new NativeToolBroker()

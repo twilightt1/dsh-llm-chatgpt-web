@@ -4,7 +4,7 @@ import type { TextTurnEvent, TextTurnResult } from '../chatgpt/turn.ts'
 import { estimateUsage } from '../chatgpt/usage.ts'
 import type { NativeRoundCleanup } from './coordinator.ts'
 import { nativeReplayState } from './continuation.ts'
-import type { BrokerToolResult } from './types.ts'
+import type { BrokerAuthorizedToolRequest, BrokerToolResult, NativeCheckpoint } from './types.ts'
 
 /** Lifecycle of one submitted browser response across logical DSH rounds. */
 export type NativePhysicalResponseState =
@@ -33,6 +33,7 @@ export interface NativePhysicalResponseOptions {
   readonly promptChars: number
   readonly driver: NativePhysicalResponseDriver
   readonly cleanup?: NativeRoundCleanup
+  readonly checkpoint?: NativeCheckpoint
 }
 
 /** Public stateful owner for one physical ChatGPT response. */
@@ -112,6 +113,12 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
         'TRANSPORT',
         { cause },
       )
+      try {
+        this.options.checkpoint?.markNonReplayable(`uncertain-${stage}`)
+      } catch {
+        // Durability failures remain fail-closed; preserve the original
+        // transport uncertainty as the visible error.
+      }
     }
   }
 
@@ -204,6 +211,7 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
       chunks.push({ type: 'block-end', index: 0, block: { type: 'text', text: emittedText } })
     }
     if (result.kind === 'tool-batch') {
+      this.options.checkpoint?.recordBatch(result.calls as readonly BrokerAuthorizedToolRequest[])
       let index = emittedText.length > 0 ? 1 : 0
       for (const call of result.calls) {
         const argumentsText = JSON.stringify(call.arguments)
@@ -247,6 +255,7 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
       usage: estimateUsage(result.promptChars || this.options.promptChars, emittedText.length),
     })
     if (emittedText.length === 0) {
+      this.options.checkpoint?.recordCompletion()
       chunks.push({
         type: 'finish',
         reason: {
@@ -261,6 +270,7 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
       this.currentState = 'failed'
       return chunks
     }
+    this.options.checkpoint?.recordCompletion()
     chunks.push({
       type: 'finish',
       reason: { kind: 'stop' },
@@ -286,8 +296,8 @@ class NativePhysicalResponseImpl implements NativePhysicalResponse {
 
   private async cleanup(mode: 'stop' | 'close'): Promise<void> {
     if (this.cleanupDone) return
-    this.cleanupDone = true
     await this.options.cleanup?.(mode)
+    this.cleanupDone = true
   }
 }
 

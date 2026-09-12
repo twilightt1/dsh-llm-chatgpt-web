@@ -193,6 +193,8 @@ export interface TextTurnOptions {
   capabilities: ChatGptWebAccountCapabilities
   /** Temporary Chat for text; connector-enabled normal chat for native MCP. */
   surface?: ChatGptSurface
+  /** Called synchronously before the first provider-side submit action. */
+  onPromptSubmitting?: () => void
   /** Called after ChatGPT accepts the prompt and creates a normal conversation. */
   onPromptSubmitted?: () => void
   /** Called with the exact newly-created normal conversation ID. */
@@ -739,6 +741,10 @@ export async function startChatGptTurnSession(
       }
       await new Promise(resolveSleep => setTimeout(resolveSleep, 200))
     }
+    // The checkpoint writer must finish the submission-attempted record before
+    // this first provider-side action. A failure therefore cannot be mistaken
+    // for a safe pre-submit abort.
+    options.onPromptSubmitting?.()
     await sendButton.press('Enter')
     progressTracker = new ChatGptProgressTracker({
       startedAt: Date.now(),

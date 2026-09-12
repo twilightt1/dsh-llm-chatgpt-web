@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ToolSchema } from '@deepseek-ai/dsh-llm'
 import { NativeToolBroker } from '../src/native/broker.ts'
-import type { BrokerToolResult } from '../src/native/types.ts'
+import type {
+  BrokerToolResult,
+  NativeInvocationDecision,
+  NativePolicyRound,
+} from '../src/native/types.ts'
 import { testCallId } from './call-id.ts'
 
 const tool: ToolSchema = {
@@ -132,6 +136,97 @@ describe('NativeToolBroker', () => {
     const quiescence = expect(broker.waitForQuiescence(requestId)).rejects.toThrow('cancelled by test')
     broker.revoke(requestId, new Error('cancelled by test'))
     await Promise.all([invocation, quiescence])
+  })
+
+  it('authorizes before minting a call id and keeps the round usable after denial', async () => {
+    const decisions: Array<{ name: string; args: Record<string, unknown>; ordinal: number }> = []
+    const policy: NativePolicyRound = {
+      authorizeInvocation(name, args, ordinal): NativeInvocationDecision {
+        decisions.push({ name, args, ordinal })
+        if (args.path === '../escape') {
+          return { allowed: false, code: 'NATIVE_POLICY_DENIED', message: 'native policy denied this invocation' }
+        }
+        return {
+          allowed: true,
+          arguments: Object.freeze({ path: '/workspace/ok.txt' }),
+          binding: Object.freeze({
+            toolName: name,
+            capability: 'workspace.read',
+            resultPolicy: 'text',
+            schemaHash: 'a'.repeat(64),
+            argumentsHash: 'b'.repeat(64),
+            callOrdinal: ordinal,
+            pathArguments: Object.freeze(['/path']),
+          }),
+        }
+      },
+      projectResult(_binding, result) {
+        return { ...result, content: [{ type: 'text', text: 'projected' }] }
+      },
+    }
+    const broker = new NativeToolBroker()
+    const requestId = broker.register({
+      sessionId: 's1', tools: [tool], invocationTimeoutMs: 90_000, ttlMs: 1_000, policyRound: policy,
+    })
+    broker.start(requestId)
+    broker.claimActivity(requestId, activityId)
+    await expect(broker.invoke(requestId, activityId, 'write', { path: '../escape' }))
+      .rejects.toMatchObject({ code: 'NATIVE_POLICY_DENIED', releaseRound: false })
+    expect(broker.takeToolBatch(requestId, Date.now() + 100)).toBeUndefined()
+    const invocation = broker.invoke(requestId, activityId, 'write', { path: 'ok.txt' })
+    const batch = broker.takeToolBatch(requestId, Date.now() + 100)!
+    expect(batch).toHaveLength(1)
+    expect(batch[0]?.arguments).toEqual({ path: '/workspace/ok.txt' })
+    expect(Object.isFrozen(batch[0]?.arguments)).toBe(true)
+    expect(Object.isFrozen((batch[0] as { binding?: unknown }).binding)).toBe(true)
+    expect((batch[0] as unknown as { binding: { callOrdinal: number } }).binding.callOrdinal).toBe(1)
+    expect(decisions).toEqual([
+      { name: 'write', args: { path: '../escape' }, ordinal: 1 },
+      { name: 'write', args: { path: 'ok.txt' }, ordinal: 1 },
+    ])
+    broker.completeBatch(requestId, [{ callId: batch[0]!.callId, result: ok }])
+    await expect(invocation).resolves.toEqual({ content: [{ type: 'text', text: 'projected' }], isError: false })
+    broker.completeActivity(requestId, activityId)
+    broker.close()
+  })
+
+  it('projects every result before atomically resolving a policy batch', async () => {
+    const policy: NativePolicyRound = {
+      authorizeInvocation(name, _args, ordinal): NativeInvocationDecision {
+        return {
+          allowed: true,
+          arguments: {},
+          binding: Object.freeze({
+            toolName: name,
+            capability: 'workspace.read',
+            resultPolicy: 'text',
+            schemaHash: 'a'.repeat(64),
+            argumentsHash: 'b'.repeat(64),
+            callOrdinal: ordinal,
+            pathArguments: Object.freeze([]),
+          }),
+        }
+      },
+      projectResult(_binding, result) {
+        return { ...result, content: [{ type: 'text', text: 'projected' }] }
+      },
+    }
+    const broker = new NativeToolBroker()
+    const requestId = broker.register({
+      sessionId: 's1', tools: [tool], invocationTimeoutMs: 90_000, ttlMs: 1_000, policyRound: policy,
+    })
+    broker.start(requestId)
+    broker.claimActivity(requestId, activityId)
+    const first = broker.invoke(requestId, activityId, 'write', { path: 'a' })
+    const second = broker.invoke(requestId, activityId, 'write', { path: 'b' })
+    const batch = broker.takeToolBatch(requestId, Date.now() + 100)!
+    broker.completeBatch(requestId, batch.map(call => ({ callId: call.callId, result: ok })))
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { content: [{ type: 'text', text: 'projected' }], isError: false },
+      { content: [{ type: 'text', text: 'projected' }], isError: false },
+    ])
+    broker.completeActivity(requestId, activityId)
+    broker.close()
   })
 
   it('rejects unknown tools without queueing a request', async () => {

@@ -11,6 +11,7 @@
  */
 
 import { contentHasImage, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, MessageId } from '@deepseek-ai/dsh-llm'
+import { hashCanonical } from './native/canonical.ts'
 import type {
   ContentBlock,
   GenerateOptions,
@@ -30,7 +31,10 @@ import type {
   BrokerCallId,
   BrokerToolRequest,
   ConnectorRuntime,
+  NativeCheckpoint,
   ConnectorTransport,
+  PreparedNativeRequest,
+  ResolvedNativeSecurityConfig,
 } from './native/types.ts'
 export type { ConnectorRuntime, ConnectorTransport } from './native/types.ts'
 import { CHATGPT_COMPOSER_SELECTOR, detectChatGptAccountCapabilities } from './chatgpt/session.ts'
@@ -56,13 +60,15 @@ import {
   ManagedRuntimeTransportError,
 } from './native/tunnel-runtime.ts'
 import {
+  assessNativeClaimResultEvidence,
   decideNativeContinuation,
-  hasExactNativeToolResults,
   nativeExecutionKey,
   parseNativeReplayState,
 } from './native/continuation.ts'
-import type { ParkedContinuationClaim } from './native/continuation.ts'
+import type { NativeContinuationIdentity, ParkedContinuationClaim } from './native/continuation.ts'
 import { createNativePhysicalResponse } from './native/physical-response.ts'
+import { requireNativeApproval } from './native/grants.ts'
+import { NativeSafetyError } from './native/errors.ts'
 import type {
   NativePhysicalResponse,
   NativePhysicalResponseDriver,
@@ -175,6 +181,8 @@ export interface ChatGptWebConnectionOptions {
   retryPolicy: ResolvedRetryPolicy
   /** ChatGPT tool transport; text remains the default. */
   connectorTransport: ConnectorTransport
+  /** Fully resolved native security policy; text mode keeps it inert. */
+  nativeSecurity: ResolvedNativeSecurityConfig
   /** Owner of the MCP tunnel process; external preserves current behavior. */
   connectorRuntime: ConnectorRuntime
   /** Exact ChatGPT connector title used by the native MCP transport. */
@@ -196,6 +204,8 @@ export interface ChatGptWebAdapterOptions {
     readonly coordinator: NativeRoundCoordinator
     readonly ready: Promise<void>
     readonly assertConnection: (connection: ChatGptWebConnectionOptions) => void
+    readonly checkpointStore?: import('./native/types.ts').NativeCheckpointStore
+    readonly prepareRequest?: (options: GenerateOptions, connection: ChatGptWebConnectionOptions) => PreparedNativeRequest
   }
 }
 
@@ -229,6 +239,7 @@ interface ActiveNativeResponse {
   readonly lease: NativeStepLease
   claim?: ParkedContinuationClaim
   readonly cleanup: NativeRoundCleanup
+  readonly checkpoint?: NativeCheckpoint
   readonly isPhysicalAvailable: () => boolean
 }
 
@@ -284,10 +295,33 @@ function nativeToolFinish(chunks: readonly StreamChunk[]): boolean {
   return chunks.some(chunk => chunk.type === 'finish' && chunk.reason.kind === 'tool-calls')
 }
 
+function nativeMessageCalls(message: Message): BrokerToolRequest[] {
+  const calls: BrokerToolRequest[] = []
+  for (const block of message.content) {
+    if (block.type !== 'tool-call') continue
+    let parsed: unknown
+    try { parsed = JSON.parse(block.arguments) } catch (error) {
+      throw new LlmError('Native projected assistant tool-call arguments are not valid JSON.', 'PROVIDER_ERROR', { cause: error })
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new LlmError('Native projected assistant tool-call arguments are not an object.', 'PROVIDER_ERROR')
+    }
+    calls.push({
+      callId: block.id,
+      name: block.name,
+      arguments: structuredClone(parsed) as Record<string, unknown>,
+    })
+  }
+  return calls
+}
+
 function nativeClaim(
   options: GenerateOptions,
   response: NativePhysicalResponse,
   chunks: readonly StreamChunk[],
+  canonicalOptions: GenerateOptions = options,
+  projectProviderMessages?: (messages: readonly Message[]) => readonly Message[],
+  identity?: NativeContinuationIdentity,
 ): ParkedContinuationClaim {
   const finish = [...chunks].reverse().find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')
   const replay = finish?.replayState === undefined ? undefined : parseNativeReplayState(finish.replayState)
@@ -298,18 +332,29 @@ function nativeClaim(
     throw new LlmError('Native tool boundary replay state does not match its call batch.', 'PROVIDER_ERROR')
   }
   const request = requestSnapshot(options)
-  const assistantMessage: Message = {
+  const canonicalAssistantMessage: Message = {
     id: MessageId(`native-${response.executionKey.slice(0, 16)}-${replay.boundary}`),
     role: 'assistant',
     content: nativeBoundaryBlocks(chunks),
     source: { kind: 'model', provider: options.provider, model: options.model },
   }
+  const assistantMessage = projectProviderMessages?.([canonicalAssistantMessage])[0] ?? canonicalAssistantMessage
+  if (assistantMessage === undefined) throw new LlmError('Native tool boundary history projection was empty.', 'PROVIDER_ERROR')
+  const providerPendingCalls = nativeMessageCalls(assistantMessage)
   return {
     sessionId: String(options.sessionId ?? ''),
     executionKey: response.executionKey,
-    requestKey: nativeExecutionKey(request),
+    requestKey: nativeExecutionKey(request, identity),
+    ...(identity === undefined ? {} : {
+      policyHash: identity.policyHash,
+      inventoryHash: identity.inventoryHash,
+      approvalHash: identity.approvalHash,
+    }),
     request,
+    canonicalRequest: requestSnapshot(canonicalOptions),
+    canonicalAssistantMessage,
     assistantMessage,
+    providerPendingCalls,
     pendingCalls,
     physicalAvailable: true,
     durableResults: false,
@@ -595,18 +640,74 @@ export class ChatGptWebAdapter extends LlmAdapter {
     await active.lease.fail(active.cleanup, cause).catch(() => {})
   }
 
+  private async recoverOwnedConversationCleanup(
+    options: GenerateOptions,
+    connection: ChatGptWebConnectionOptions,
+    checkpointHash: string,
+  ): Promise<void> {
+    const store = this.config.native?.checkpointStore
+    if (store?.prepareRecoveryCleanup === undefined || store.confirmRecoveryCleanup === undefined) {
+      throw new NativeSafetyError('native checkpoint cleanup recovery is unavailable', undefined, 'NATIVE_CHECKPOINT_UNAVAILABLE')
+    }
+    const ledger = createOwnedConversationLedger(connection.profileDir)
+    const pending = ledger.pending()
+    if (pending.length !== 1) {
+      throw new NativeSafetyError(
+        'native checkpoint cleanup cannot be correlated to exactly one owned conversation',
+        undefined,
+        'NATIVE_CHECKPOINT_CLEANUP_REQUIRED',
+      )
+    }
+    store.prepareRecoveryCleanup(checkpointHash)
+    const browser = this.browserFor(connection)
+    let page: Page | undefined
+    let cleanupError: unknown
+    try {
+      await browser.ensureReady(options.signal)
+      page = await browser.newTurnPage()
+      await retryPendingConversationDeletions(page, ledger)
+      if (ledger.pending().length !== 0) throw new Error('owned conversation cleanup remained pending')
+      store.confirmRecoveryCleanup(
+        checkpointHash,
+        hashCanonical('native-ledger-correlation', 1, pending[0]),
+      )
+    } catch (error) {
+      cleanupError = error
+    }
+    if (page !== undefined) await page.close().catch(error => { cleanupError ??= error })
+    await browser.persistSession().catch(error => { cleanupError ??= error })
+    if (cleanupError !== undefined) {
+      throw new NativeSafetyError(
+        'native checkpoint owned-conversation cleanup could not be confirmed',
+        cleanupError,
+        'NATIVE_CHECKPOINT_CLEANUP_REQUIRED',
+      )
+    }
+  }
+
   private async * runPersistentNativeTurn(
     options: GenerateOptions,
     connection: ChatGptWebConnectionOptions,
+    prepared: PreparedNativeRequest | undefined,
   ): AsyncIterable<StreamChunk> {
     const nativeRuntime = this.config.native
     if (nativeRuntime === undefined) {
       throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
     }
     const sessionId = String(options.sessionId ?? '')
+    const providerOptions = prepared?.providerOptions ?? options
+    const preparedRound = prepared?.nativeRound
+    const continuationIdentity: NativeContinuationIdentity | undefined = prepared === undefined
+      ? undefined
+      : {
+          policyHash: prepared.policyHash,
+          inventoryHash: prepared.inventoryHash,
+          approvalHash: prepared.approvalHash,
+        }
     let active = this.nativeResponses.get(sessionId)
     let lease: NativeStepLease | undefined = active?.lease
     let activeCleanup: NativeRoundCleanup | undefined = active?.cleanup
+    let checkpoint: NativeCheckpoint | undefined = active?.checkpoint
     let nativeReleased = false
 
     try {
@@ -616,7 +717,10 @@ export class ChatGptWebAdapter extends LlmAdapter {
         }
         const physicalAvailable = active.isPhysicalAvailable()
         const uncertainOutcome = active.claim.uncertainOutcome || active.response.hasUncertainOutcome()
-        const durableResults = !uncertainOutcome && hasExactNativeToolResults(active.claim, options)
+        const durableEvidence = uncertainOutcome
+          ? undefined
+          : assessNativeClaimResultEvidence(active.claim, options, providerOptions)
+        const durableResults = durableEvidence?.kind === 'proven'
         const decisionClaim: ParkedContinuationClaim = {
           ...active.claim,
           physicalAvailable,
@@ -624,7 +728,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
           uncertainOutcome,
           ...(physicalAvailable ? {} : { unavailableReason: 'page-lost' as const }),
         }
-        const decision = decideNativeContinuation(decisionClaim, options)
+        const decision = decideNativeContinuation(decisionClaim, providerOptions, continuationIdentity)
         if (decision.kind === 'fail') {
           if (!physicalAvailable && !uncertainOutcome
             && ['MISSING_TOOL_RESULT', 'TOOL_RESULT_MISMATCH', 'HISTORY_MISMATCH', 'CALL_MISMATCH', 'UNCERTAIN_OUTCOME'].includes(decision.code)) {
@@ -637,24 +741,65 @@ export class ChatGptWebAdapter extends LlmAdapter {
           throw new LlmError(decision.message, decision.code)
         }
         if (decision.kind === 'fresh-replay') {
-          await active.response.stop(new LlmError(
-            `Native continuation requires a fresh replay (${decision.reason}).`,
-            'PROVIDER_ERROR',
-          ))
           this.nativeResponses.delete(sessionId)
-          await nativeRuntime.coordinator.stopAtTurnBoundary(sessionId)
+          if (active.checkpoint === undefined) {
+            await active.response.stop(new LlmError(
+              `Native continuation requires a fresh replay (${decision.reason}).`,
+              'PROVIDER_ERROR',
+            ))
+            await nativeRuntime.coordinator.stopAtTurnBoundary(sessionId)
+            lease = undefined
+          } else {
+            const replayCheckpoint = active.checkpoint
+            // Let the coordinator correlate the exact durable results and run
+            // owned cleanup before consuming the one-shot replay fence. It
+            // then allocates a fresh broker record for the replacement.
+            const replayLease = await nativeRuntime.coordinator.beginStep(
+              preparedRound === undefined
+                ? {
+                    sessionId,
+                    messages: options.messages,
+                    tools: options.tools ?? [],
+                    ttlMs: connection.mcpInvocationTimeoutMs,
+                    invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+                    continuation: { kind: 'fresh-replay' },
+                    checkpoint: replayCheckpoint,
+                    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+                  }
+                : {
+                    snapshot: preparedRound.coordinatorSnapshot,
+                    openPolicyRound: preparedRound.openRound,
+                    ttlMs: connection.mcpInvocationTimeoutMs,
+                    continuation: { kind: 'fresh-replay' },
+                    checkpoint: replayCheckpoint,
+                    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+                  },
+            )
+            lease = replayLease
+          }
           active = undefined
-          lease = undefined
         } else {
-          const resumed = await nativeRuntime.coordinator.beginStep({
-            sessionId,
-            messages: options.messages,
-            tools: options.tools ?? [],
-            ttlMs: connection.mcpInvocationTimeoutMs,
-            invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
-            continuation: { kind: 'continue' },
-            ...(options.signal !== undefined ? { signal: options.signal } : {}),
-          })
+          const resumed = await nativeRuntime.coordinator.beginStep(
+            preparedRound === undefined
+              ? {
+                  sessionId,
+                  messages: options.messages,
+                  tools: options.tools ?? [],
+                  ttlMs: connection.mcpInvocationTimeoutMs,
+                  invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+                  continuation: { kind: 'continue' },
+                  ...(checkpoint === undefined ? {} : { checkpoint }),
+                  ...(options.signal !== undefined ? { signal: options.signal } : {}),
+                }
+              : {
+                  snapshot: preparedRound.coordinatorSnapshot,
+                  openPolicyRound: preparedRound.openRound,
+                  ttlMs: connection.mcpInvocationTimeoutMs,
+                  continuation: { kind: 'continue' },
+                  ...(checkpoint === undefined ? {} : { checkpoint }),
+                  ...(options.signal !== undefined ? { signal: options.signal } : {}),
+                },
+          )
           if (resumed.requestId !== active.response.requestId) {
             throw new LlmError('Native continuation changed the broker request unexpectedly.', 'TRANSPORT')
           }
@@ -665,7 +810,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
             const boundary = yield* forwardNativeBoundary(active.response)
             boundaryDelivered = true
             if (nativeToolFinish(boundary)) {
-              active.claim = nativeClaim(options, active.response, boundary)
+              active.claim = nativeClaim(providerOptions, active.response, boundary, options, prepared?.projectProviderMessages, continuationIdentity)
               await resumed.park(active.cleanup)
             } else {
               await resumed.complete(active.cleanup)
@@ -687,6 +832,39 @@ export class ChatGptWebAdapter extends LlmAdapter {
 
       await nativeRuntime.ready
       nativeRuntime.assertConnection(connection)
+      if (checkpoint === undefined && prepared !== undefined && preparedRound !== undefined
+        && nativeRuntime.checkpointStore !== undefined) {
+        const verdict = nativeRuntime.checkpointStore.recoverForRequest(prepared)
+        if (verdict.kind === 'blocked') {
+          throw new NativeSafetyError(
+            `native checkpoint recovery is blocked (${verdict.reason}); inspect checkpoint ${verdict.checkpointHash}`,
+            undefined,
+            'NATIVE_CHECKPOINT_BLOCKED',
+          )
+        }
+        if (verdict.kind === 'normal') {
+          checkpoint = nativeRuntime.checkpointStore.begin(prepared)
+        } else if (verdict.kind === 'fresh-replay') {
+          if (nativeRuntime.checkpointStore.prepareFreshReplay === undefined) {
+            throw new NativeSafetyError('native checkpoint replay support is unavailable', undefined, 'NATIVE_CHECKPOINT_UNAVAILABLE')
+          }
+          checkpoint = nativeRuntime.checkpointStore.prepareFreshReplay(prepared, verdict.checkpointHash)
+        } else if (verdict.kind === 'cleanup-required') {
+          await this.recoverOwnedConversationCleanup(options, connection, verdict.checkpointHash)
+          const afterCleanup = nativeRuntime.checkpointStore.recoverForRequest(prepared)
+          if (afterCleanup.kind !== 'fresh-replay') {
+            throw new NativeSafetyError(
+              `native checkpoint ${verdict.checkpointHash} did not become replayable after cleanup`,
+              undefined,
+              'NATIVE_CHECKPOINT_CLEANUP_REQUIRED',
+            )
+          }
+          if (nativeRuntime.checkpointStore.prepareFreshReplay === undefined) {
+            throw new NativeSafetyError('native checkpoint replay support is unavailable', undefined, 'NATIVE_CHECKPOINT_UNAVAILABLE')
+          }
+          checkpoint = nativeRuntime.checkpointStore.prepareFreshReplay(prepared, afterCleanup.checkpointHash)
+        }
+      }
       const ledger = createOwnedConversationLedger(connection.profileDir)
       const browser = this.browserFor(connection)
       let page: Page | undefined
@@ -701,14 +879,32 @@ export class ChatGptWebAdapter extends LlmAdapter {
         sessionStopped = true
         await session.stop().catch(() => {})
       }
+      const prepareCheckpointCleanup = (): void => {
+        if (checkpoint === undefined) return
+        try {
+          checkpoint.prepareCleanup()
+        } catch {
+          checkpoint.markNonReplayable('cleanup-preparation-failed')
+          checkpoint.prepareCleanup()
+        }
+      }
       const cleanup: NativeRoundCleanup = (mode): Promise<void> => {
         if (cleanupRequested === undefined || mode === 'stop') cleanupRequested = mode
         if (cleanupPromise !== undefined) return cleanupPromise
-        if (page === undefined && session === undefined) return Promise.resolve()
+        if (page === undefined && session === undefined) {
+          cleanupPromise = (async () => {
+            if (checkpoint !== undefined && !promptSubmitted) {
+              prepareCheckpointCleanup()
+              checkpoint.confirmCleanup(hashCanonical('native-ledger-correlation', 1, []))
+            }
+          })()
+          return cleanupPromise
+        }
         cleanupPromise = (async () => {
-          if (mode === 'stop') await stopSession()
           let cleanupError: unknown
           try {
+            prepareCheckpointCleanup()
+            if (mode === 'stop') await stopSession()
             if (page !== undefined && promptSubmitted) {
               const conversationId = ownedConversationId ?? conversationIdFromUrl(page.url())
               if (conversationId !== undefined) {
@@ -716,6 +912,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
                 if (!ledger.pending().includes(conversationId)) ledger.remember(conversationId)
                 await deleteOwnedConversation(page, conversationId)
                 ledger.forget(conversationId)
+                checkpoint?.confirmCleanup(hashCanonical('native-ledger-correlation', 1, conversationId))
                 ownedConversationId = undefined
               } else {
                 throw new LlmError(
@@ -723,9 +920,12 @@ export class ChatGptWebAdapter extends LlmAdapter {
                   'PROVIDER_ERROR',
                 )
               }
+            } else if (checkpoint !== undefined) {
+              checkpoint.confirmCleanup(hashCanonical('native-ledger-correlation', 1, []))
             }
           } catch (error) {
             cleanupError = error
+            try { checkpoint?.markNonReplayable('cleanup-failed') } catch { /* preserve the cleanup failure */ }
           }
           if (page !== undefined) {
             await page.close().catch(error => { cleanupError ??= error })
@@ -769,16 +969,29 @@ export class ChatGptWebAdapter extends LlmAdapter {
         browser.markProbed()
       }
       const capabilities = this.capabilities
-      lease = await nativeRuntime.coordinator.beginStep({
-        sessionId,
-        messages: options.messages,
-        tools: options.tools ?? [],
-        ttlMs: connection.mcpInvocationTimeoutMs,
-        invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
-        ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      })
+      if (lease === undefined) {
+        lease = await nativeRuntime.coordinator.beginStep(
+          preparedRound === undefined
+            ? {
+                sessionId,
+                messages: options.messages,
+                tools: options.tools ?? [],
+                ttlMs: connection.mcpInvocationTimeoutMs,
+                invocationTimeoutMs: connection.mcpInvocationTimeoutMs,
+                ...(checkpoint === undefined ? {} : { checkpoint }),
+                ...(options.signal !== undefined ? { signal: options.signal } : {}),
+              }
+            : {
+                snapshot: preparedRound.coordinatorSnapshot,
+                openPolicyRound: preparedRound.openRound,
+                ttlMs: connection.mcpInvocationTimeoutMs,
+                ...(checkpoint === undefined ? {} : { checkpoint }),
+                ...(options.signal !== undefined ? { signal: options.signal } : {}),
+              },
+        )
+      }
       lease.bindCleanup(cleanup)
-      const prompt = compilePrompt(options, COMPOSER_CHAR_BUDGET, this.takeNotice(options), {
+      const prompt = compilePrompt(providerOptions, COMPOSER_CHAR_BUDGET, this.takeNotice(options), {
         requestId: lease.requestId,
         connectorName: connection.connectorName,
       })
@@ -787,7 +1000,13 @@ export class ChatGptWebAdapter extends LlmAdapter {
         prompt,
         capabilities,
         surface: 'connector',
-        onPromptSubmitted: markPromptSubmitted,
+        onPromptSubmitting: () => checkpoint?.recordSubmissionAttempted(),
+        onPromptSubmitted: () => {
+          // Mark the provider boundary before durability failures can escape;
+          // cleanup must never treat an accepted prompt as pre-submit.
+          markPromptSubmitted()
+          checkpoint?.recordSubmitted()
+        },
         onConversationCreated: rememberConversation,
         turnTimeoutMs: connection.turnTimeoutMs,
         stallTimeoutMs: connection.stallTimeoutMs,
@@ -809,16 +1028,18 @@ export class ChatGptWebAdapter extends LlmAdapter {
       }
       const response = createNativePhysicalResponse({
         sessionId,
-        executionKey: nativeExecutionKey(options),
+        executionKey: nativeExecutionKey(providerOptions, continuationIdentity),
         requestId: lease.requestId,
         promptChars: prompt.length,
         driver,
         cleanup,
+        ...(checkpoint === undefined ? {} : { checkpoint }),
       })
       const current: ActiveNativeResponse = {
         response,
         lease,
         cleanup,
+        ...(checkpoint === undefined ? {} : { checkpoint }),
         isPhysicalAvailable: () => {
           try {
             return page !== undefined && !page.isClosed()
@@ -836,7 +1057,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         const boundary = yield* forwardNativeBoundary(response)
         boundaryDelivered = true
         if (nativeToolFinish(boundary)) {
-          current.claim = nativeClaim(options, response, boundary)
+          current.claim = nativeClaim(providerOptions, response, boundary, options, prepared?.projectProviderMessages, continuationIdentity)
           await lease.park(cleanup)
         } else {
           await lease.complete(cleanup)
@@ -860,10 +1081,31 @@ export class ChatGptWebAdapter extends LlmAdapter {
         await active.response.stop(failure).catch(() => {})
         this.nativeResponses.delete(sessionId)
       }
+      let cleanupAttempted = false
+      let cleanupSucceeded = activeCleanup === undefined
       if (lease !== undefined && !nativeReleased) {
         await lease.fail(activeCleanup ?? (async () => {}), failure).catch(() => {})
       } else if (activeCleanup !== undefined && active === undefined) {
-        await activeCleanup(options.signal?.aborted ? 'stop' : 'close').catch(() => {})
+        cleanupAttempted = true
+        try {
+          await activeCleanup(options.signal?.aborted ? 'stop' : 'close')
+          cleanupSucceeded = true
+        } catch { /* unresolved ownership remains blocked for recovery */ }
+      }
+      if (checkpoint !== undefined && lease === undefined) {
+        if (!cleanupAttempted && activeCleanup !== undefined) {
+          cleanupAttempted = true
+          try {
+            await activeCleanup('close')
+            cleanupSucceeded = true
+          } catch { /* unresolved ownership remains blocked for recovery */ }
+        }
+        try { checkpoint.markNonReplayable('pre-submit-failure') } catch { /* already fenced or terminal */ }
+        if (cleanupSucceeded) {
+          try { checkpoint.prepareCleanup() } catch { /* cleanup could already be prepared */ }
+          try { checkpoint.confirmCleanup(hashCanonical('native-ledger-correlation', 1, [])) } catch { /* unresolved ownership remains blocked */ }
+          try { checkpoint.markTerminal('failed') } catch { /* unresolved ownership remains blocked for recovery */ }
+        }
       }
       throw failure
     }
@@ -880,23 +1122,38 @@ export class ChatGptWebAdapter extends LlmAdapter {
         )
       }
     }
-    const hasTools = (options.tools?.length ?? 0) > 0
     const nativeMode = connection.connectorTransport === 'mcp'
+    const prepared = nativeMode
+      ? this.config.native === undefined
+        ? undefined
+        : this.config.native.prepareRequest?.(options, connection)
+      : undefined
+    if (nativeMode && this.config.native !== undefined && prepared === undefined
+      && (connection.nativeSecurity.toolPolicy !== 'full' || connection.nativeSecurity.approval !== 'none')) {
+      throw new NativeSafetyError('native secure policy preparation is unavailable; refusing an unguarded MCP turn', undefined, 'NATIVE_POLICY_UNAVAILABLE')
+    }
+    const providerOptions = prepared?.providerOptions ?? options
+    const effectiveHasTools = (providerOptions.tools?.length ?? 0) > 0
+    if (nativeMode && prepared !== undefined) {
+      requireNativeApproval(connection.profileDir, connection.nativeSecurity.approval, prepared)
+    }
     // Auxiliary model calls (session titles and compaction) share the adapter
     // but are not DSH agent rounds. They must not enter the native coordinator:
     // a title request queued while an agent round is parked has no durable
     // tool_result to resume and would otherwise steal the parked reservation.
     const auxiliaryModelCall = options.purpose === 'session-title' || options.purpose === 'compaction'
+    if (nativeMode && this.config.native === undefined) {
+      throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
+    }
     const nativeRound = nativeMode && !auxiliaryModelCall
-    const nativeTools = nativeRound && hasTools
+      && (prepared?.nativeRound !== undefined
+        || (prepared === undefined && this.config.native?.prepareRequest === undefined))
+    const nativeTools = nativeRound && effectiveHasTools
     if (nativeRound && options.sessionId === undefined) {
       throw new LlmError('Native MCP transport requires a sessionId for round ownership.', 'INVALID_REQUEST')
     }
-    if (nativeRound && this.config.native === undefined) {
-      throw new LlmError('Native MCP transport is not initialized by the plugin runtime.', 'UNSUPPORTED')
-    }
     if (nativeTools) {
-      yield* this.runPersistentNativeTurn(options, connection)
+      yield* this.runPersistentNativeTurn(options, connection, prepared)
       return
     }
 
@@ -1018,7 +1275,7 @@ export class ChatGptWebAdapter extends LlmAdapter {
         lease.bindCleanup(cleanup)
       }
       const prompt = compilePrompt(
-        options,
+        providerOptions,
         COMPOSER_CHAR_BUDGET,
         this.takeNotice(options),
         nativeTools && lease !== undefined ? {

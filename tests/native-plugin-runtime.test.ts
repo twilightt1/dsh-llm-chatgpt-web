@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { resolveAdapterOptions } from '../src/index.ts'
 import { NativeToolBroker } from '../src/native/broker.ts'
+import type { GenerateOptions, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { NativeBrokerSocketServer } from '../src/native/broker-socket.ts'
 import type { NativeRoundCoordinator } from '../src/native/coordinator.ts'
 import type { ManagedNativeRuntimeConfig } from '../src/native/runtime-config.ts'
@@ -99,6 +100,33 @@ describe('native plugin runtime composition', () => {
     void broker
   })
 
+  it('prepares detached native requests with an immutable coordinator round', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-plugin-'))
+    const log: string[] = []
+    const { dependencies } = fakes(log)
+    const initial = await connection(root, false)
+    const stack = createNativePluginRuntime(initial, dependencies)
+    const tool: ToolSchema = { name: 'read', description: 'read', parameters: { type: 'object' } }
+    const request: GenerateOptions = {
+      provider: 'chatgpt-web',
+      model: 'chatgpt-web/high',
+      messages: [],
+      tools: [tool],
+      sessionId: 's1' as never,
+    }
+    const prepared = stack.prepareRequest(request, initial)
+    expect(prepared.providerOptions).not.toBe(request)
+    expect(prepared.providerOptions.tools).not.toBe(request.tools)
+    expect(prepared.nativeRound?.coordinatorSnapshot.broker.tools).toEqual([tool])
+    expect(prepared.nativeRound?.coordinatorSnapshot).toMatchObject({
+      sessionId: 's1',
+      policyHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      inventoryHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      approvalHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    })
+    await stack.close()
+  })
+
   it('does not create a tunnel for externally owned MCP mode', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-native-plugin-'))
     const log: string[] = []
@@ -163,6 +191,37 @@ describe('native plugin runtime composition', () => {
     const initial = await connection(root)
     const stack = createNativePluginRuntime(initial, dependencies)
     await expect(stack.ready).rejects.toThrow(/outside the package root/i)
+    await stack.close()
+  })
+
+  it('warns once at startup and once on the first secure request when cwd is implicit', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-native-plugin-'))
+    const log: string[] = []
+    const warnings: string[] = []
+    const { dependencies: baseDependencies } = fakes(log)
+    const secure = resolveAdapterOptions({
+      profileDir: root,
+      connectorTransport: 'mcp',
+      nativeSecurity: {
+        toolPolicy: 'allowlist',
+        rules: [{ tool: 'read', capability: 'workspace.read', pathArguments: ['/path'] }],
+      },
+      brokerSocketPath: join(root, 'broker.sock'),
+    })
+    const stack = createNativePluginRuntime(secure, { ...baseDependencies, warn: message => warnings.push(message) })
+    expect(warnings).toHaveLength(1)
+    stack.prepareRequest({
+      provider: 'chatgpt-web', model: 'chatgpt-web/high', messages: [],
+      tools: [{ name: 'read', description: 'read', parameters: { type: 'object' } }],
+      sessionId: 's1' as never,
+    }, secure)
+    expect(warnings).toHaveLength(2)
+    stack.prepareRequest({
+      provider: 'chatgpt-web', model: 'chatgpt-web/high', messages: [],
+      tools: [{ name: 'read', description: 'read', parameters: { type: 'object' } }],
+      sessionId: 's2' as never,
+    }, secure)
+    expect(warnings).toHaveLength(2)
     await stack.close()
   })
 

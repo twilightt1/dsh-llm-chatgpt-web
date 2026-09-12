@@ -1,3 +1,4 @@
+import "./chunks/types-CkBIayy6.js";
 //#region src/native/setup.d.ts
 interface NativeSetupInput {
   readonly isTTY: boolean | undefined;

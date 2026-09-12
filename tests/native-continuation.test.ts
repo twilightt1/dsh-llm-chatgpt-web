@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import {
+  assessNativeResultEvidence,
+  correlateNativeToolResults,
   decideNativeContinuation,
+  hasExactNativeToolResults,
   nativeExecutionKey,
   nativeReplayState,
   parseNativeReplayState,
@@ -103,6 +106,46 @@ describe('native execution identity', () => {
     expect(nativeExecutionKey(request({ stop: ['different'] }))).not.toBe(first)
   })
 
+  it('binds provider and canonical continuation views to policy identity', () => {
+    const identity = { policyHash: 'a'.repeat(64), inventoryHash: 'b'.repeat(64), approvalHash: 'c'.repeat(64) }
+    const canonicalCall: BrokerToolRequest = { ...call, arguments: { path: '/workspace/x' } }
+    const canonicalAssistant: Message = {
+      ...assistant,
+      content: [{ type: 'tool-call', id: canonicalCall.callId, name: canonicalCall.name, arguments: JSON.stringify(canonicalCall.arguments) }],
+    }
+    const providerAssistant: Message = {
+      ...canonicalAssistant,
+      content: [{ type: 'tool-call', id: canonicalCall.callId, name: canonicalCall.name, arguments: JSON.stringify({ path: 'x' }) }],
+    }
+    const canonical = request({ messages: [user] })
+    const provider = request({ messages: [user] })
+    const parked: ParkedContinuationClaim = {
+      sessionId: 'session-1',
+      executionKey: nativeExecutionKey(provider, identity),
+      requestKey: nativeExecutionKey(provider, identity),
+      policyHash: identity.policyHash,
+      inventoryHash: identity.inventoryHash,
+      approvalHash: identity.approvalHash,
+      request: provider,
+      canonicalRequest: canonical,
+      assistantMessage: providerAssistant,
+      canonicalAssistantMessage: canonicalAssistant,
+      providerPendingCalls: [{ ...canonicalCall, arguments: { path: 'x' } }],
+      pendingCalls: [canonicalCall],
+      physicalAvailable: true,
+      durableResults: false,
+      uncertainOutcome: false,
+    }
+    const providerResult = resultMessage()
+    const canonicalResult = resultMessage()
+    expect(decideNativeContinuation(parked, provider, identity)).toMatchObject({ kind: 'fail' })
+    expect(decideNativeContinuation(parked, { ...provider, messages: [user, providerAssistant, providerResult] }, identity))
+      .toEqual({ kind: 'continue', results: [{ content: [{ type: 'text', text: 'done' }], isError: false }] })
+    expect(hasExactNativeToolResults(parked, { ...canonical, messages: [user, canonicalAssistant, canonicalResult] })).toBe(true)
+    expect(decideNativeContinuation(parked, { ...provider, messages: [user, providerAssistant, providerResult] }, { ...identity, approvalHash: 'd'.repeat(64) }))
+      .toMatchObject({ kind: 'fail', code: 'POLICY_MISMATCH' })
+  })
+
   it('round-trips only the versioned replay envelope', () => {
     const envelope = nativeReplayState(
       'a'.repeat(64),
@@ -151,6 +194,101 @@ describe('native execution identity', () => {
   })
 })
 
+describe('native result correlation', () => {
+  it('correlates exact text-only results in pending-call order', () => {
+    expect(correlateNativeToolResults([resultMessage()], [call])).toEqual([
+      { content: [{ type: 'text', text: 'done' }], isError: false },
+    ])
+  })
+})
+
+describe('native durable result evidence', () => {
+  it('returns proven evidence with provider-facing cloned results', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [user, assistant, resultMessage()],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+      provider: {
+        messages: [user, assistant, resultMessage()],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toEqual({
+      kind: 'proven',
+      results: [{ content: [{ type: 'text', text: 'done' }], isError: false }],
+    })
+    if (evidence.kind !== 'proven') throw new Error('expected proven evidence')
+    expect(Object.isFrozen(evidence)).toBe(true)
+    expect(Object.isFrozen(evidence.results)).toBe(true)
+    expect(Object.isFrozen(evidence.results[0])).toBe(true)
+  })
+
+  it('returns ambiguous evidence when two boundaries match', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [assistant, resultMessage(), assistant, resultMessage()],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toMatchObject({ kind: 'ambiguous' })
+  })
+
+  it('returns conflicting evidence for an extra tool-result tail', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [assistant, resultMessage(), resultMessage('duplicate')],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toMatchObject({ kind: 'conflicting' })
+  })
+
+  it('returns provider-facing results when canonical content is projected', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [assistant, resultMessage('raw output')],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+      provider: {
+        messages: [assistant, resultMessage('sanitized output')],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toEqual({
+      kind: 'proven',
+      results: [{ content: [{ type: 'text', text: 'sanitized output' }], isError: false }],
+    })
+  })
+
+  it('returns conflicting evidence when canonical and provider error flags differ', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [assistant, resultMessage('raw output')],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+      provider: {
+        messages: [assistant, resultMessage('sanitized output', true)],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toMatchObject({ kind: 'conflicting', reason: 'result-evidence-conflicting' })
+  })
+})
+
 describe('decideNativeContinuation', () => {
   it('continues with exact tool results from the appended history tail', () => {
     const decision = decideNativeContinuation(claim(), request({ messages: [user, assistant, resultMessage()] }))
@@ -193,6 +331,137 @@ describe('decideNativeContinuation', () => {
     )).toMatchObject({ kind: 'fail' })
   })
 
+  it('treats exact current results as durable when older tool history was pruned', () => {
+    const priorCall: BrokerToolRequest = {
+      callId: testCallId('call_00000000000000000000000000000002'),
+      name: 'write',
+      arguments: { path: 'older' },
+    }
+    const priorAssistant: Message = {
+      ...assistant,
+      id: MessageId('prior-assistant'),
+      content: [{
+        type: 'tool-call',
+        id: priorCall.callId,
+        name: priorCall.name,
+        arguments: JSON.stringify(priorCall.arguments),
+      }],
+    }
+    const priorResult: Message = {
+      id: MessageId('prior-result'),
+      role: 'user',
+      content: [{
+        type: 'tool-result',
+        toolCallId: priorCall.callId,
+        content: [{ type: 'text', text: 'large original output' }],
+        isError: false,
+      }],
+      source: { kind: 'tool', callId: priorCall.callId },
+    }
+    const prunedPriorResult: Message = {
+      ...priorResult,
+      content: [{
+        type: 'tool-result',
+        toolCallId: priorCall.callId,
+        content: [{ type: 'text', text: '[older tool output pruned]' }],
+        isError: false,
+      }],
+    }
+    const base = request({ messages: [user, priorAssistant, priorResult] })
+    const parked = claim({
+      executionKey: nativeExecutionKey(base),
+      request: base,
+      canonicalRequest: base,
+      canonicalAssistantMessage: assistant,
+      durableResults: false,
+    })
+    const incoming = request({
+      messages: [user, priorAssistant, prunedPriorResult, assistant, resultMessage()],
+    })
+
+    const durableResults = hasExactNativeToolResults(parked, incoming)
+
+    expect(durableResults).toBe(true)
+    expect(decideNativeContinuation({ ...parked, durableResults }, incoming))
+      .toEqual({ kind: 'fresh-replay', reason: 'context-added' })
+  })
+
+  it('treats exact current results as durable when compaction replaces older history with a summary', () => {
+    const priorCall: BrokerToolRequest = {
+      callId: testCallId('call_00000000000000000000000000000003'),
+      name: 'write',
+      arguments: { path: 'older' },
+    }
+    const priorAssistant: Message = {
+      ...assistant,
+      id: MessageId('compacted-prior-assistant'),
+      content: [{
+        type: 'tool-call',
+        id: priorCall.callId,
+        name: priorCall.name,
+        arguments: JSON.stringify(priorCall.arguments),
+      }],
+    }
+    const priorResult: Message = {
+      id: MessageId('compacted-prior-result'),
+      role: 'user',
+      content: [{
+        type: 'tool-result',
+        toolCallId: priorCall.callId,
+        content: [{ type: 'text', text: 'large original output' }],
+        isError: false,
+      }],
+      source: { kind: 'tool', callId: priorCall.callId },
+    }
+    const retainedContext: Message = {
+      id: MessageId('retained-context'),
+      role: 'user',
+      content: [{ type: 'text', text: 'recent context retained verbatim' }],
+      source: { kind: 'plugin', plugin: 'test-context' },
+    }
+    const summary: Message = {
+      id: MessageId('compaction-summary'),
+      role: 'user',
+      content: [{ type: 'text', text: 'summary of the replaced older span' }],
+      source: { kind: 'plugin', plugin: 'compact' },
+    }
+    const base = request({ messages: [user, priorAssistant, priorResult, retainedContext] })
+    const parked = claim({
+      executionKey: nativeExecutionKey(base),
+      request: base,
+      canonicalRequest: base,
+      canonicalAssistantMessage: assistant,
+      durableResults: false,
+    })
+    const incoming = request({
+      messages: [summary, retainedContext, assistant, resultMessage()],
+    })
+
+    const durableResults = hasExactNativeToolResults(parked, incoming)
+
+    expect(durableResults).toBe(true)
+    expect(decideNativeContinuation({ ...parked, durableResults }, incoming))
+      .toEqual({ kind: 'fresh-replay', reason: 'context-added' })
+  })
+
+  it('refuses durability proof when compaction leaves duplicate matching boundaries', () => {
+    const base = request()
+    const parked = claim({
+      executionKey: nativeExecutionKey(base),
+      request: base,
+      canonicalRequest: base,
+      canonicalAssistantMessage: assistant,
+      durableResults: false,
+    })
+    const incoming = request({
+      messages: [assistant, resultMessage(), assistant, resultMessage()],
+    })
+
+    expect(hasExactNativeToolResults(parked, incoming)).toBe(false)
+    expect(decideNativeContinuation(parked, incoming))
+      .toMatchObject({ kind: 'fail', code: 'UNCERTAIN_OUTCOME' })
+  })
+
   it('selects typed fresh replay for model, schema, generation, and context changes', () => {
     expect(decideNativeContinuation(claim(), request({ model: 'chatgpt-web/light', messages: [user, assistant, resultMessage()] })))
       .toEqual({ kind: 'fresh-replay', reason: 'model-changed' })
@@ -207,6 +476,17 @@ describe('decideNativeContinuation', () => {
       id: MessageId('steering'),
       content: [{ type: 'text', text: 'steer' }],
     }] }))).toEqual({ kind: 'fresh-replay', reason: 'steering' })
+  })
+
+  it('refuses fresh replay when a parked side effect has no exact durable results', () => {
+    expect(decideNativeContinuation(
+      claim({ durableResults: false }),
+      request({ model: 'chatgpt-web/light' }),
+    )).toMatchObject({ kind: 'fail', code: 'UNCERTAIN_OUTCOME' })
+    expect(decideNativeContinuation(
+      claim({ durableResults: false }),
+      request({ messages: [user, assistant] }),
+    )).toMatchObject({ kind: 'fail' })
   })
 
   it('allows page-loss replay only after durable results and rejects uncertain outcomes', () => {

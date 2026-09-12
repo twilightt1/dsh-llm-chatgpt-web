@@ -29,7 +29,8 @@ import {
 } from './adapter.ts'
 import type { ChatGptWebCatalogModel, ChatGptWebConnectionOptions } from './adapter.ts'
 import { defaultProfileDir, resolveChromeExecutable } from './chatgpt/launch.ts'
-import type { ConnectorRuntime } from './native/types.ts'
+import type { ConnectorRuntime, NativeSecurityConfig } from './native/types.ts'
+import { resolveNativeSecurityConfig } from './native/policy.ts'
 import { defaultNativeRuntimeConfigPath } from './native/runtime-config.ts'
 import {
   createNativePluginRuntime,
@@ -46,9 +47,67 @@ export type {
 } from './adapter.ts'
 export { compilePrompt } from './chatgpt/prompt.ts'
 export { NativeToolBroker } from './native/broker.ts'
-export { NativeRoundCoordinator, correlateToolResults } from './native/coordinator.ts'
+export { NativeRoundCoordinator } from './native/coordinator.ts'
+/** @deprecated Use the continuation-owned native result evidence seam. */
+export { correlateToolResults } from './native/coordinator.ts'
+export {
+  approveNativeChallenge,
+  formatNativeApprovalChallenge,
+  readNativeApprovalChallenge,
+  requireNativeApproval,
+  shellQuotePosix,
+} from './native/grants.ts'
+export {
+  NativeApprovalRequiredError,
+  NativePolicyDeniedError,
+  NativeSafetyError,
+} from './native/errors.ts'
+export {
+  appendDurablePrivateJsonLine,
+  acquirePrivateWriterLease,
+  durableAtomicWritePrivateFile,
+  syncPrivateDirectory,
+} from './native/private-files.ts'
+export { createNativeCheckpointStore } from './native/checkpoint.ts'
+/** @deprecated Checkpoint result hashes are implementation-owned evidence. */
+export {
+  nativeCheckpointProjectionHash,
+  nativeCheckpointRawResultHash,
+} from './native/checkpoint.ts'
 export type { NativeRoundCleanup, NativeStepLease } from './native/coordinator.ts'
-export type { BrokerRoundSnapshot, BrokerRpcError, BrokerRpcResponse, BrokerToolRequest, BrokerToolResult } from './native/types.ts'
+export type { WorkspaceBoundary } from './native/workspace-boundary.ts'
+export type {
+  BrokerRoundSnapshot,
+  BrokerRpcError,
+  NativeApprovalChallengeV1,
+  NativeApprovalGrantV1,
+  BrokerRpcResponse,
+  BrokerToolRequest,
+  BrokerToolResult,
+  NativeCheckpoint,
+  NativeCheckpointCallBinding,
+  NativeCheckpointEventType,
+  NativeCheckpointStore,
+  NativeCheckpointSummary,
+  NativeRecoveryVerdict,
+  NativeApprovalMode,
+  NativeCapability,
+  NativeEffectiveCapability,
+  NativeEffectiveResultPolicy,
+  NativeEvidenceLimitsConfig,
+  NativePolicyRuntimeIdentity,
+  NativePolicySummary,
+  NativeResultPolicy,
+  NativeSecurityConfig,
+  NativeToolPolicy,
+  NativeToolRuleConfig,
+  PreparedNativeRequest,
+  ResolvedNativeSecurityConfig,
+  ResolvedNativeToolRule,
+  PrivateProcessState,
+  PrivateWriterLease,
+  PrivateWriterLeaseDependencies,
+} from './native/types.ts'
 
 export const name = 'llm-chatgpt-web'
 export const inject = ['llm']
@@ -67,6 +126,7 @@ const DEFAULT_MODELS: ChatGptWebCatalogModel[] = [
 ]
 
 const MODEL_MODALITIES = ['text', 'image'] as const satisfies readonly ModelModality[]
+const PATH_CONTROL_BYTES = /[\u0000-\u001f\u007f]/
 
 /** Plugin config. Paths accept `~` (expanded) — never shared between users. */
 export interface Config {
@@ -106,6 +166,8 @@ export interface Config {
   brokerSocketPath?: string
   /** Native MCP call/round timeout in milliseconds. */
   mcpInvocationTimeoutMs?: number
+  /** Native tool policy and workspace security controls. */
+  nativeSecurity?: NativeSecurityConfig
 }
 
 const catalogModel: z<ChatGptWebCatalogModel> = z.object({
@@ -136,6 +198,27 @@ export const Config: z<Config> = z.object({
   connectorName: z.string(),
   brokerSocketPath: z.string(),
   mcpInvocationTimeoutMs: z.number().step(1).min(1).max(2_147_483_647).default(90_000),
+  nativeSecurity: z.object({
+    toolPolicy: z.union(['full', 'evidence-only', 'allowlist'] as const),
+    workspaceRoot: z.string(),
+    approval: z.union(['none', 'workspace-policy'] as const),
+    rules: z.array(z.object({
+      tool: z.string(),
+      capability: z.union([
+        'workspace.read',
+        'workspace.search',
+        'git.read',
+        'execution.read',
+        'side-effect',
+      ] as const),
+      pathArguments: z.array(z.string()),
+      result: z.union(['text', 'sanitized-evidence'] as const),
+    })),
+    evidenceLimits: z.object({
+      maxBytes: z.number().step(1).min(1),
+      maxLines: z.number().step(1).min(1),
+    }),
+  }),
 })
 
 function expandHome(path: string): string {
@@ -144,6 +227,10 @@ function expandHome(path: string): string {
     return home + path.slice(1)
   }
   return path
+}
+
+function assertSafePathText(path: string, field: string): void {
+  if (PATH_CONTROL_BYTES.test(path)) throw new Error(`llm-chatgpt-web: ${field} contains a control byte`)
 }
 
 /**
@@ -196,6 +283,7 @@ export function resolveAdapterOptions(
   arch: string = process.arch,
 ): ChatGptWebConnectionOptions {
   const profileDir = expandHome(config.profileDir ?? defaultProfileDir())
+  assertSafePathText(profileDir, 'profileDir')
   const connectorTransport = config.connectorTransport ?? 'text'
   const connectorRuntime = config.connectorRuntime ?? 'external'
   if (connectorRuntime !== 'external' && connectorRuntime !== 'managed') {
@@ -231,9 +319,12 @@ export function resolveAdapterOptions(
     throw new Error('llm-chatgpt-web: mcpInvocationTimeoutMs must be a positive safe integer no greater than 2147483647')
   }
   const brokerSocketPath = expandHome(config.brokerSocketPath ?? defaultBrokerSocketPath(profileDir))
+  assertSafePathText(brokerSocketPath, 'brokerSocketPath')
   const nativeRuntimeConfigPath = expandHome(
     config.nativeRuntimeConfigPath ?? defaultNativeRuntimeConfigPath(profileDir),
   )
+  assertSafePathText(nativeRuntimeConfigPath, 'nativeRuntimeConfigPath')
+  const nativeSecurity = resolveNativeSecurityConfig(config.nativeSecurity)
   if (connectorTransport === 'mcp' && !isAbsolute(brokerSocketPath)) {
     throw new Error('llm-chatgpt-web: brokerSocketPath must be an absolute Unix socket path in MCP mode')
   }
@@ -259,6 +350,7 @@ export function resolveAdapterOptions(
     models: resolveModels(config.models),
     retryPolicy: resolveRetryPolicy(config.retryPolicy, 'llm-chatgpt-web: retryPolicy'),
     connectorTransport,
+    nativeSecurity,
     connectorRuntime,
     connectorName: connectorName || 'DSH Native',
     brokerSocketPath,

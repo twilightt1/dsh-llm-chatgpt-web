@@ -1,45 +1,10 @@
+import { A as NativeToolRuleConfig, C as NativePolicyRound, D as NativeResultPolicy, E as NativeRecoveryVerdict, F as ResolvedNativeSecurityConfig, I as ResolvedNativeToolRule, L as WorkspaceBoundary, M as PrivateProcessState, N as PrivateWriterLease, O as NativeSecurityConfig, P as PrivateWriterLeaseDependencies, S as NativeEvidenceLimitsConfig, T as NativePolicySummary, _ as NativeCheckpointStore, a as BrokerRpcResponse, b as NativeEffectiveCapability, c as ConnectorRuntime, d as NativeApprovalGrantV1, f as NativeApprovalMode, g as NativeCheckpointEventType, h as NativeCheckpointCallBinding, i as BrokerRpcError, j as PreparedNativeRequest, k as NativeToolPolicy, l as ConnectorTransport, m as NativeCheckpoint, n as BrokerCompletedTool, o as BrokerToolRequest, p as NativeCapability, r as BrokerRoundSnapshot, s as BrokerToolResult, t as BrokerCallId, u as NativeApprovalChallengeV1, v as NativeCheckpointSummary, w as NativePolicyRuntimeIdentity, x as NativeEffectiveResultPolicy, y as NativeCoordinatorSnapshot } from "./chunks/types-CkBIayy6.js";
 import z from "@deepseek-ai/schemastery";
-import { ContentBlock, GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, Message, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk, ToolSchema } from "@deepseek-ai/dsh-llm";
+import { GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, Message, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk, ToolSchema } from "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
-//#region src/native/types.d.ts
-type BrokerCallId = Extract<ContentBlock, {
-  type: 'tool-call';
-}>['id'];
-/** A provider-side tool request handed to the DSH agent loop. */
-interface BrokerToolRequest {
-  readonly callId: BrokerCallId;
-  readonly name: string;
-  readonly arguments: Record<string, unknown>;
-}
-/** A DSH tool result held until the model-facing result is available. */
-interface BrokerToolResult {
-  readonly content: ContentBlock[];
-  readonly isError: boolean;
-}
-/** One durable result delivered for a non-terminal broker batch. */
-interface BrokerCompletedTool {
-  readonly callId: BrokerCallId;
-  readonly result: BrokerToolResult;
-}
-/** Immutable facts captured when one provider round is registered. */
-interface BrokerRoundSnapshot {
-  readonly sessionId: string;
-  readonly tools: readonly ToolSchema[];
-  readonly invocationTimeoutMs: number;
-}
-/** The two supported adapter-level connector transports. */
-type ConnectorTransport = 'text' | 'mcp';
-/** Owner of the native MCP tunnel process. */
-type ConnectorRuntime = 'external' | 'managed';
-/** JSON-RPC request/response values used by the private broker socket. */
-interface BrokerRpcError {
-  readonly message: string;
-}
-interface BrokerRpcResponse<T = unknown> {
-  readonly id: string;
-  readonly result?: T;
-  readonly error?: string;
-}
+//#region src/native/continuation.d.ts
+/** Correlate one broker batch with its exact text-only DSH result messages. */
+declare function correlateNativeToolResults(messages: readonly Message[], calls: readonly BrokerToolRequest[]): readonly BrokerToolResult[];
 //#endregion
 //#region src/native/broker.d.ts
 /**
@@ -54,6 +19,8 @@ declare class NativeToolBroker {
   private closed;
   register(input: BrokerRoundSnapshot & {
     readonly ttlMs: number;
+    readonly policyRound?: NativePolicyRound;
+    readonly checkpoint?: NativeCheckpoint;
   }): string;
   /** Renew the inactivity lease while the owning browser round is polling. */
   touch(requestId: string): void;
@@ -107,25 +74,21 @@ interface NativeStepLease {
   fail(cleanup: NativeRoundCleanup, cause: Error): Promise<void>;
 }
 interface BeginStepInput {
-  readonly sessionId: string;
-  readonly messages: readonly Message[];
-  readonly tools: readonly ToolSchema[];
+  readonly snapshot?: NativeCoordinatorSnapshot;
+  readonly openPolicyRound?: () => NativePolicyRound;
+  readonly sessionId?: string;
+  readonly messages?: readonly Message[];
+  readonly tools?: readonly ToolSchema[];
   readonly ttlMs: number;
-  readonly invocationTimeoutMs: number;
+  readonly invocationTimeoutMs?: number;
   readonly signal?: AbortSignal;
   readonly continuation?: {
     readonly kind: 'continue' | 'fresh-replay';
   };
+  readonly checkpoint?: NativeCheckpoint;
 }
-/**
- * Correlate the durable tool results for one broker batch.
- *
- * Results not belonging to the pending batch are intentionally ignored: the
- * session can contain older completed calls. Every pending call must occur
- * exactly once, and image-bearing results are rejected before they can be
- * replayed through the text-only ChatGPT connector.
- */
-declare function correlateToolResults(messages: readonly Message[], calls: readonly BrokerToolRequest[]): readonly BrokerToolResult[];
+/** @deprecated Use the continuation-owned native result evidence seam. */
+declare const correlateToolResults: typeof correlateNativeToolResults;
 /** Serialize one browser reservation while giving its parked owner priority. */
 declare class NativeRoundCoordinator {
   private readonly broker;
@@ -135,7 +98,7 @@ declare class NativeRoundCoordinator {
   private disposed;
   constructor(broker: NativeToolBroker);
   beginStep(input: BeginStepInput): Promise<NativeStepLease>;
-  stopAtTurnBoundary(sessionId: string): Promise<void>;
+  stopAtTurnBoundary(sessionId: string, preserveCheckpoint?: boolean): Promise<void>;
   dispose(): Promise<void>;
   private scheduleDrain;
   private drain;
@@ -198,6 +161,8 @@ interface ChatGptWebConnectionOptions {
   retryPolicy: ResolvedRetryPolicy;
   /** ChatGPT tool transport; text remains the default. */
   connectorTransport: ConnectorTransport;
+  /** Fully resolved native security policy; text mode keeps it inert. */
+  nativeSecurity: ResolvedNativeSecurityConfig;
   /** Owner of the MCP tunnel process; external preserves current behavior. */
   connectorRuntime: ConnectorRuntime;
   /** Exact ChatGPT connector title used by the native MCP transport. */
@@ -218,6 +183,8 @@ interface ChatGptWebAdapterOptions {
     readonly coordinator: NativeRoundCoordinator;
     readonly ready: Promise<void>;
     readonly assertConnection: (connection: ChatGptWebConnectionOptions) => void;
+    readonly checkpointStore?: NativeCheckpointStore;
+    readonly prepareRequest?: (options: GenerateOptions, connection: ChatGptWebConnectionOptions) => PreparedNativeRequest;
   };
 }
 /**
@@ -268,6 +235,7 @@ declare class ChatGptWebAdapter extends LlmAdapter {
    */
   private emitTurnResult;
   private abandonNativeResponse;
+  private recoverOwnedConversationCleanup;
   private runPersistentNativeTurn;
   private runTurn;
 }
@@ -287,6 +255,62 @@ interface NativePromptBinding {
  * position.
  */
 declare function compilePrompt(options: GenerateOptions, maxChars: number, notice?: string, native?: NativePromptBinding): string;
+//#endregion
+//#region src/native/grants.d.ts
+/** Require an exact local grant before any effective native capability opens. */
+declare function requireNativeApproval(profileDir: string, approval: NativeApprovalMode, prepared: PreparedNativeRequest, now?: Date): void;
+/** Approve one exact pending challenge through the interactive local CLI. */
+declare function approveNativeChallenge(input: {
+  readonly profileDir: string;
+  readonly challengeId: string;
+  readonly confirmation: string;
+  readonly now?: Date;
+}): NativeApprovalGrantV1;
+/** Quote one value for a POSIX shell without allowing expansion or control bytes. */
+declare function shellQuotePosix(value: string): string;
+/** Render a terminal-safe, human-readable challenge summary. */
+declare function formatNativeApprovalChallenge(challenge: NativeApprovalChallengeV1): string;
+declare function readNativeApprovalChallenge(profileDir: string): NativeApprovalChallengeV1 | undefined;
+//#endregion
+//#region src/native/errors.d.ts
+/** A policy denial is recoverable within the same still-valid broker round. */
+declare class NativePolicyDeniedError extends Error {
+  readonly code: "NATIVE_POLICY_DENIED";
+  readonly releaseRound: false;
+  constructor(message: string);
+}
+/** A native safety failure is an invalid request, never a provider retry. */
+declare class NativeSafetyError extends LlmError {
+  readonly nativeCode: string;
+  readonly retryable: false;
+  constructor(message: string, cause?: unknown, nativeCode?: string);
+}
+/** A missing or stale local policy grant blocks before any provider side effect. */
+declare class NativeApprovalRequiredError extends NativeSafetyError {
+  readonly nativeCode: "NATIVE_APPROVAL_REQUIRED";
+  constructor(message: string, cause?: unknown);
+}
+//#endregion
+//#region src/native/private-files.d.ts
+/** Write a private file with file and parent-directory durability. */
+declare function durableAtomicWritePrivateFile(path: string, data: string | Uint8Array, mode?: 0o600 | 0o700): void;
+/** Sync an already-private directory after a durable mutation. */
+declare function syncPrivateDirectory(path: string): void;
+/** Append one complete, fsynced, bounded JSONL record to a private file. */
+declare function appendDurablePrivateJsonLine(path: string, record: unknown): void;
+/** Acquire the profile-wide atomic checkpoint writer lease. */
+declare function acquirePrivateWriterLease(profileDir: string, supplied?: Partial<PrivateWriterLeaseDependencies>): PrivateWriterLease;
+//#endregion
+//#region src/native/checkpoint.d.ts
+/**
+ * @deprecated Checkpoint result hashes are implementation-owned evidence.
+ */
+declare function nativeCheckpointRawResultHash(result: BrokerToolResult): string;
+/**
+ * @deprecated Checkpoint result hashes are implementation-owned evidence.
+ */
+declare function nativeCheckpointProjectionHash(result: BrokerToolResult): string;
+declare function createNativeCheckpointStore(profileDir: string, dependencies?: Partial<PrivateWriterLeaseDependencies>): NativeCheckpointStore;
 //#endregion
 //#region src/index.d.ts
 declare const name = "llm-chatgpt-web";
@@ -331,6 +355,8 @@ interface Config {
   brokerSocketPath?: string;
   /** Native MCP call/round timeout in milliseconds. */
   mcpInvocationTimeoutMs?: number;
+  /** Native tool policy and workspace security controls. */
+  nativeSecurity?: NativeSecurityConfig;
 }
 declare const Config: z<Config>;
 /**
@@ -344,4 +370,4 @@ declare function defaultBrokerSocketPath(profileDir: string): string;
 declare function resolveAdapterOptions(config: Config, platform?: NodeJS.Platform, arch?: string): ChatGptWebConnectionOptions;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeRoundCleanup, NativeRoundCoordinator, type NativeStepLease, NativeToolBroker, PROVIDER, apply, compilePrompt, correlateToolResults, defaultBrokerSocketPath, inject, name, resolveAdapterOptions };
+export { type BrokerRoundSnapshot, type BrokerRpcError, type BrokerRpcResponse, type BrokerToolRequest, type BrokerToolResult, ChatGptWebAdapter, type ChatGptWebAdapterOptions, type ChatGptWebCatalogModel, type ChatGptWebConnectionOptions, Config, type ConnectorRuntime, type ConnectorTransport, type NativeApprovalChallengeV1, type NativeApprovalGrantV1, type NativeApprovalMode, NativeApprovalRequiredError, type NativeCapability, type NativeCheckpoint, type NativeCheckpointCallBinding, type NativeCheckpointEventType, type NativeCheckpointStore, type NativeCheckpointSummary, type NativeEffectiveCapability, type NativeEffectiveResultPolicy, type NativeEvidenceLimitsConfig, NativePolicyDeniedError, type NativePolicyRuntimeIdentity, type NativePolicySummary, type NativeRecoveryVerdict, type NativeResultPolicy, type NativeRoundCleanup, NativeRoundCoordinator, NativeSafetyError, type NativeSecurityConfig, type NativeStepLease, NativeToolBroker, type NativeToolPolicy, type NativeToolRuleConfig, PROVIDER, type PreparedNativeRequest, type PrivateProcessState, type PrivateWriterLease, type PrivateWriterLeaseDependencies, type ResolvedNativeSecurityConfig, type ResolvedNativeToolRule, type WorkspaceBoundary, acquirePrivateWriterLease, appendDurablePrivateJsonLine, apply, approveNativeChallenge, compilePrompt, correlateToolResults, createNativeCheckpointStore, defaultBrokerSocketPath, durableAtomicWritePrivateFile, formatNativeApprovalChallenge, inject, name, nativeCheckpointProjectionHash, nativeCheckpointRawResultHash, readNativeApprovalChallenge, requireNativeApproval, resolveAdapterOptions, shellQuotePosix, syncPrivateDirectory };

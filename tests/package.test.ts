@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import * as packageEntry from '../src/index.ts'
+import {
+  MANAGED_TUNNEL_CLIENT_VERSION,
+  tunnelReleaseAsset,
+} from '../src/native/tunnel-install.ts'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as Record<string, unknown>
@@ -21,6 +27,22 @@ describe('package manifest', () => {
     const exports = pkg['exports'] as Record<string, unknown>
     expect(exports['.']).toBeDefined()
     expect(exports['./package.json']).toBe('./package.json')
+  })
+
+  it('pins the v0.7.0 release metadata and tunnel assets', () => {
+    expect(pkg['version']).toBe('0.7.0')
+    const deps = pkg['dependencies'] as Record<string, string>
+    expect(deps.fflate).toBe('0.8.3')
+    expect(MANAGED_TUNNEL_CLIENT_VERSION).toBe('0.0.12')
+    const assets = [
+      ['darwin', 'amd64', 'tunnel-client-v0.0.12-darwin-amd64.zip', '33de53aec680faafedc795f8f8268d6861577bddb871cb2d49529c91f88c2009'],
+      ['darwin', 'arm64', 'tunnel-client-v0.0.12-darwin-arm64.zip', '42fb3138dc9c081d5777cb7e8bd1e041cc48b67c4978dbab3c5167ca1aabca02'],
+      ['linux', 'amd64', 'tunnel-client-v0.0.12-linux-amd64.zip', '2bb693bd7b5cd28da7ce09cd9e309529dbb33b7cc9dc0058e62a064688f92c81'],
+      ['linux', 'arm64', 'tunnel-client-v0.0.12-linux-arm64.zip', '6813878a3edb82ebebb32fe5a859bc6327a81cce5bc7b635a2313174d26365d6'],
+    ] as const
+    for (const [platform, arch, name, archiveSha256] of assets) {
+      expect(tunnelReleaseAsset(platform, arch)).toEqual({ name, archiveSha256 })
+    }
   })
 
   it('keeps runtime dependencies and the native MCP executable in the package', () => {
@@ -44,6 +66,28 @@ describe('package manifest', () => {
     for (const file of ['lib/index.js', 'lib/native-setup-main.js', 'lib/mcp-main.js']) {
       expect(readFileSync(join(root, file), 'utf8')).not.toMatch(/sk-[A-Za-z0-9_-]{12,}/)
     }
+  })
+
+  it('keeps the public security documentation and excludes internal docs from the packed tree', () => {
+    const readme = readFileSync(join(root, 'README.md'), 'utf8')
+    for (const term of [
+      'toolPolicy', 'workspaceRoot', 'approval', '.dsh-chatgptignore', 'approve',
+      'recover --abandon', 'doctor --json', 'TOCTOU', 'output-provenance',
+      'rollback', 'experimental 0.7.0',
+    ]) expect(readme).toContain(term)
+    const packed = JSON.parse(execFileSync('pnpm', ['pack', '--dry-run', '--json'], {
+      cwd: root,
+      encoding: 'utf8',
+    })) as { files: Array<{ path: string }> }
+    expect(packed.files.every(file => !/docs\/internal|research|superpowers/.test(file.path))).toBe(true)
+  })
+
+  it('keeps transition exports without exposing the internal evidence evaluator', () => {
+    expect(packageEntry.correlateToolResults).toBeTypeOf('function')
+    expect(packageEntry.nativeCheckpointRawResultHash).toBeTypeOf('function')
+    expect(packageEntry.nativeCheckpointProjectionHash).toBeTypeOf('function')
+    expect('assessNativeResultEvidence' in packageEntry).toBe(false)
+    expect('assessNativeClaimResultEvidence' in packageEntry).toBe(false)
   })
 
   it('targets a supported node runtime', () => {
