@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import {
+  assessNativeResultEvidence,
   decideNativeContinuation,
   hasExactNativeToolResults,
   nativeExecutionKey,
@@ -189,6 +190,89 @@ describe('native execution identity', () => {
         callIds: [],
       },
     })).toBeUndefined()
+  })
+})
+
+describe('native durable result evidence', () => {
+  it('returns proven evidence with provider-facing cloned results', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [user, assistant, resultMessage()],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+      provider: {
+        messages: [user, assistant, resultMessage()],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toEqual({
+      kind: 'proven',
+      results: [{ content: [{ type: 'text', text: 'done' }], isError: false }],
+    })
+  })
+
+  it('returns ambiguous evidence when two boundaries match', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [assistant, resultMessage(), assistant, resultMessage()],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toMatchObject({ kind: 'ambiguous' })
+  })
+
+  it('returns conflicting evidence for an extra tool-result tail', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [assistant, resultMessage(), resultMessage('duplicate')],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toMatchObject({ kind: 'conflicting' })
+  })
+
+  it('returns provider-facing results when canonical content is projected', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [assistant, resultMessage('raw output')],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+      provider: {
+        messages: [assistant, resultMessage('sanitized output')],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toEqual({
+      kind: 'proven',
+      results: [{ content: [{ type: 'text', text: 'sanitized output' }], isError: false }],
+    })
+  })
+
+  it('returns conflicting evidence when canonical and provider error flags differ', () => {
+    const evidence = assessNativeResultEvidence({
+      canonical: {
+        messages: [assistant, resultMessage('raw output')],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+      provider: {
+        messages: [assistant, resultMessage('sanitized output', true)],
+        calls: [call],
+        matchesAssistant: message => message === assistant,
+      },
+    })
+
+    expect(evidence).toMatchObject({ kind: 'conflicting', reason: 'result-evidence-conflicting' })
   })
 })
 

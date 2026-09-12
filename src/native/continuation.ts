@@ -52,6 +52,33 @@ export type NativeContinuationDecision =
   | { readonly kind: 'fresh-replay'; readonly reason: NativeFreshReplayReason }
   | { readonly kind: 'fail'; readonly code: string; readonly message: string }
 
+export type NativeDurableResultEvidenceReason =
+  | 'assistant-boundary-missing'
+  | 'result-missing'
+  | 'result-malformed'
+  | 'duplicate-tool-result'
+  | 'provider-view-missing'
+  | 'provider-view-conflicting'
+  | 'result-evidence-conflicting'
+
+export type NativeDurableResultEvidence =
+  | { readonly kind: 'proven'; readonly results: readonly BrokerToolResult[] }
+  | { readonly kind: 'missing'; readonly reason: NativeDurableResultEvidenceReason }
+  | { readonly kind: 'ambiguous'; readonly reason: 'assistant-boundary-ambiguous' }
+  | { readonly kind: 'conflicting'; readonly reason: NativeDurableResultEvidenceReason }
+
+export interface NativeDurableResultEvidenceView {
+  readonly messages: readonly Message[]
+  readonly calls: readonly BrokerToolRequest[]
+  readonly matchesAssistant: (message: Message) => boolean
+  readonly matchesResult?: (result: BrokerToolResult, index: number) => boolean
+}
+
+export interface NativeDurableResultEvidenceInput {
+  readonly canonical: NativeDurableResultEvidenceView
+  readonly provider?: NativeDurableResultEvidenceView
+}
+
 interface CanonicalRecord {
   readonly [key: string]: unknown
 }
@@ -212,6 +239,74 @@ function assistantCallsMatch(message: Message, calls: readonly BrokerToolRequest
       && block.name === call.name
       && block.arguments === JSON.stringify(call.arguments)
   })
+}
+
+function evidenceForView(view: NativeDurableResultEvidenceView): NativeDurableResultEvidence {
+  let boundaryIndex: number | undefined
+  for (const [index, message] of view.messages.entries()) {
+    if (!view.matchesAssistant(message)) continue
+    if (boundaryIndex !== undefined) {
+      return { kind: 'ambiguous', reason: 'assistant-boundary-ambiguous' }
+    }
+    boundaryIndex = index
+  }
+  if (boundaryIndex === undefined) {
+    return { kind: 'missing', reason: 'assistant-boundary-missing' }
+  }
+
+  const resultMessages = view.messages.slice(boundaryIndex + 1)
+  if (resultMessages.length < view.calls.length) {
+    return { kind: 'missing', reason: 'result-missing' }
+  }
+  const results: BrokerToolResult[] = []
+  for (const [index, call] of view.calls.entries()) {
+    const message = resultMessages[index]
+    const result = message === undefined ? undefined : onlyTextResult(message, call)
+    if (result === undefined) {
+      return { kind: 'missing', reason: 'result-malformed' }
+    }
+    if (view.matchesResult !== undefined && !view.matchesResult(result, index)) {
+      return { kind: 'conflicting', reason: 'result-evidence-conflicting' }
+    }
+    results.push(result)
+  }
+
+  const extra = resultMessages.slice(view.calls.length)
+  if (extra.some(message => message.source.kind === 'tool'
+    || message.content.some(block => block.type === 'tool-result'))) {
+    return { kind: 'conflicting', reason: 'duplicate-tool-result' }
+  }
+  return { kind: 'proven', results }
+}
+
+function sameEvidenceCalls(left: readonly BrokerToolRequest[], right: readonly BrokerToolRequest[]): boolean {
+  if (left.length !== right.length) return false
+  return left.every((call, index) => {
+    const other = right[index]
+    return other !== undefined
+      && String(call.callId) === String(other.callId)
+      && call.name === other.name
+  })
+}
+
+/** Prove exact durable results across canonical and optional provider views. */
+export function assessNativeResultEvidence(
+  input: NativeDurableResultEvidenceInput,
+): NativeDurableResultEvidence {
+  const canonical = evidenceForView(input.canonical)
+  if (canonical.kind !== 'proven') return canonical
+  if (input.provider === undefined) return canonical
+
+  const provider = evidenceForView(input.provider)
+  if (provider.kind === 'ambiguous') return provider
+  if (provider.kind === 'missing') return { kind: 'missing', reason: 'provider-view-missing' }
+  if (provider.kind === 'conflicting') return { kind: 'conflicting', reason: 'provider-view-conflicting' }
+  if (!sameEvidenceCalls(input.canonical.calls, input.provider.calls)
+    || provider.results.length !== canonical.results.length
+    || provider.results.some((result, index) => result.isError !== canonical.results[index]?.isError)) {
+    return { kind: 'conflicting', reason: 'result-evidence-conflicting' }
+  }
+  return { kind: 'proven', results: provider.results }
 }
 
 function exactNativeBoundaryIndex(
