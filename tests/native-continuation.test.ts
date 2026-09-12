@@ -221,6 +221,10 @@ describe('native durable result evidence', () => {
       kind: 'proven',
       results: [{ content: [{ type: 'text', text: 'done' }], isError: false }],
     })
+    if (evidence.kind !== 'proven') throw new Error('expected proven evidence')
+    expect(Object.isFrozen(evidence)).toBe(true)
+    expect(Object.isFrozen(evidence.results)).toBe(true)
+    expect(Object.isFrozen(evidence.results[0])).toBe(true)
   })
 
   it('returns ambiguous evidence when two boundaries match', () => {

@@ -242,32 +242,44 @@ function assistantCallsMatch(message: Message, calls: readonly BrokerToolRequest
   })
 }
 
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value)
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child)
+  }
+  return value
+}
+
+function freezeEvidence(value: NativeDurableResultEvidence): NativeDurableResultEvidence {
+  return deepFreeze(value)
+}
+
 function evidenceForView(view: NativeDurableResultEvidenceView): NativeDurableResultEvidence {
   let boundaryIndex: number | undefined
   for (const [index, message] of view.messages.entries()) {
     if (!view.matchesAssistant(message)) continue
     if (boundaryIndex !== undefined) {
-      return { kind: 'ambiguous', reason: 'assistant-boundary-ambiguous' }
+      return freezeEvidence({ kind: 'ambiguous', reason: 'assistant-boundary-ambiguous' })
     }
     boundaryIndex = index
   }
   if (boundaryIndex === undefined) {
-    return { kind: 'missing', reason: 'assistant-boundary-missing' }
+    return freezeEvidence({ kind: 'missing', reason: 'assistant-boundary-missing' })
   }
 
   const resultMessages = view.messages.slice(boundaryIndex + 1)
   if (resultMessages.length < view.calls.length) {
-    return { kind: 'missing', reason: 'result-missing' }
+    return freezeEvidence({ kind: 'missing', reason: 'result-missing' })
   }
   const results: BrokerToolResult[] = []
   for (const [index, call] of view.calls.entries()) {
     const message = resultMessages[index]
     const result = message === undefined ? undefined : onlyTextResult(message, call)
     if (result === undefined) {
-      return { kind: 'missing', reason: 'result-malformed' }
+      return freezeEvidence({ kind: 'missing', reason: 'result-malformed' })
     }
     if (view.matchesResult !== undefined && !view.matchesResult(result, index)) {
-      return { kind: 'conflicting', reason: 'result-evidence-conflicting' }
+      return freezeEvidence({ kind: 'conflicting', reason: 'result-evidence-conflicting' })
     }
     results.push(result)
   }
@@ -275,9 +287,9 @@ function evidenceForView(view: NativeDurableResultEvidenceView): NativeDurableRe
   const extra = resultMessages.slice(view.calls.length)
   if (extra.some(message => message.source.kind === 'tool'
     || message.content.some(block => block.type === 'tool-result'))) {
-    return { kind: 'conflicting', reason: 'duplicate-tool-result' }
+    return freezeEvidence({ kind: 'conflicting', reason: 'duplicate-tool-result' })
   }
-  return { kind: 'proven', results }
+  return freezeEvidence({ kind: 'proven', results })
 }
 
 function sameEvidenceCalls(left: readonly BrokerToolRequest[], right: readonly BrokerToolRequest[]): boolean {
@@ -300,14 +312,14 @@ export function assessNativeResultEvidence(
 
   const provider = evidenceForView(input.provider)
   if (provider.kind === 'ambiguous') return provider
-  if (provider.kind === 'missing') return { kind: 'missing', reason: 'provider-view-missing' }
-  if (provider.kind === 'conflicting') return { kind: 'conflicting', reason: 'provider-view-conflicting' }
+  if (provider.kind === 'missing') return freezeEvidence({ kind: 'missing', reason: 'provider-view-missing' })
+  if (provider.kind === 'conflicting') return freezeEvidence({ kind: 'conflicting', reason: 'provider-view-conflicting' })
   if (!sameEvidenceCalls(input.canonical.calls, input.provider.calls)
     || provider.results.length !== canonical.results.length
     || provider.results.some((result, index) => result.isError !== canonical.results[index]?.isError)) {
-    return { kind: 'conflicting', reason: 'result-evidence-conflicting' }
+    return freezeEvidence({ kind: 'conflicting', reason: 'result-evidence-conflicting' })
   }
-  return { kind: 'proven', results: provider.results }
+  return freezeEvidence({ kind: 'proven', results: provider.results })
 }
 
 /** Correlate one broker batch with its exact text-only DSH result messages. */
