@@ -309,42 +309,34 @@ export function assessNativeResultEvidence(
   return { kind: 'proven', results: provider.results }
 }
 
-function exactNativeBoundaryIndex(
+/** Assess one parked native claim against canonical and optional provider history. */
+export function assessNativeClaimResultEvidence(
   claim: ParkedContinuationClaim,
-  messages: readonly Message[],
-): number | undefined {
-  const expectedAssistant = claim.canonicalAssistantMessage ?? claim.assistantMessage
-  let match: number | undefined
-  for (const [index, message] of messages.entries()) {
-    if (!sameMessages([message], [expectedAssistant])
-      || !assistantCallsMatch(message, claim.pendingCalls)) continue
-    // Repeated boundaries cannot prove which result delivery is authoritative.
-    if (match !== undefined) return undefined
-    match = index
+  canonicalOptions: GenerateOptions,
+  providerOptions?: GenerateOptions,
+): NativeDurableResultEvidence {
+  const canonicalAssistant = claim.canonicalAssistantMessage ?? claim.assistantMessage
+  const canonical: NativeDurableResultEvidenceView = {
+    messages: canonicalOptions.messages,
+    calls: claim.pendingCalls,
+    matchesAssistant: message => sameMessages([message], [canonicalAssistant])
+      && assistantCallsMatch(message, claim.pendingCalls),
   }
-  return match
+  const provider = providerOptions === undefined ? undefined : {
+    messages: providerOptions.messages,
+    calls: claim.providerPendingCalls ?? claim.pendingCalls,
+    matchesAssistant: (message: Message): boolean => sameMessages([message], [claim.assistantMessage])
+      && assistantCallsMatch(message, claim.providerPendingCalls ?? claim.pendingCalls),
+  }
+  return assessNativeResultEvidence({ canonical, ...(provider === undefined ? {} : { provider }) })
 }
 
-/** Prove that the incoming history contains this boundary's exact results. */
+/** Deprecated one-view compatibility helper for existing source consumers. */
 export function hasExactNativeToolResults(
   claim: ParkedContinuationClaim,
   options: GenerateOptions,
 ): boolean {
-  // Durability belongs to the current boundary. Older history may be pruned or
-  // replaced by a compaction summary between DSH steps, moving this boundary
-  // to a different index. Locate the one exact assistant call batch instead of
-  // trusting the parked request's obsolete message count.
-  const assistantIndex = exactNativeBoundaryIndex(claim, options.messages)
-  if (assistantIndex === undefined) return false
-  const resultMessages = options.messages.slice(assistantIndex + 1)
-  if (resultMessages.length < claim.pendingCalls.length) return false
-  for (const [index, call] of claim.pendingCalls.entries()) {
-    const message = resultMessages[index]
-    if (message === undefined || onlyTextResult(message, call) === undefined) return false
-  }
-  const extra = resultMessages.slice(claim.pendingCalls.length)
-  return !extra.some(message => message.source.kind === 'tool'
-    || message.content.some(block => block.type === 'tool-result'))
+  return assessNativeClaimResultEvidence(claim, options).kind === 'proven'
 }
 
 function extraTailReason(messages: readonly Message[]): NativeFreshReplayReason | undefined {

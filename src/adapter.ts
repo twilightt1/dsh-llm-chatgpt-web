@@ -60,8 +60,8 @@ import {
   ManagedRuntimeTransportError,
 } from './native/tunnel-runtime.ts'
 import {
+  assessNativeClaimResultEvidence,
   decideNativeContinuation,
-  hasExactNativeToolResults,
   nativeExecutionKey,
   parseNativeReplayState,
 } from './native/continuation.ts'
@@ -717,7 +717,10 @@ export class ChatGptWebAdapter extends LlmAdapter {
         }
         const physicalAvailable = active.isPhysicalAvailable()
         const uncertainOutcome = active.claim.uncertainOutcome || active.response.hasUncertainOutcome()
-        const durableResults = !uncertainOutcome && hasExactNativeToolResults(active.claim, options)
+        const durableEvidence = uncertainOutcome
+          ? undefined
+          : assessNativeClaimResultEvidence(active.claim, options, providerOptions)
+        const durableResults = durableEvidence?.kind === 'proven'
         const decisionClaim: ParkedContinuationClaim = {
           ...active.claim,
           physicalAvailable,
