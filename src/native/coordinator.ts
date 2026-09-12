@@ -1,11 +1,10 @@
-import { contentHasImage } from '@deepseek-ai/dsh-llm'
 import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { canonicalJson } from './canonical.ts'
+import { correlateNativeToolResults } from './continuation.ts'
 import { NativeToolBroker } from './broker.ts'
 import type {
   BrokerAuthorizedToolRequest,
   BrokerToolRequest,
-  BrokerToolResult,
   NativeCheckpoint,
   NativeCoordinatorSnapshot,
   NativePolicyRound,
@@ -101,54 +100,8 @@ class RoundRecord {
   }
 }
 
-/**
- * Correlate the durable tool results for one broker batch.
- *
- * Results not belonging to the pending batch are intentionally ignored: the
- * session can contain older completed calls. Every pending call must occur
- * exactly once, and image-bearing results are rejected before they can be
- * replayed through the text-only ChatGPT connector.
- */
-export function correlateToolResults(
-  messages: readonly Message[],
-  calls: readonly BrokerToolRequest[],
-): readonly BrokerToolResult[] {
-  const pending = new Set<string>()
-  for (const call of calls) {
-    const key = String(call.callId)
-    if (pending.has(key)) throw new Error(`duplicate pending broker call ${key}`)
-    pending.add(key)
-  }
-  const found = new Map<string, BrokerToolResult>()
-  for (const message of messages) {
-    for (const block of message.content) {
-      if (block.type !== 'tool-result') continue
-      const key = String(block.toolCallId)
-      const sourceKey = message.source.kind === 'tool' ? String(message.source.callId) : undefined
-      if (sourceKey !== undefined && sourceKey !== key && (pending.has(sourceKey) || pending.has(key))) {
-        throw new Error(`mismatched tool result identity for ${key}`)
-      }
-      if (!pending.has(key)) continue
-      if (message.source.kind !== 'tool' || sourceKey !== key || message.content.length !== 1) {
-        throw new Error(`malformed tool result identity for ${key}`)
-      }
-      if (found.has(key)) throw new Error(`duplicate tool result for ${key}`)
-      if (contentHasImage(block.content) || block.content.some(item => item.type !== 'text')) {
-        throw new Error(`unsupported non-text content in tool result for ${key}`)
-      }
-      found.set(key, {
-        content: structuredClone(block.content),
-        isError: block.isError === true,
-      })
-    }
-  }
-  return calls.map(call => {
-    const key = String(call.callId)
-    const result = found.get(key)
-    if (result === undefined) throw new Error(`missing tool result for ${key}`)
-    return result
-  })
-}
+/** @deprecated Use the continuation-owned native result evidence seam. */
+export const correlateToolResults = correlateNativeToolResults
 
 function normalizeBeginStepInput(input: BeginStepInput): NormalizedBeginStepInput {
   if (input.snapshot !== undefined) {

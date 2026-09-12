@@ -1,3 +1,4 @@
+import { contentHasImage } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message, ReplayEnvelope } from '@deepseek-ai/dsh-llm'
 import { canonicalJson, hashCanonical } from './canonical.ts'
 import type {
@@ -307,6 +308,48 @@ export function assessNativeResultEvidence(
     return { kind: 'conflicting', reason: 'result-evidence-conflicting' }
   }
   return { kind: 'proven', results: provider.results }
+}
+
+/** Correlate one broker batch with its exact text-only DSH result messages. */
+export function correlateNativeToolResults(
+  messages: readonly Message[],
+  calls: readonly BrokerToolRequest[],
+): readonly BrokerToolResult[] {
+  const pending = new Set<string>()
+  for (const call of calls) {
+    const key = String(call.callId)
+    if (pending.has(key)) throw new Error(`duplicate pending broker call ${key}`)
+    pending.add(key)
+  }
+  const found = new Map<string, BrokerToolResult>()
+  for (const message of messages) {
+    for (const block of message.content) {
+      if (block.type !== 'tool-result') continue
+      const key = String(block.toolCallId)
+      const sourceKey = message.source.kind === 'tool' ? String(message.source.callId) : undefined
+      if (sourceKey !== undefined && sourceKey !== key && (pending.has(sourceKey) || pending.has(key))) {
+        throw new Error(`mismatched tool result identity for ${key}`)
+      }
+      if (!pending.has(key)) continue
+      if (message.source.kind !== 'tool' || sourceKey !== key || message.content.length !== 1) {
+        throw new Error(`malformed tool result identity for ${key}`)
+      }
+      if (found.has(key)) throw new Error(`duplicate tool result for ${key}`)
+      if (contentHasImage(block.content) || block.content.some(item => item.type !== 'text')) {
+        throw new Error(`unsupported non-text content in tool result for ${key}`)
+      }
+      found.set(key, {
+        content: structuredClone(block.content),
+        isError: block.isError === true,
+      })
+    }
+  }
+  return calls.map(call => {
+    const key = String(call.callId)
+    const result = found.get(key)
+    if (result === undefined) throw new Error(`missing tool result for ${key}`)
+    return result
+  })
 }
 
 /** Assess one parked native claim against canonical and optional provider history. */

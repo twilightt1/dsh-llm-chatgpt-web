@@ -3,6 +3,7 @@ import { MessageId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import {
   assessNativeResultEvidence,
+  correlateNativeToolResults,
   decideNativeContinuation,
   hasExactNativeToolResults,
   nativeExecutionKey,
@@ -190,6 +191,14 @@ describe('native execution identity', () => {
         callIds: [],
       },
     })).toBeUndefined()
+  })
+})
+
+describe('native result correlation', () => {
+  it('correlates exact text-only results in pending-call order', () => {
+    expect(correlateNativeToolResults([resultMessage()], [call])).toEqual([
+      { content: [{ type: 'text', text: 'done' }], isError: false },
+    ])
   })
 })
 
