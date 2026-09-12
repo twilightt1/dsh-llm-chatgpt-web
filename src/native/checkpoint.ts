@@ -564,10 +564,16 @@ function projectionHash(result: BrokerToolResult): string {
   return hashCanonical('native-tool-projection', 1, { content: result.content, isError: result.isError === true })
 }
 
+/**
+ * @deprecated Checkpoint result hashes are implementation-owned evidence.
+ */
 export function nativeCheckpointRawResultHash(result: BrokerToolResult): string {
   return rawResultHash(result)
 }
 
+/**
+ * @deprecated Checkpoint result hashes are implementation-owned evidence.
+ */
 export function nativeCheckpointProjectionHash(result: BrokerToolResult): string {
   return projectionHash(result)
 }

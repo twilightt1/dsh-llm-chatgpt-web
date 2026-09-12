@@ -374,7 +374,9 @@ export function assessNativeClaimResultEvidence(
   return assessNativeResultEvidence({ canonical, ...(provider === undefined ? {} : { provider }) })
 }
 
-/** Deprecated one-view compatibility helper for existing source consumers. */
+/**
+ * @deprecated Use the continuation-owned durable result evidence evaluator.
+ */
 export function hasExactNativeToolResults(
   claim: ParkedContinuationClaim,
   options: GenerateOptions,

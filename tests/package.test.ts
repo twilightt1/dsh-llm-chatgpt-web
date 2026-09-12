@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import * as packageEntry from '../src/index.ts'
 import {
   MANAGED_TUNNEL_CLIENT_VERSION,
   tunnelReleaseAsset,
@@ -79,6 +80,14 @@ describe('package manifest', () => {
       encoding: 'utf8',
     })) as { files: Array<{ path: string }> }
     expect(packed.files.every(file => !/docs\/internal|research|superpowers/.test(file.path))).toBe(true)
+  })
+
+  it('keeps transition exports without exposing the internal evidence evaluator', () => {
+    expect(packageEntry.correlateToolResults).toBeTypeOf('function')
+    expect(packageEntry.nativeCheckpointRawResultHash).toBeTypeOf('function')
+    expect(packageEntry.nativeCheckpointProjectionHash).toBeTypeOf('function')
+    expect('assessNativeResultEvidence' in packageEntry).toBe(false)
+    expect('assessNativeClaimResultEvidence' in packageEntry).toBe(false)
   })
 
   it('targets a supported node runtime', () => {

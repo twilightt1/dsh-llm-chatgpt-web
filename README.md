@@ -88,6 +88,15 @@ outcome, correlation conflict, or cleanup failure stops without resubmitting.
 automatically retried. Text transport and auxiliary title/compaction calls do
 not use this lifetime.
 
+### Transition compatibility
+
+The transition release keeps the existing `correlateToolResults`,
+`nativeCheckpointRawResultHash`, and `nativeCheckpointProjectionHash` exports,
+plus the source-level `hasExactNativeToolResults` helper, as deprecated
+compatibility adapters. New code should rely on the continuation-owned durable
+result evidence behavior; the compatibility adapters are scheduled for removal
+in the following release after the transition behavior has been reviewed.
+
 ## Prerequisites
 
 - Google Chrome installed (or set `chromeExecutablePath`).

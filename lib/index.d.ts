@@ -2,6 +2,10 @@ import { A as NativeToolRuleConfig, C as NativePolicyRound, D as NativeResultPol
 import z from "@deepseek-ai/schemastery";
 import { GenerateOptions, LlmAdapter, LlmError, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, Message, ModelModality, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk, ToolSchema } from "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
+//#region src/native/continuation.d.ts
+/** Correlate one broker batch with its exact text-only DSH result messages. */
+declare function correlateNativeToolResults(messages: readonly Message[], calls: readonly BrokerToolRequest[]): readonly BrokerToolResult[];
+//#endregion
 //#region src/native/broker.d.ts
 /**
  * In-memory owner-side broker for one native ChatGPT provider round.
@@ -83,15 +87,8 @@ interface BeginStepInput {
   };
   readonly checkpoint?: NativeCheckpoint;
 }
-/**
- * Correlate the durable tool results for one broker batch.
- *
- * Results not belonging to the pending batch are intentionally ignored: the
- * session can contain older completed calls. Every pending call must occur
- * exactly once, and image-bearing results are rejected before they can be
- * replayed through the text-only ChatGPT connector.
- */
-declare function correlateToolResults(messages: readonly Message[], calls: readonly BrokerToolRequest[]): readonly BrokerToolResult[];
+/** @deprecated Use the continuation-owned native result evidence seam. */
+declare const correlateToolResults: typeof correlateNativeToolResults;
 /** Serialize one browser reservation while giving its parked owner priority. */
 declare class NativeRoundCoordinator {
   private readonly broker;
@@ -305,7 +302,13 @@ declare function appendDurablePrivateJsonLine(path: string, record: unknown): vo
 declare function acquirePrivateWriterLease(profileDir: string, supplied?: Partial<PrivateWriterLeaseDependencies>): PrivateWriterLease;
 //#endregion
 //#region src/native/checkpoint.d.ts
+/**
+ * @deprecated Checkpoint result hashes are implementation-owned evidence.
+ */
 declare function nativeCheckpointRawResultHash(result: BrokerToolResult): string;
+/**
+ * @deprecated Checkpoint result hashes are implementation-owned evidence.
+ */
 declare function nativeCheckpointProjectionHash(result: BrokerToolResult): string;
 declare function createNativeCheckpointStore(profileDir: string, dependencies?: Partial<PrivateWriterLeaseDependencies>): NativeCheckpointStore;
 //#endregion

@@ -47,7 +47,9 @@ export type {
 } from './adapter.ts'
 export { compilePrompt } from './chatgpt/prompt.ts'
 export { NativeToolBroker } from './native/broker.ts'
-export { NativeRoundCoordinator, correlateToolResults } from './native/coordinator.ts'
+export { NativeRoundCoordinator } from './native/coordinator.ts'
+/** @deprecated Use the continuation-owned native result evidence seam. */
+export { correlateToolResults } from './native/coordinator.ts'
 export {
   approveNativeChallenge,
   formatNativeApprovalChallenge,
@@ -66,8 +68,9 @@ export {
   durableAtomicWritePrivateFile,
   syncPrivateDirectory,
 } from './native/private-files.ts'
+export { createNativeCheckpointStore } from './native/checkpoint.ts'
+/** @deprecated Checkpoint result hashes are implementation-owned evidence. */
 export {
-  createNativeCheckpointStore,
   nativeCheckpointProjectionHash,
   nativeCheckpointRawResultHash,
 } from './native/checkpoint.ts'
